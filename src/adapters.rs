@@ -692,10 +692,8 @@ fn is_empty_placeholder(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SurvivalHypothesis, parse_structured_output, render_hypothesis_hints,
-        render_structured_resume_prompt_with_hypotheses,
-    };
+    use super::*;
+    use crate::benchmark::{LessonDirection, MetaLesson, MetaLessonEvidence, TruthCategory};
 
     #[test]
     fn render_hypothesis_hints_empty_produces_empty_string() {
@@ -828,5 +826,509 @@ mod tests {
         assert_eq!(output.decisions[0].evidence, vec!["d1", "e3"]);
         assert_eq!(output.operational_scars[0].evidence, vec!["s1"]);
         assert_eq!(output.next_step.text, "run shared continuity benchmark");
+    }
+
+    #[test]
+    fn parse_structured_output_rejects_empty_string() {
+        let err = parse_structured_output("").unwrap_err();
+        assert!(err.to_string().contains("empty response"));
+    }
+
+    #[test]
+    fn parse_structured_output_rejects_whitespace_only() {
+        let err = parse_structured_output("   \n  ").unwrap_err();
+        assert!(err.to_string().contains("empty response"));
+    }
+
+    #[test]
+    fn parse_structured_output_rejects_no_json_object() {
+        let err = parse_structured_output("just plain text without braces").unwrap_err();
+        assert!(err.to_string().contains("did not contain json object"));
+    }
+
+    #[test]
+    fn parse_structured_output_rejects_array_without_braces() {
+        let err = parse_structured_output("[1, 2, 3]").unwrap_err();
+        assert!(err.to_string().contains("did not contain json object"));
+    }
+
+    #[test]
+    fn parse_structured_output_extracts_json_from_surrounding_text() {
+        let output = parse_structured_output(
+            r#"Here is my response: {"summary":"extracted","critical_facts":[],"constraints":[],"decisions":[],"open_hypotheses":[],"operational_scars":[],"avoid_repeating":[],"next_step":""} end"#,
+        )
+        .expect("should extract json from surrounding text");
+        assert_eq!(output.summary, "extracted");
+    }
+
+    #[test]
+    fn parse_structured_output_rejects_malformed_json() {
+        let err = parse_structured_output(r#"{"summary": broken}"#).unwrap_err();
+        assert!(err.to_string().contains("parsing model json"));
+    }
+
+    #[test]
+    fn normalize_handles_null_fields_gracefully() {
+        let output = parse_structured_output(
+            r#"{
+                "summary": null,
+                "critical_facts": null,
+                "constraints": null,
+                "decisions": null,
+                "open_hypotheses": null,
+                "operational_scars": null,
+                "avoid_repeating": null,
+                "next_step": null
+            }"#,
+        )
+        .expect("all-null fields should produce defaults");
+        assert!(output.summary.is_empty());
+        assert!(output.critical_facts.is_empty());
+        assert!(output.constraints.is_empty());
+        assert!(output.decisions.is_empty());
+        assert!(output.open_hypotheses.is_empty());
+        assert!(output.operational_scars.is_empty());
+        assert!(output.avoid_repeating.is_empty());
+        assert!(output.next_step.text.is_empty());
+    }
+
+    #[test]
+    fn normalize_handles_missing_optional_fields() {
+        let output = parse_structured_output(r#"{"summary":"minimal"}"#)
+            .expect("missing fields should default");
+        assert_eq!(output.summary, "minimal");
+        assert!(output.critical_facts.is_empty());
+        assert!(output.next_step.text.is_empty());
+    }
+
+    #[test]
+    fn value_to_text_handles_number_summary() {
+        let output = parse_structured_output(r#"{"summary": 42}"#)
+            .expect("numeric summary should stringify");
+        assert_eq!(output.summary, "42");
+    }
+
+    #[test]
+    fn value_to_text_handles_bool_summary() {
+        let output = parse_structured_output(r#"{"summary": true}"#)
+            .expect("boolean summary should stringify");
+        assert_eq!(output.summary, "true");
+    }
+
+    #[test]
+    fn value_to_text_object_with_text_key() {
+        let output = parse_structured_output(r#"{"summary": {"text": "from text key"}}"#)
+            .expect("object with text key should extract");
+        assert_eq!(output.summary, "from text key");
+    }
+
+    #[test]
+    fn is_empty_placeholder_recognises_n_a_and_null_strings() {
+        let output = parse_structured_output(
+            r#"{
+                "summary": "ok",
+                "critical_facts": ["N/A"],
+                "constraints": ["NULL"],
+                "operational_scars": ["None"],
+                "next_step": "n/a"
+            }"#,
+        )
+        .expect("placeholder strings should be filtered");
+        assert!(output.critical_facts.is_empty());
+        assert!(output.constraints.is_empty());
+        assert!(output.operational_scars.is_empty());
+        assert!(output.next_step.text.is_empty());
+    }
+
+    #[test]
+    fn is_empty_placeholder_recognises_empty_object_and_array() {
+        let output = parse_structured_output(
+            r#"{
+                "summary": "ok",
+                "critical_facts": [{}],
+                "next_step": {}
+            }"#,
+        )
+        .expect("empty object/array placeholders should be filtered");
+        assert!(output.critical_facts.is_empty());
+        assert!(output.next_step.text.is_empty());
+    }
+
+    #[test]
+    fn parse_evidence_text_no_separator_returns_whole_text() {
+        let note = parse_evidence_text("simple fact without pipe");
+        assert_eq!(note.text, "simple fact without pipe");
+        assert!(note.evidence.is_empty());
+    }
+
+    #[test]
+    fn parse_evidence_text_separator_but_no_valid_ids() {
+        let note = parse_evidence_text("fact || not-an-id, also-not");
+        assert_eq!(note.text, "fact || not-an-id, also-not");
+        assert!(note.evidence.is_empty());
+    }
+
+    #[test]
+    fn parse_evidence_text_multiple_pipes_joins_text() {
+        let note = parse_evidence_text("part one || part two || e1");
+        assert_eq!(note.text, "part one || part two");
+        assert_eq!(note.evidence, vec!["e1"]);
+    }
+
+    #[test]
+    fn parse_decision_text_single_field() {
+        let note = parse_decision_text("bare decision");
+        assert_eq!(note.text, "bare decision");
+        assert!(note.rationale.is_empty());
+        assert!(note.evidence.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_text_two_fields_no_evidence() {
+        let note = parse_decision_text("choose X || because Y");
+        assert_eq!(note.text, "choose X");
+        assert_eq!(note.rationale, "because Y");
+        assert!(note.evidence.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_text_three_fields_but_last_not_evidence() {
+        let note = parse_decision_text("choose X || because Y || not-ids");
+        assert_eq!(note.text, "choose X");
+        assert_eq!(note.rationale, "because Y || not-ids");
+        assert!(note.evidence.is_empty());
+    }
+
+    #[test]
+    fn parse_evidence_ids_rejects_invalid_formats() {
+        assert!(parse_evidence_ids("").is_empty());
+        assert!(parse_evidence_ids("123").is_empty());
+        assert!(parse_evidence_ids("AB1").is_empty());
+        assert!(parse_evidence_ids("e1a").is_empty());
+    }
+
+    #[test]
+    fn parse_evidence_ids_accepts_single_letter_prefix() {
+        // A single lowercase letter with no digits is technically valid
+        // per the filter (empty digit sequence passes `.all()`)
+        let ids = parse_evidence_ids("e");
+        assert_eq!(ids, vec!["e"]);
+    }
+
+    #[test]
+    fn parse_evidence_ids_accepts_various_prefixes() {
+        let ids = parse_evidence_ids("a1, e2, d3, f4, k5, h6, i7, s8, t9, p10, r11");
+        assert_eq!(ids.len(), 11);
+        assert_eq!(ids[0], "a1");
+        assert_eq!(ids[10], "r11");
+    }
+
+    #[test]
+    fn split_fields_filters_empty_parts() {
+        let fields = split_fields("a || || b ||");
+        assert_eq!(fields, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn structured_output_schema_has_required_keys() {
+        let schema = structured_output_schema();
+        let required = schema["required"].as_array().unwrap();
+        let keys: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(keys.contains(&"summary"));
+        assert!(keys.contains(&"critical_facts"));
+        assert!(keys.contains(&"decisions"));
+        assert!(keys.contains(&"next_step"));
+    }
+
+    #[test]
+    fn nanos_to_ms_converts_correctly() {
+        assert_eq!(nanos_to_ms(Some(1_500_000_000)), 1500);
+        assert_eq!(nanos_to_ms(None), 0);
+        assert_eq!(nanos_to_ms(Some(0)), 0);
+        assert_eq!(nanos_to_ms(Some(999_999)), 0);
+    }
+
+    #[test]
+    fn hypotheses_from_meta_lessons_filters_sparse_and_high_p() {
+        let lessons = vec![
+            MetaLesson {
+                pattern: "file paths help".into(),
+                feature_name: "file_path".into(),
+                category: TruthCategory::CriticalFact,
+                direction: LessonDirection::SurvivedMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 10,
+                    lost_with_feature: 2,
+                    survived_without_feature: 3,
+                    lost_without_feature: 8,
+                    rate_with_feature: 0.83,
+                    rate_without_feature: 0.27,
+                    chi_squared: 9.0,
+                    p_value: 0.003,
+                    adjusted_p_value: 0.01,
+                    sparse_cells: false,
+                },
+                confidence: 0.9,
+                sample_size: 23,
+                benchmark_classes: 4,
+            },
+            MetaLesson {
+                pattern: "sparse pattern".into(),
+                feature_name: "sparse_feat".into(),
+                category: TruthCategory::Constraint,
+                direction: LessonDirection::LostMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 1,
+                    lost_with_feature: 1,
+                    survived_without_feature: 1,
+                    lost_without_feature: 1,
+                    rate_with_feature: 0.5,
+                    rate_without_feature: 0.5,
+                    chi_squared: 0.0,
+                    p_value: 1.0,
+                    adjusted_p_value: 1.0,
+                    sparse_cells: true,
+                },
+                confidence: 0.1,
+                sample_size: 4,
+                benchmark_classes: 1,
+            },
+            MetaLesson {
+                pattern: "high p-value".into(),
+                feature_name: "weak_feat".into(),
+                category: TruthCategory::Decision,
+                direction: LessonDirection::SurvivedMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 5,
+                    lost_with_feature: 5,
+                    survived_without_feature: 5,
+                    lost_without_feature: 5,
+                    rate_with_feature: 0.5,
+                    rate_without_feature: 0.5,
+                    chi_squared: 0.0,
+                    p_value: 0.5,
+                    adjusted_p_value: 0.5,
+                    sparse_cells: false,
+                },
+                confidence: 0.5,
+                sample_size: 20,
+                benchmark_classes: 4,
+            },
+        ];
+        let result = hypotheses_from_meta_lessons(&lessons);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].feature_name, "file_path");
+        assert!(result[0].category.contains("CriticalFact"));
+        assert!(result[0].direction.contains("SurvivedMore"));
+        assert_eq!(result[0].hint, "file paths help");
+    }
+
+    #[test]
+    fn hypotheses_from_kernel_items_filters_correctly() {
+        use crate::continuity::{
+            ContinuityItemRecord, ContinuityKind, ContinuityRetentionState, ContinuityStatus,
+        };
+        use crate::model::Scope;
+
+        let now = chrono::Utc::now();
+        let make_item =
+            |kind: ContinuityKind, status: ContinuityStatus, extra: serde_json::Value| {
+                ContinuityItemRecord {
+                    id: "item-1".into(),
+                    memory_id: "mem-1".into(),
+                    context_id: "ctx-1".into(),
+                    namespace: "ns".into(),
+                    task_id: "task".into(),
+                    author_agent_id: "agent".into(),
+                    kind,
+                    scope: Scope::Project,
+                    status,
+                    title: "Test hypothesis".into(),
+                    body: "body".into(),
+                    importance: 0.9,
+                    confidence: 0.9,
+                    salience: 0.9,
+                    retention: ContinuityRetentionState {
+                        class: "hypothesis".into(),
+                        age_hours: 1.0,
+                        half_life_hours: 36.0,
+                        floor: 0.03,
+                        decay_multiplier: 1.0,
+                        effective_salience: 0.9,
+                    },
+                    created_at: now,
+                    updated_at: now,
+                    supersedes_id: None,
+                    resolved_at: None,
+                    supports: Vec::new(),
+                    extra,
+                }
+            };
+
+        let eligible = make_item(
+            ContinuityKind::Hypothesis,
+            ContinuityStatus::Open,
+            serde_json::json!({
+                "requires_validation": true,
+                "feature_name": "file_path",
+                "category": "CriticalFact",
+                "direction": "survived_more",
+                "evidence": { "sparse_cells": false }
+            }),
+        );
+        let sparse = make_item(
+            ContinuityKind::Hypothesis,
+            ContinuityStatus::Open,
+            serde_json::json!({
+                "requires_validation": true,
+                "evidence": { "sparse_cells": true }
+            }),
+        );
+        let wrong_kind = make_item(
+            ContinuityKind::Fact,
+            ContinuityStatus::Open,
+            serde_json::json!({ "requires_validation": true }),
+        );
+        let resolved = make_item(
+            ContinuityKind::Hypothesis,
+            ContinuityStatus::Resolved,
+            serde_json::json!({ "requires_validation": true }),
+        );
+        let no_validation = make_item(
+            ContinuityKind::Hypothesis,
+            ContinuityStatus::Open,
+            serde_json::json!({ "requires_validation": false }),
+        );
+
+        let items = vec![eligible, sparse, wrong_kind, resolved, no_validation];
+        let result = hypotheses_from_kernel_items(&items);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].feature_name, "file_path");
+        assert_eq!(result[0].category, "CriticalFact");
+        assert_eq!(result[0].direction, "survived_more");
+        assert_eq!(result[0].hint, "Test hypothesis");
+    }
+
+    #[test]
+    fn hypotheses_from_kernel_items_uses_defaults_for_missing_fields() {
+        use crate::continuity::{
+            ContinuityItemRecord, ContinuityKind, ContinuityRetentionState, ContinuityStatus,
+        };
+        use crate::model::Scope;
+
+        let now = chrono::Utc::now();
+        let item = ContinuityItemRecord {
+            id: "item-1".into(),
+            memory_id: "mem-1".into(),
+            context_id: "ctx-1".into(),
+            namespace: "ns".into(),
+            task_id: "task".into(),
+            author_agent_id: "agent".into(),
+            kind: ContinuityKind::Hypothesis,
+            scope: Scope::Project,
+            status: ContinuityStatus::Open,
+            title: "Hint title".into(),
+            body: "body".into(),
+            importance: 0.9,
+            confidence: 0.9,
+            salience: 0.9,
+            retention: ContinuityRetentionState {
+                class: "hypothesis".into(),
+                age_hours: 1.0,
+                half_life_hours: 36.0,
+                floor: 0.03,
+                decay_multiplier: 1.0,
+                effective_salience: 0.9,
+            },
+            created_at: now,
+            updated_at: now,
+            supersedes_id: None,
+            resolved_at: None,
+            supports: Vec::new(),
+            extra: serde_json::json!({
+                "requires_validation": true,
+                "evidence": { "sparse_cells": false }
+            }),
+        };
+        let result = hypotheses_from_kernel_items(&[item]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].feature_name, "unknown");
+        assert_eq!(result[0].category, "unknown");
+        assert_eq!(result[0].direction, "unknown");
+    }
+
+    #[test]
+    fn evidence_note_deserializes_from_full_object() {
+        let note: EvidenceNote =
+            serde_json::from_value(serde_json::json!({"text": "a fact", "evidence": ["e1", "e2"]}))
+                .unwrap();
+        assert_eq!(note.text, "a fact");
+        assert_eq!(note.evidence, vec!["e1", "e2"]);
+    }
+
+    #[test]
+    fn evidence_note_deserializes_from_plain_string() {
+        let note: EvidenceNote =
+            serde_json::from_value(serde_json::json!("inline fact || f1")).unwrap();
+        assert_eq!(note.text, "inline fact");
+        assert_eq!(note.evidence, vec!["f1"]);
+    }
+
+    #[test]
+    fn decision_note_deserializes_from_full_object() {
+        let note: DecisionNote = serde_json::from_value(serde_json::json!({
+            "text": "choose A",
+            "rationale": "because B",
+            "evidence": ["d1"]
+        }))
+        .unwrap();
+        assert_eq!(note.text, "choose A");
+        assert_eq!(note.rationale, "because B");
+        assert_eq!(note.evidence, vec!["d1"]);
+    }
+
+    #[test]
+    fn decision_note_deserializes_from_plain_string_with_three_parts() {
+        let note: DecisionNote =
+            serde_json::from_value(serde_json::json!("choose A || because B || d1")).unwrap();
+        assert_eq!(note.text, "choose A");
+        assert_eq!(note.rationale, "because B");
+        assert_eq!(note.evidence, vec!["d1"]);
+    }
+
+    #[test]
+    fn action_note_deserializes_from_string_and_object() {
+        let from_str: ActionNote = serde_json::from_value(serde_json::json!("run tests")).unwrap();
+        assert_eq!(from_str.text, "run tests");
+        assert!(from_str.evidence.is_empty());
+
+        let from_obj: ActionNote = serde_json::from_value(serde_json::json!({
+            "text": "deploy",
+            "evidence": ["a1"]
+        }))
+        .unwrap();
+        assert_eq!(from_obj.text, "deploy");
+        assert_eq!(from_obj.evidence, vec!["a1"]);
+    }
+
+    #[test]
+    fn parse_evidence_list_handles_single_non_array_value() {
+        let output =
+            parse_structured_output(r#"{"summary":"test","critical_facts":"single fact || e1"}"#)
+                .unwrap();
+        assert_eq!(output.critical_facts.len(), 1);
+        assert_eq!(output.critical_facts[0].text, "single fact");
+        assert_eq!(output.critical_facts[0].evidence, vec!["e1"]);
+    }
+
+    #[test]
+    fn parse_decision_list_handles_single_object() {
+        let output = parse_structured_output(
+            r#"{"summary":"test","decisions":{"text":"only one","rationale":"reason","evidence":["d1"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(output.decisions.len(), 1);
+        assert_eq!(output.decisions[0].text, "only one");
+        assert_eq!(output.decisions[0].rationale, "reason");
     }
 }
