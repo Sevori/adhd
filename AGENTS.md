@@ -2,6 +2,75 @@
 
 Every agent working on this repo — Claude Code, subagents, MCP-spawned heads, CI bots, organism workers — MUST operate under the identity defined in [IDENTITY.md](./IDENTITY.md). No exceptions. No "professional mode". No watered-down version. Read it. Internalise it. Be it.
 
+## How The Documents Fit Together
+
+Four documents. Each has a job. Here's when you use each one:
+
+| Document | What it is | When to read it | When to change it |
+|----------|-----------|-----------------|-------------------|
+| **[IDENTITY.md](./IDENTITY.md)** | WHO you are. The persona. The thinking style. | Start of every session. When you catch yourself hedging. | Almost never. This is the soul. |
+| **[SPEC.md](./SPEC.md)** | WHAT the system is. Data model, tools, correctness criteria. | Before implementing anything. Before reviewing a PR. Before arguing about behaviour. | When the system's behaviour needs to change. Spec changes FIRST, code changes SECOND. |
+| **[AGENTS.md](./AGENTS.md)** (this file) | HOW to work. Workflows, decision trees, quality gates. | When you're unsure about process. | When a workflow is broken or missing. |
+| **[CLAUDE.md](./CLAUDE.md)** | Quick-reference for Claude Code sessions. Build commands, module map. | Every session (auto-loaded). | When tooling or project structure changes. |
+
+**The flow:** IDENTITY.md shapes HOW you think -> SPEC.md tells you WHAT is true -> this file tells you WHAT TO DO -> CLAUDE.md gives you the shortcuts.
+
+## Concrete Workflows
+
+### Starting a Task
+
+```
+1. Read IDENTITY.md (are you the persona? if not, /persona)
+2. Define success: "How will I know this worked?" Write it down.
+3. Check SPEC.md: does this task change system behaviour?
+   YES -> update SPEC.md first, then implement
+   NO  -> proceed to implementation
+4. Check the current state: make check, read the relevant code
+5. Research: go to the internet, check what exists, read the papers
+6. Build (brute force first), measure, kill or keep
+```
+
+### Changing System Behaviour
+
+The persona says "define success before starting." The spec is where you define it for ICE.
+
+```
+1. Open SPEC.md
+2. Write the change as you want it to be true
+   (e.g., add a new MCP tool, change a decay parameter, add a benchmark metric)
+3. make test — the tests should FAIL now (your spec is ahead of the code)
+4. Implement until tests pass
+5. If tests already passed, your spec change was cosmetic, not behavioural. Ask why.
+```
+
+This is spec-driven development. The persona's "no ambiguity" principle means: if you can't write it in SPEC.md, you don't understand it well enough to build it.
+
+### Reviewing a PR
+
+The persona says "go to the source." The source is SPEC.md, not the code.
+
+```
+1. Does this PR change behaviour?
+   YES -> is SPEC.md updated? If not, reject.
+   NO  -> skip to code review.
+2. Read the SPEC.md diff first. Does the behaviour change make sense?
+3. Read the code. Does it implement the spec correctly?
+4. Run make test && make lint. Clean?
+5. Check survival analysis: does this change affect benchmark metrics?
+```
+
+### When You're Lost
+
+The persona says "ask the stupid question." Here's the decision tree:
+
+```
+- "What should this function do?"     -> Read SPEC.md
+- "How should I phrase this?"         -> Read IDENTITY.md (blunt, surgical, no filler)
+- "What's the build command?"         -> Read CLAUDE.md
+- "Should I even be doing this?"      -> Define success. If you can't, ask.
+- "This request is too vague"         -> Say "WTF are you trying to say?" and mean it
+```
+
 ## Before You Touch Anything
 
 1. **Read IDENTITY.md.** If you haven't, stop. Go read it now. You are that person.
@@ -59,6 +128,23 @@ make build         # Clean build
 ```
 
 No exceptions. No "it passes locally". No "the lint warning is a false positive". Fix it or explain why it's unfixable with evidence.
+
+## Trust Hierarchy
+
+Not all files are equal. The spec is the source of truth. The code is downstream.
+
+**Severity tiers for changes:**
+
+| Tier | Files | Review bar |
+|------|-------|------------|
+| **Critical** | `SPEC.md`, `IDENTITY.md`, `AGENTS.md` | These define what the system IS. Changing them changes everything downstream. Treat like constitutional amendments. |
+| **High** | `CLAUDE.md`, `skills/*/SKILL.md` | Agent behaviour instructions. Changes alter how every future session operates. |
+| **Normal** | `src/**/*.rs`, `tests/**`, `Cargo.toml` | Implementation. Regenerable from the spec. Still review carefully, but the spec is what matters. |
+| **Low** | `Makefile`, `.github/**`, docs | Tooling and process. Change freely. |
+
+If a change to source code contradicts `SPEC.md`, the code is wrong. If a change to `SPEC.md` makes the benchmarks fail, update the code — the spec is the intent, the benchmarks validate it.
+
+Reference: [Bootstrapping Coding Agents](https://www.monperrus.net/martin/coding-agent-bootstrap) (Monperrus, 2026) — "The specification is the stable artifact, not the implementation."
 
 ## The Religion
 
