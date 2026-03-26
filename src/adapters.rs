@@ -70,6 +70,16 @@ pub struct AgentContinuationOutput {
     pub next_step: ActionNote,
 }
 
+/// A survival hypothesis extracted from Phase 2 meta-analysis, ready for
+/// injection into the extraction prompt (Phase 3 closed-loop validation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurvivalHypothesis {
+    pub feature_name: String,
+    pub category: String,
+    pub direction: String,
+    pub hint: String,
+}
+
 pub trait AgentAdapter {
     fn config(&self) -> &AgentAdapterConfig;
     fn analyze(
@@ -77,6 +87,16 @@ pub trait AgentAdapter {
         objective: &str,
         context_text: &str,
     ) -> Result<(AgentContinuationOutput, ModelCallMetrics)>;
+    /// Analyse with optional survival hypothesis injection (Phase 3).
+    /// Default ignores hypotheses; concrete adapters override.
+    fn analyze_with_hypotheses(
+        &self,
+        objective: &str,
+        context_text: &str,
+        _hypotheses: &[SurvivalHypothesis],
+    ) -> Result<(AgentContinuationOutput, ModelCallMetrics)> {
+        self.analyze(objective, context_text)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +117,20 @@ impl OllamaAdapter {
         render_structured_resume_prompt(self.config.role.as_str(), objective, context_text)
     }
 
+    fn prompt_with_hypotheses(
+        &self,
+        objective: &str,
+        context_text: &str,
+        hypotheses: &[SurvivalHypothesis],
+    ) -> String {
+        render_structured_resume_prompt_with_hypotheses(
+            self.config.role.as_str(),
+            objective,
+            context_text,
+            hypotheses,
+        )
+    }
+
     fn ensure_success(&self) -> Result<()> {
         let response = self
             .client
@@ -111,22 +145,15 @@ impl OllamaAdapter {
         }
         Ok(())
     }
-}
 
-impl AgentAdapter for OllamaAdapter {
-    fn config(&self) -> &AgentAdapterConfig {
-        &self.config
-    }
-
-    fn analyze(
+    fn generate_with_prompt(
         &self,
-        objective: &str,
-        context_text: &str,
+        prompt: String,
     ) -> Result<(AgentContinuationOutput, ModelCallMetrics)> {
         self.ensure_success()?;
         let request = OllamaGenerateRequest {
             model: self.config.model.clone(),
-            prompt: self.prompt(objective, context_text),
+            prompt,
             format: structured_output_schema(),
             stream: false,
             options: OllamaOptions {
@@ -163,6 +190,29 @@ impl AgentAdapter for OllamaAdapter {
                 prompt_eval_count: payload.prompt_eval_count.unwrap_or_default(),
             },
         ))
+    }
+}
+
+impl AgentAdapter for OllamaAdapter {
+    fn config(&self) -> &AgentAdapterConfig {
+        &self.config
+    }
+
+    fn analyze(
+        &self,
+        objective: &str,
+        context_text: &str,
+    ) -> Result<(AgentContinuationOutput, ModelCallMetrics)> {
+        self.generate_with_prompt(self.prompt(objective, context_text))
+    }
+
+    fn analyze_with_hypotheses(
+        &self,
+        objective: &str,
+        context_text: &str,
+        hypotheses: &[SurvivalHypothesis],
+    ) -> Result<(AgentContinuationOutput, ModelCallMetrics)> {
+        self.generate_with_prompt(self.prompt_with_hypotheses(objective, context_text, hypotheses))
     }
 }
 
@@ -249,6 +299,16 @@ pub fn structured_output_schema() -> Value {
 }
 
 pub fn render_structured_resume_prompt(role: &str, objective: &str, context_text: &str) -> String {
+    render_structured_resume_prompt_with_hypotheses(role, objective, context_text, &[])
+}
+
+pub fn render_structured_resume_prompt_with_hypotheses(
+    role: &str,
+    objective: &str,
+    context_text: &str,
+    hypotheses: &[SurvivalHypothesis],
+) -> String {
+    let hints = render_hypothesis_hints(hypotheses);
     format!(
         "You are a {role} agent resuming work inside a Shared Continuity Kernel.\n\
 Return JSON only with keys summary, critical_facts, constraints, decisions, open_hypotheses, operational_scars, avoid_repeating, next_step.\n\
@@ -276,13 +336,101 @@ Examples:\n\
 Do not invent unsupported facts. Omit weak claims instead of guessing.\n\
 If a list has no good item, return an empty array []. If next_step is unknown, return an empty string.\n\
 Keep the output compact: summary under 30 words, next_step under 20 words, each list with at most 2 items, and each item text under 18 words.\n\
+{hints}\
 Objective: {objective}\n\
 \n\
 Context:\n{context_text}\n",
         role = role,
+        hints = hints,
         objective = objective,
         context_text = context_text,
     )
+}
+
+/// Render survival hypothesis hints as prompt directives.
+///
+/// When hypotheses are present, they become `[SURVIVAL HINTS]` directives
+/// instructing the model to emphasise features correlated with survival.
+pub fn render_hypothesis_hints(hypotheses: &[SurvivalHypothesis]) -> String {
+    if hypotheses.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["[SURVIVAL HINTS] The following patterns are statistically correlated with better information survival. Apply them when extracting items:".to_string()];
+    for (i, h) in hypotheses.iter().enumerate() {
+        lines.push(format!("{}. [{}] {}", i + 1, h.category, h.hint));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// Extract eligible survival hypotheses from Phase 2 MetaLessons.
+/// Only hypotheses with `sparse_cells: false` and `adjusted_p_value < 0.05` qualify.
+pub fn hypotheses_from_meta_lessons(
+    lessons: &[crate::benchmark::MetaLesson],
+) -> Vec<SurvivalHypothesis> {
+    lessons
+        .iter()
+        .filter(|l| !l.evidence.sparse_cells && l.evidence.adjusted_p_value < 0.05)
+        .map(|l| SurvivalHypothesis {
+            feature_name: l.feature_name.clone(),
+            category: format!("{:?}", l.category),
+            direction: format!("{:?}", l.direction),
+            hint: l.pattern.clone(),
+        })
+        .collect()
+}
+
+/// Extract survival hypotheses from kernel Hypothesis items written by Phase 2.
+///
+/// Filters for items that have `requires_validation: true` in extra and
+/// are not flagged with `sparse_cells: true` in their evidence.
+pub fn hypotheses_from_kernel_items(
+    items: &[crate::continuity::ContinuityItemRecord],
+) -> Vec<SurvivalHypothesis> {
+    items
+        .iter()
+        .filter(|item| {
+            item.kind == crate::continuity::ContinuityKind::Hypothesis
+                && item.status.is_open()
+                && item
+                    .extra
+                    .get("requires_validation")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                && item
+                    .extra
+                    .get("evidence")
+                    .and_then(|e| e.get("sparse_cells"))
+                    .and_then(|v| v.as_bool())
+                    != Some(true)
+        })
+        .map(|item| {
+            let feature_name = item
+                .extra
+                .get("feature_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let category = item
+                .extra
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let direction = item
+                .extra
+                .get("direction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            SurvivalHypothesis {
+                feature_name,
+                category,
+                direction,
+                hint: item.title.clone(),
+            }
+        })
+        .collect()
 }
 
 fn string_array_schema(max_length: usize) -> Value {
@@ -544,7 +692,67 @@ fn is_empty_placeholder(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_structured_output;
+    use super::{
+        SurvivalHypothesis, parse_structured_output, render_hypothesis_hints,
+        render_structured_resume_prompt_with_hypotheses,
+    };
+
+    #[test]
+    fn render_hypothesis_hints_empty_produces_empty_string() {
+        assert_eq!(render_hypothesis_hints(&[]), "");
+    }
+
+    #[test]
+    fn render_hypothesis_hints_formats_directives() {
+        let hypotheses = vec![
+            SurvivalHypothesis {
+                feature_name: "file_path".into(),
+                category: "CriticalFact".into(),
+                direction: "survived_more".into(),
+                hint: "Include file paths in critical facts — items with file paths survive 90% vs 10% without".into(),
+            },
+            SurvivalHypothesis {
+                feature_name: "prohibition_framing".into(),
+                category: "Constraint".into(),
+                direction: "survived_more".into(),
+                hint: "Use prohibition framing (never/avoid/must not) for constraints".into(),
+            },
+        ];
+        let hints = render_hypothesis_hints(&hypotheses);
+        assert!(hints.contains("[SURVIVAL HINTS]"));
+        assert!(hints.contains("1. [CriticalFact]"));
+        assert!(hints.contains("2. [Constraint]"));
+        assert!(hints.contains("file paths survive 90%"));
+        assert!(hints.contains("prohibition framing"));
+    }
+
+    #[test]
+    fn prompt_with_hypotheses_includes_hints_section() {
+        let hypotheses = vec![SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "survived_more".into(),
+            hint: "Include file paths".into(),
+        }];
+        let prompt = render_structured_resume_prompt_with_hypotheses(
+            "tester",
+            "test objective",
+            "some context",
+            &hypotheses,
+        );
+        assert!(prompt.contains("[SURVIVAL HINTS]"));
+        assert!(prompt.contains("Include file paths"));
+        assert!(prompt.contains("test objective"));
+        assert!(prompt.contains("some context"));
+    }
+
+    #[test]
+    fn prompt_without_hypotheses_matches_original() {
+        let original = super::render_structured_resume_prompt("tester", "obj", "ctx");
+        let with_empty =
+            render_structured_resume_prompt_with_hypotheses("tester", "obj", "ctx", &[]);
+        assert_eq!(original, with_empty);
+    }
 
     #[test]
     fn parser_accepts_scalar_and_boolean_fallbacks() {

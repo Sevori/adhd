@@ -10,8 +10,8 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::adapters::{
     AgentAdapter, AgentAdapterConfig, AgentContinuationOutput, DecisionNote, EvidenceNote,
-    ModelCallMetrics, OllamaAdapter, parse_structured_output, render_structured_resume_prompt,
-    structured_output_schema,
+    ModelCallMetrics, OllamaAdapter, SurvivalHypothesis, parse_structured_output,
+    render_structured_resume_prompt, structured_output_schema,
 };
 use crate::continuity::{
     AttachAgentInput, ContextRead, ContinuityHandoffInput, ContinuityItemInput, ContinuityKind,
@@ -183,6 +183,8 @@ pub struct BenchmarkSuiteReport {
     pub summary: BenchmarkSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta_lessons: Option<MetaLessonReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase3: Option<Phase3ValidationReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -567,6 +569,9 @@ pub struct BenchmarkClassReport {
     pub metrics: BenchmarkMetrics,
     pub resource: ResourceEnvelope,
     pub artifacts: Vec<String>,
+    /// Phase 3: A/B comparison of hypothesis injection (treatment) vs control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypothesis_injection: Option<Phase3ClassResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -736,9 +741,13 @@ struct SurfacedItem {
 pub fn run_continuity_suite(config: ContinuityBenchConfig) -> Result<BenchmarkSuiteReport> {
     std::fs::create_dir_all(&config.output_dir)?;
     let started = Utc::now();
+
+    // Phase 3: load hypotheses from previous meta-lessons if available.
+    let prior_hypotheses = load_prior_hypotheses(&config.output_dir);
+
     let mut classes = Vec::new();
     for class in config.selected_classes() {
-        classes.push(run_class(class, &config)?);
+        classes.push(run_class(class, &config, &prior_hypotheses)?);
     }
     let summary = summarize(&classes);
     let mut report = BenchmarkSuiteReport {
@@ -747,8 +756,10 @@ pub fn run_continuity_suite(config: ContinuityBenchConfig) -> Result<BenchmarkSu
         classes,
         summary,
         meta_lessons: None,
+        phase3: None,
     };
 
+    // Phase 2: generate meta-lessons from this run.
     let meta = generate_meta_lessons(&[report.clone()], 0.05);
     if !meta.lessons.is_empty() {
         let meta_path = config.output_dir.join("meta-lessons.json");
@@ -756,11 +767,51 @@ pub fn run_continuity_suite(config: ContinuityBenchConfig) -> Result<BenchmarkSu
     }
     report.meta_lessons = Some(meta);
 
+    // Phase 3: if we injected hypotheses, generate validation report.
+    if !prior_hypotheses.is_empty() {
+        let class_results: Vec<Phase3ClassResult> = report
+            .classes
+            .iter()
+            .filter_map(|cr| cr.hypothesis_injection.clone())
+            .collect();
+        if !class_results.is_empty() {
+            let cycle = detect_validation_cycle(&config.output_dir);
+            let phase3 = generate_phase3_report(&class_results, &prior_hypotheses, cycle);
+            let phase3_path = config.output_dir.join("phase3-report.json");
+            std::fs::write(&phase3_path, serde_json::to_vec_pretty(&phase3)?)?;
+            report.phase3 = Some(phase3);
+        }
+    }
+
     let suite_report_path = config.output_dir.join("suite-report.json");
     std::fs::write(&suite_report_path, serde_json::to_vec_pretty(&report)?)?;
     let summary_path = config.output_dir.join("summary.md");
     std::fs::write(&summary_path, render_suite_markdown(&report))?;
     Ok(report)
+}
+
+/// Load survival hypotheses from a previous meta-lessons.json in the output directory.
+fn load_prior_hypotheses(output_dir: &Path) -> Vec<SurvivalHypothesis> {
+    let meta_path = output_dir.join("meta-lessons.json");
+    let Ok(contents) = std::fs::read_to_string(&meta_path) else {
+        return Vec::new();
+    };
+    let Ok(report) = serde_json::from_str::<MetaLessonReport>(&contents) else {
+        return Vec::new();
+    };
+    extract_eligible_hypotheses(&report)
+}
+
+/// Detect which validation cycle we are on by counting prior phase3 reports.
+fn detect_validation_cycle(output_dir: &Path) -> usize {
+    let phase3_path = output_dir.join("phase3-report.json");
+    let Ok(contents) = std::fs::read_to_string(&phase3_path) else {
+        return 1;
+    };
+    let Ok(prior) = serde_json::from_str::<Phase3ValidationReport>(&contents) else {
+        return 1;
+    };
+    prior.cycle + 1
 }
 
 pub fn export_market_head_challenge(
@@ -1492,6 +1543,7 @@ fn load_market_head_same_pack_report(
 fn run_class(
     class: BenchmarkClass,
     config: &ContinuityBenchConfig,
+    hypotheses: &[SurvivalHypothesis],
 ) -> Result<BenchmarkClassReport> {
     let scenario = scenario_for(class);
     let class_root = config.output_dir.join(class.slug());
@@ -1692,6 +1744,23 @@ fn run_class(
         storage_bytes: storage_bytes(&class_root)?,
         gpu_report: gpu_report(config),
     };
+    let hypothesis_injection = if !hypotheses.is_empty() {
+        match run_phase3_injection(
+            &class_root,
+            class,
+            &context.id,
+            &scenario,
+            &small_b,
+            config,
+            hypotheses,
+        ) {
+            Ok(result) => Some(result),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let report = BenchmarkClassReport {
         class,
         scenario_id: scenario.id.clone(),
@@ -1700,6 +1769,7 @@ fn run_class(
         metrics,
         resource,
         artifacts: vec![full_transcript.model, config.small_model.clone()],
+        hypothesis_injection,
     };
     let report_path = class_root.join("report.json");
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
@@ -2089,6 +2159,177 @@ fn run_baseline_inner(
         artifacts,
         continuity_path,
     })
+}
+
+/// Run Phase 3 A/B comparison: control (no hypotheses) vs treatment (with hypotheses).
+///
+/// Both arms use the same context envelope for fair comparison.
+fn run_phase3_injection(
+    class_root: &Path,
+    class: BenchmarkClass,
+    context_id: &str,
+    scenario: &Scenario,
+    adapter: &impl AgentAdapter,
+    config: &ContinuityBenchConfig,
+    hypotheses: &[SurvivalHypothesis],
+) -> Result<Phase3ClassResult> {
+    let kernel = SharedContinuityKernel::open(class_root)?;
+    let (envelope, _continuity_path) = build_context_envelope(
+        &kernel,
+        class,
+        BaselineKind::SharedContinuity,
+        context_id,
+        scenario,
+        adapter.config().agent_id.as_str(),
+        config.token_budget,
+        config.candidate_limit,
+        config.recent_window,
+    )?;
+
+    // Control arm: standard prompt (no hypotheses)
+    let control_result = adapter.analyze(&scenario.objective, &envelope.text);
+    let (control_survival, control_eval) = match control_result {
+        Ok((output, _metrics)) => {
+            let repaired = repair_output_from_envelope(output, &envelope);
+            let eval = evaluate_output(&repaired, &scenario.truth, &envelope);
+            let survival = benchmark_survival_analysis(&repaired, &scenario.truth, &envelope);
+            (Some(survival), eval)
+        }
+        Err(_) => (None, failed_evaluation(&envelope)),
+    };
+
+    // Treatment arm: prompt with hypothesis injection
+    let treatment_result =
+        adapter.analyze_with_hypotheses(&scenario.objective, &envelope.text, hypotheses);
+    let (treatment_survival, treatment_eval) = match treatment_result {
+        Ok((output, _metrics)) => {
+            let repaired = repair_output_from_envelope(output, &envelope);
+            let eval = evaluate_output(&repaired, &scenario.truth, &envelope);
+            let survival = benchmark_survival_analysis(&repaired, &scenario.truth, &envelope);
+            (Some(survival), eval)
+        }
+        Err(_) => (None, failed_evaluation(&envelope)),
+    };
+
+    let delta_ras = treatment_eval.resume_accuracy_score - control_eval.resume_accuracy_score;
+    let delta_cfsr =
+        treatment_eval.critical_fact_survival_rate - control_eval.critical_fact_survival_rate;
+    let delta_csr = treatment_eval.constraint_survival_rate - control_eval.constraint_survival_rate;
+    let delta_osr =
+        treatment_eval.operational_scar_retention - control_eval.operational_scar_retention;
+
+    Ok(Phase3ClassResult {
+        class,
+        control_survival,
+        treatment_survival,
+        hypotheses: hypotheses.to_vec(),
+        delta_ras,
+        delta_cfsr,
+        delta_csr,
+        delta_osr,
+    })
+}
+
+/// Aggregate per-class Phase 3 results into a suite-level validation report.
+pub fn generate_phase3_report(
+    class_results: &[Phase3ClassResult],
+    hypotheses: &[SurvivalHypothesis],
+    cycle: usize,
+) -> Phase3ValidationReport {
+    let mut results = Vec::new();
+
+    for hypothesis in hypotheses {
+        let category = match hypothesis.category.as_str() {
+            "CriticalFact" => TruthCategory::CriticalFact,
+            "Constraint" => TruthCategory::Constraint,
+            "Decision" => TruthCategory::Decision,
+            "OperationalScar" => TruthCategory::OperationalScar,
+            _ => continue,
+        };
+
+        let mut treatment_reports = Vec::new();
+        let mut control_reports = Vec::new();
+        for cr in class_results {
+            if let Some(ref ts) = cr.treatment_survival {
+                treatment_reports.push((cr.class, ts.clone()));
+            }
+            if let Some(ref cs) = cr.control_survival {
+                control_reports.push((cr.class, cs.clone()));
+            }
+        }
+
+        let mut positive_classes = 0usize;
+        let mut total_classes = 0usize;
+        let mut total_control_rate = 0.0f64;
+        let mut total_treatment_rate = 0.0f64;
+
+        for (class, treatment_survival) in &treatment_reports {
+            let control_survival = control_reports
+                .iter()
+                .find(|(c, _)| c == class)
+                .map(|(_, s)| s);
+            let Some(control_survival) = control_survival else {
+                continue;
+            };
+            let treatment_rate = category_rate(treatment_survival, category);
+            let control_rate = category_rate(control_survival, category);
+            if treatment_rate.is_nan() || control_rate.is_nan() {
+                continue;
+            }
+            total_classes += 1;
+            total_control_rate += control_rate;
+            total_treatment_rate += treatment_rate;
+            if treatment_rate > control_rate {
+                positive_classes += 1;
+            }
+        }
+
+        let avg_control = if total_classes > 0 {
+            total_control_rate / total_classes as f64
+        } else {
+            0.0
+        };
+        let avg_treatment = if total_classes > 0 {
+            total_treatment_rate / total_classes as f64
+        } else {
+            0.0
+        };
+        let improvement = avg_treatment - avg_control;
+        let promoted =
+            improvement > 0.05 && total_classes >= 3 && positive_classes * 2 > total_classes;
+        let rejected = total_classes >= 3 && improvement <= 0.0;
+
+        results.push(HypothesisValidationResult {
+            feature_name: hypothesis.feature_name.clone(),
+            category,
+            direction: if hypothesis.direction.contains("Survived") {
+                LessonDirection::SurvivedMore
+            } else {
+                LessonDirection::LostMore
+            },
+            control_survival_rate: avg_control,
+            treatment_survival_rate: avg_treatment,
+            absolute_improvement: improvement,
+            positive_classes,
+            total_classes,
+            promoted,
+            rejected,
+        });
+    }
+
+    let promoted_count = results.iter().filter(|r| r.promoted).count();
+    let rejected_count = results.iter().filter(|r| r.rejected).count();
+    let converged = cycle >= 5 && promoted_count == 0;
+
+    Phase3ValidationReport {
+        generated_at: Utc::now().to_rfc3339(),
+        cycle,
+        hypotheses_tested: results.len(),
+        results,
+        promoted_count,
+        rejected_count,
+        converged,
+    }
 }
 
 fn build_context_envelope(
@@ -2856,6 +3097,94 @@ pub struct MetaLessonReport {
     pub candidates_tested: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: Closed-loop hypothesis validation types
+// ---------------------------------------------------------------------------
+
+/// Distinguishes treatment (with hypothesis injection) from control arms.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase3Arm {
+    Treatment,
+    Control,
+}
+
+/// Per-hypothesis validation result comparing treatment vs control survival.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HypothesisValidationResult {
+    pub feature_name: String,
+    pub category: TruthCategory,
+    pub direction: LessonDirection,
+    pub control_survival_rate: f64,
+    pub treatment_survival_rate: f64,
+    pub absolute_improvement: f64,
+    pub positive_classes: usize,
+    pub total_classes: usize,
+    pub promoted: bool,
+    pub rejected: bool,
+}
+
+/// Full Phase 3 validation report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Phase3ValidationReport {
+    pub generated_at: String,
+    pub cycle: usize,
+    pub hypotheses_tested: usize,
+    pub results: Vec<HypothesisValidationResult>,
+    pub promoted_count: usize,
+    pub rejected_count: usize,
+    pub converged: bool,
+}
+
+/// Per-class Phase 3 injection result: control vs treatment on same envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Phase3ClassResult {
+    pub class: BenchmarkClass,
+    pub control_survival: Option<SurvivalReport>,
+    pub treatment_survival: Option<SurvivalReport>,
+    pub hypotheses: Vec<SurvivalHypothesis>,
+    pub delta_ras: f64,
+    pub delta_cfsr: f64,
+    pub delta_csr: f64,
+    pub delta_osr: f64,
+}
+
+/// Extract eligible survival hypotheses from a `MetaLessonReport`.
+///
+/// Only hypotheses with `sparse_cells: false` and `adjusted_p_value < 0.05`
+/// are eligible for prompt injection.
+pub fn extract_eligible_hypotheses(report: &MetaLessonReport) -> Vec<SurvivalHypothesis> {
+    report
+        .lessons
+        .iter()
+        .filter(|lesson| !lesson.evidence.sparse_cells && lesson.evidence.adjusted_p_value < 0.05)
+        .map(|lesson| {
+            let hint = format!(
+                "{} (survival rate {:.0}% with vs {:.0}% without, p={:.4})",
+                lesson.pattern,
+                lesson.evidence.rate_with_feature * 100.0,
+                lesson.evidence.rate_without_feature * 100.0,
+                lesson.evidence.adjusted_p_value,
+            );
+            SurvivalHypothesis {
+                feature_name: lesson.feature_name.clone(),
+                category: format!("{:?}", lesson.category),
+                direction: format!("{:?}", lesson.direction),
+                hint,
+            }
+        })
+        .collect()
+}
+
+fn category_rate(survival: &SurvivalReport, category: TruthCategory) -> f64 {
+    match category {
+        TruthCategory::CriticalFact => survival.facts.rate,
+        TruthCategory::Constraint => survival.constraints.rate,
+        TruthCategory::Decision => survival.decisions.rate,
+        TruthCategory::OperationalScar => survival.scars.rate,
+    }
+}
+
 /// Run survival analysis comparing model output against ground truth.
 fn benchmark_survival_analysis(
     output: &AgentContinuationOutput,
@@ -3441,6 +3770,80 @@ pub fn write_meta_lessons_to_kernel(
         return Ok(Vec::new());
     }
     kernel.write_derivations(inputs)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Closed-loop hypothesis validation functions
+// ---------------------------------------------------------------------------
+
+/// Write Phase 3 validation outcomes to the kernel.
+///
+/// Promoted hypotheses become `Lesson` items. Rejected hypotheses are resolved.
+pub fn write_phase3_outcomes_to_kernel(
+    kernel: &SharedContinuityKernel,
+    context_id: &str,
+    report: &Phase3ValidationReport,
+) -> Result<Vec<crate::continuity::ContinuityItemRecord>> {
+    let mut records = Vec::new();
+
+    for result in &report.results {
+        if result.promoted {
+            let input = ContinuityItemInput {
+                context_id: context_id.to_string(),
+                author_agent_id: "metacognitive-validator".to_string(),
+                kind: ContinuityKind::Lesson,
+                title: format!(
+                    "validated-survival-pattern: {} ({:?})",
+                    result.feature_name, result.category
+                ),
+                body: format!(
+                    "VALIDATED: {:?} items with feature '{}' show {:.1}% absolute improvement \
+                     in survival rate (treatment {:.1}% vs control {:.1}%). \
+                     Positive in {}/{} benchmark classes. Promoted from hypothesis after \
+                     Phase 3 closed-loop validation cycle {}.",
+                    result.category,
+                    result.feature_name,
+                    result.absolute_improvement * 100.0,
+                    result.treatment_survival_rate * 100.0,
+                    result.control_survival_rate * 100.0,
+                    result.positive_classes,
+                    result.total_classes,
+                    report.cycle,
+                ),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.85),
+                confidence: Some(0.9),
+                salience: Some(0.8),
+                layer: Some(MemoryLayer::Semantic),
+                supports: Vec::new(),
+                dimensions: vec![
+                    DimensionValue {
+                        key: "metacognitive_phase".into(),
+                        value: "3".into(),
+                        weight: 100,
+                    },
+                    DimensionValue {
+                        key: "validation_status".into(),
+                        value: "promoted".into(),
+                        weight: 80,
+                    },
+                ],
+                extra: serde_json::json!({
+                    "feature_name": result.feature_name,
+                    "category": result.category,
+                    "absolute_improvement": result.absolute_improvement,
+                    "treatment_rate": result.treatment_survival_rate,
+                    "control_rate": result.control_survival_rate,
+                    "cycle": report.cycle,
+                }),
+            };
+            let written = kernel.write_derivations(vec![input])?;
+            records.extend(written);
+        }
+    }
+
+    Ok(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -4953,25 +5356,30 @@ fn trim_text(text: &str, max: usize) -> String {
 mod tests {
     use super::{
         BaselineKind, BaselineRunReport, BaselineStatus, BenchmarkClass, BenchmarkClassReport,
-        BenchmarkMetrics, ContextEnvelope, ContinuityBenchConfig, ContinuityPathKind,
-        ContinuityPathReport, ContinuityPathRole, Evaluation, GroundTruth, JudgeCalibrationVerdict,
-        JudgeEvaluation, LessonDirection, MarketHeadChallengeCaseEvaluation,
-        MarketHeadChallengeConfig, MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
+        BenchmarkMetrics, CategoryStats, ContextEnvelope, ContinuityBenchConfig,
+        ContinuityPathKind, ContinuityPathReport, ContinuityPathRole, Evaluation, GroundTruth,
+        HypothesisValidationResult, JudgeCalibrationVerdict, JudgeEvaluation, LessonDirection,
+        MarketHeadChallengeCaseEvaluation, MarketHeadChallengeConfig,
+        MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
         MarketHeadJudgeCaseEvaluation, MarketHeadJudgeComparisonEntry,
         MarketHeadJudgeEvaluationReport, MarketHeadJudgeSamePackComparisonReport,
-        MarketHeadJudgeSummary, MetaLesson, MetaLessonEvidence, MetaLessonReport, ResourceEnvelope,
-        SurfacedItem, SurvivalOutcome, TruthCategory, TruthItem, benchmark_survival_analysis,
-        benjamini_hochberg, build_context_envelope, chi_squared_2x2, compare_feature_distributions,
+        MarketHeadJudgeSummary, MetaLesson, MetaLessonEvidence, MetaLessonReport,
+        Phase3ClassResult, Phase3ValidationReport, ResourceEnvelope, SurfacedItem, SurvivalOutcome,
+        SurvivalReport, TruthCategory, TruthItem, benchmark_survival_analysis,
+        build_context_envelope, chi_squared_2x2, compare_feature_distributions,
         compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
         compare_market_head_judge_pack, compare_market_head_same_pack, erfc_approx,
         evaluate_market_head_challenge, evaluate_market_head_judge_challenge,
-        export_market_head_challenge, export_market_head_judge_challenge, generate_meta_lessons,
+        export_market_head_challenge, export_market_head_judge_challenge,
+        extract_eligible_hypotheses, generate_meta_lessons, generate_phase3_report,
         populate_scenario, render_market_head_judge_calibration_markdown,
         render_market_head_judge_disagreement_markdown, render_market_head_judge_pack_markdown,
         render_market_head_judge_prompt, render_market_head_same_pack_markdown,
         render_suite_markdown, repair_output_from_envelope, scenario_for,
     };
-    use crate::adapters::{AgentContinuationOutput, DecisionNote, EvidenceNote, ModelCallMetrics};
+    use crate::adapters::{
+        AgentContinuationOutput, DecisionNote, EvidenceNote, ModelCallMetrics, SurvivalHypothesis,
+    };
     use crate::benchmark::{BenchmarkSuiteReport, BenchmarkSummary};
     use crate::continuity::{
         AttachAgentInput, OpenContextInput, SharedContinuityKernel, SnapshotInput,
@@ -6008,9 +6416,11 @@ mod tests {
                 metrics: BenchmarkMetrics::default(),
                 resource: ResourceEnvelope::default(),
                 artifacts: Vec::new(),
+                hypothesis_injection: None,
             }],
             summary: BenchmarkSummary::default(),
             meta_lessons: None,
+            phase3: None,
         };
 
         let markdown = render_suite_markdown(&report);
@@ -6053,9 +6463,11 @@ mod tests {
                 metrics: BenchmarkMetrics::default(),
                 resource: ResourceEnvelope::default(),
                 artifacts: Vec::new(),
+                hypothesis_injection: None,
             }],
             summary: BenchmarkSummary::default(),
             meta_lessons: None,
+            phase3: None,
         };
 
         let markdown = render_suite_markdown(&report);
@@ -6917,9 +7329,11 @@ mod tests {
                 metrics: BenchmarkMetrics::default(),
                 resource: ResourceEnvelope::default(),
                 artifacts: Vec::new(),
+                hypothesis_injection: None,
             }],
             summary: BenchmarkSummary::default(),
             meta_lessons: None,
+            phase3: None,
         };
 
         let meta = generate_meta_lessons(&[suite], 0.05);
@@ -6934,5 +7348,453 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&meta).unwrap();
         assert!(json.contains("total_records"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_eligible_hypotheses_filters_sparse_and_high_p() {
+        let report = MetaLessonReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            total_records: 100,
+            candidates_tested: 3,
+            lessons: vec![
+                MetaLesson {
+                    pattern: "File paths survive better".into(),
+                    feature_name: "file_path".into(),
+                    category: TruthCategory::CriticalFact,
+                    direction: LessonDirection::SurvivedMore,
+                    evidence: MetaLessonEvidence {
+                        survived_with_feature: 9,
+                        lost_with_feature: 1,
+                        survived_without_feature: 1,
+                        lost_without_feature: 9,
+                        rate_with_feature: 0.9,
+                        rate_without_feature: 0.1,
+                        chi_squared: 12.8,
+                        p_value: 0.001,
+                        adjusted_p_value: 0.003,
+                        sparse_cells: false,
+                    },
+                    confidence: 0.99,
+                    sample_size: 20,
+                    benchmark_classes: 3,
+                },
+                MetaLesson {
+                    pattern: "Sparse hypothesis".into(),
+                    feature_name: "numeric_ref".into(),
+                    category: TruthCategory::Constraint,
+                    direction: LessonDirection::LostMore,
+                    evidence: MetaLessonEvidence {
+                        survived_with_feature: 2,
+                        lost_with_feature: 1,
+                        survived_without_feature: 1,
+                        lost_without_feature: 2,
+                        rate_with_feature: 0.67,
+                        rate_without_feature: 0.33,
+                        chi_squared: 1.0,
+                        p_value: 0.3,
+                        adjusted_p_value: 0.3,
+                        sparse_cells: true,
+                    },
+                    confidence: 0.5,
+                    sample_size: 6,
+                    benchmark_classes: 3,
+                },
+                MetaLesson {
+                    pattern: "High p-value".into(),
+                    feature_name: "aspiration_framing".into(),
+                    category: TruthCategory::Decision,
+                    direction: LessonDirection::SurvivedMore,
+                    evidence: MetaLessonEvidence {
+                        survived_with_feature: 5,
+                        lost_with_feature: 5,
+                        survived_without_feature: 5,
+                        lost_without_feature: 5,
+                        rate_with_feature: 0.5,
+                        rate_without_feature: 0.5,
+                        chi_squared: 0.0,
+                        p_value: 0.99,
+                        adjusted_p_value: 0.99,
+                        sparse_cells: false,
+                    },
+                    confidence: 0.01,
+                    sample_size: 20,
+                    benchmark_classes: 3,
+                },
+            ],
+        };
+
+        let eligible = extract_eligible_hypotheses(&report);
+        assert_eq!(
+            eligible.len(),
+            1,
+            "only the non-sparse, low-p hypothesis qualifies"
+        );
+        assert_eq!(eligible[0].feature_name, "file_path");
+    }
+
+    #[test]
+    fn generate_phase3_report_promotes_strong_improvement() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "SurvivedMore".into(),
+            hint: "Include file paths".into(),
+        };
+
+        let control_survival = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats {
+                total: 10,
+                survived: 6,
+                lost: 4,
+                rate: 0.6,
+                ..Default::default()
+            },
+            constraints: CategoryStats::default(),
+            decisions: CategoryStats::default(),
+            scars: CategoryStats::default(),
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+        let treatment_survival = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats {
+                total: 10,
+                survived: 9,
+                lost: 1,
+                rate: 0.9,
+                ..Default::default()
+            },
+            constraints: CategoryStats::default(),
+            decisions: CategoryStats::default(),
+            scars: CategoryStats::default(),
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+
+        let class_results: Vec<Phase3ClassResult> = [
+            BenchmarkClass::AgentSwapSurvival,
+            BenchmarkClass::StrongToSmallContinuation,
+            BenchmarkClass::SmallToSmallRelay,
+        ]
+        .iter()
+        .map(|&class| Phase3ClassResult {
+            class,
+            control_survival: Some(control_survival.clone()),
+            treatment_survival: Some(treatment_survival.clone()),
+            hypotheses: vec![hypothesis.clone()],
+            delta_ras: 0.3,
+            delta_cfsr: 0.3,
+            delta_csr: 0.0,
+            delta_osr: 0.0,
+        })
+        .collect();
+
+        let report = generate_phase3_report(&class_results, &[hypothesis], 1);
+        assert_eq!(report.hypotheses_tested, 1);
+        let result = &report.results[0];
+        assert!((result.absolute_improvement - 0.3).abs() < 0.001);
+        assert!(result.promoted);
+        assert!(!result.rejected);
+        assert!(!report.converged);
+    }
+
+    #[test]
+    fn generate_phase3_report_rejects_negative_improvement() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "aspiration_framing".into(),
+            category: "Constraint".into(),
+            direction: "SurvivedMore".into(),
+            hint: "Use aspiration framing".into(),
+        };
+
+        let control = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats::default(),
+            constraints: CategoryStats {
+                total: 10,
+                survived: 8,
+                lost: 2,
+                rate: 0.8,
+                ..Default::default()
+            },
+            decisions: CategoryStats::default(),
+            scars: CategoryStats::default(),
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+        let treatment = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats::default(),
+            constraints: CategoryStats {
+                total: 10,
+                survived: 5,
+                lost: 5,
+                rate: 0.5,
+                ..Default::default()
+            },
+            decisions: CategoryStats::default(),
+            scars: CategoryStats::default(),
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+
+        let class_results: Vec<Phase3ClassResult> = [
+            BenchmarkClass::AgentSwapSurvival,
+            BenchmarkClass::StrongToSmallContinuation,
+            BenchmarkClass::SmallToSmallRelay,
+        ]
+        .iter()
+        .map(|&class| Phase3ClassResult {
+            class,
+            control_survival: Some(control.clone()),
+            treatment_survival: Some(treatment.clone()),
+            hypotheses: vec![hypothesis.clone()],
+            delta_ras: -0.3,
+            delta_cfsr: 0.0,
+            delta_csr: -0.3,
+            delta_osr: 0.0,
+        })
+        .collect();
+
+        let report = generate_phase3_report(&class_results, &[hypothesis], 1);
+        assert_eq!(report.rejected_count, 1);
+        assert!(report.results[0].rejected);
+        assert!(!report.results[0].promoted);
+    }
+
+    #[test]
+    fn generate_phase3_report_converges_after_five_cycles() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "SurvivedMore".into(),
+            hint: "Include file paths".into(),
+        };
+
+        let same_survival = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats {
+                total: 10,
+                survived: 7,
+                lost: 3,
+                rate: 0.7,
+                ..Default::default()
+            },
+            constraints: CategoryStats::default(),
+            decisions: CategoryStats::default(),
+            scars: CategoryStats::default(),
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+
+        let class_results: Vec<Phase3ClassResult> = [
+            BenchmarkClass::AgentSwapSurvival,
+            BenchmarkClass::StrongToSmallContinuation,
+            BenchmarkClass::SmallToSmallRelay,
+        ]
+        .iter()
+        .map(|&class| Phase3ClassResult {
+            class,
+            control_survival: Some(same_survival.clone()),
+            treatment_survival: Some(same_survival.clone()),
+            hypotheses: vec![hypothesis.clone()],
+            delta_ras: 0.0,
+            delta_cfsr: 0.0,
+            delta_csr: 0.0,
+            delta_osr: 0.0,
+        })
+        .collect();
+
+        let report = generate_phase3_report(&class_results, &[hypothesis], 5);
+        assert!(
+            report.converged,
+            "cycle 5 with no promotion should converge"
+        );
+    }
+
+    #[test]
+    fn phase3_validation_report_serialization_roundtrip() {
+        let report = Phase3ValidationReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            cycle: 1,
+            hypotheses_tested: 1,
+            results: vec![HypothesisValidationResult {
+                feature_name: "file_path".into(),
+                category: TruthCategory::CriticalFact,
+                direction: LessonDirection::SurvivedMore,
+                control_survival_rate: 0.6,
+                treatment_survival_rate: 0.9,
+                absolute_improvement: 0.3,
+                positive_classes: 3,
+                total_classes: 3,
+                promoted: true,
+                rejected: false,
+            }],
+            promoted_count: 1,
+            rejected_count: 0,
+            converged: false,
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: Phase3ValidationReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.results.len(), 1);
+        assert_eq!(parsed.promoted_count, 1);
+        assert!(!parsed.converged);
+    }
+
+    #[test]
+    fn load_prior_hypotheses_returns_empty_for_missing_file() {
+        let dir = tempdir().unwrap();
+        let result = super::load_prior_hypotheses(dir.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn load_prior_hypotheses_parses_valid_meta_lessons() {
+        let dir = tempdir().unwrap();
+        let meta = MetaLessonReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            total_records: 20,
+            candidates_tested: 1,
+            lessons: vec![MetaLesson {
+                pattern: "File paths survive better".into(),
+                feature_name: "file_path".into(),
+                category: TruthCategory::CriticalFact,
+                direction: LessonDirection::SurvivedMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 9,
+                    lost_with_feature: 1,
+                    survived_without_feature: 1,
+                    lost_without_feature: 9,
+                    rate_with_feature: 0.9,
+                    rate_without_feature: 0.1,
+                    chi_squared: 12.8,
+                    p_value: 0.001,
+                    adjusted_p_value: 0.003,
+                    sparse_cells: false,
+                },
+                confidence: 0.99,
+                sample_size: 20,
+                benchmark_classes: 3,
+            }],
+        };
+        let meta_path = dir.path().join("meta-lessons.json");
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        let result = super::load_prior_hypotheses(dir.path());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].feature_name, "file_path");
+    }
+
+    #[test]
+    fn detect_validation_cycle_returns_1_when_no_prior() {
+        let dir = tempdir().unwrap();
+        assert_eq!(super::detect_validation_cycle(dir.path()), 1);
+    }
+
+    #[test]
+    fn detect_validation_cycle_increments_from_prior() {
+        let dir = tempdir().unwrap();
+        let prior = Phase3ValidationReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            cycle: 3,
+            hypotheses_tested: 1,
+            results: Vec::new(),
+            promoted_count: 0,
+            rejected_count: 0,
+            converged: false,
+        };
+        let path = dir.path().join("phase3-report.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&prior).unwrap()).unwrap();
+
+        assert_eq!(super::detect_validation_cycle(dir.path()), 4);
+    }
+
+    #[test]
+    fn phase3_class_result_serialization_roundtrip() {
+        let result = Phase3ClassResult {
+            class: BenchmarkClass::AgentSwapSurvival,
+            control_survival: None,
+            treatment_survival: None,
+            hypotheses: vec![SurvivalHypothesis {
+                feature_name: "file_path".into(),
+                category: "CriticalFact".into(),
+                direction: "SurvivedMore".into(),
+                hint: "Include file paths".into(),
+            }],
+            delta_ras: 0.15,
+            delta_cfsr: 0.10,
+            delta_csr: 0.0,
+            delta_osr: 0.0,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: Phase3ClassResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.class, BenchmarkClass::AgentSwapSurvival);
+        assert!((parsed.delta_ras - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn hypotheses_from_meta_lessons_filters_correctly() {
+        use crate::adapters::hypotheses_from_meta_lessons;
+
+        let lessons = vec![
+            MetaLesson {
+                pattern: "Good hypothesis".into(),
+                feature_name: "file_path".into(),
+                category: TruthCategory::CriticalFact,
+                direction: LessonDirection::SurvivedMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 9,
+                    lost_with_feature: 1,
+                    survived_without_feature: 1,
+                    lost_without_feature: 9,
+                    rate_with_feature: 0.9,
+                    rate_without_feature: 0.1,
+                    chi_squared: 12.8,
+                    p_value: 0.001,
+                    adjusted_p_value: 0.003,
+                    sparse_cells: false,
+                },
+                confidence: 0.99,
+                sample_size: 20,
+                benchmark_classes: 3,
+            },
+            MetaLesson {
+                pattern: "Sparse one".into(),
+                feature_name: "numeric_ref".into(),
+                category: TruthCategory::Constraint,
+                direction: LessonDirection::LostMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 2,
+                    lost_with_feature: 1,
+                    survived_without_feature: 1,
+                    lost_without_feature: 2,
+                    rate_with_feature: 0.67,
+                    rate_without_feature: 0.33,
+                    chi_squared: 1.0,
+                    p_value: 0.01,
+                    adjusted_p_value: 0.02,
+                    sparse_cells: true,
+                },
+                confidence: 0.5,
+                sample_size: 6,
+                benchmark_classes: 3,
+            },
+        ];
+
+        let result = hypotheses_from_meta_lessons(&lessons);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].feature_name, "file_path");
+        assert_eq!(result[0].category, "CriticalFact");
     }
 }

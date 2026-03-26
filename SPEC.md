@@ -134,6 +134,38 @@ Output: `MetaLessonReport` serialized to `meta-lessons.json` alongside the suite
 
 **Prior art:** Reflexion (Shinn et al., 2023) reflects on task failures; Meta-Policy Reflexion (arXiv 2509.03990) extracts corrective action rules; MemMA (arXiv 2603.18718) does backward error propagation through memory. None analyse memory forgetting patterns to mutate extraction behaviour — but none claim to until the loop is closed.
 
+#### Phase 3: Closed-Loop Hypothesis Injection
+
+Phase 3 closes the metacognitive loop by making the extraction prompt dynamic. Survival hypotheses from Phase 2 are injected into the prompt as extraction guidance, and their impact on survival rates is measured via A/B comparison.
+
+**Mechanism:**
+
+1. Before building the extraction prompt, load prior `MetaLessonReport` from the output directory. Extract eligible hypotheses (non-sparse, adjusted p < 0.05).
+2. Convert qualifying hypotheses into `SurvivalHypothesis` directives: each carries a feature name, category, direction (survived_more / lost_more), and a natural-language hint for prompt injection.
+3. `render_structured_resume_prompt` accepts an optional `&[SurvivalHypothesis]` slice. When non-empty, a `[SURVIVAL HINTS]` section is appended to the prompt instructing the model to bias extraction toward features correlated with survival (e.g., "Include file paths in critical facts — items with file paths survive at 90% vs 10% without").
+4. During benchmark runs, each class runs two variants of the `SharedContinuity` baseline on the same envelope: one **without** hypothesis injection (control) and one **with** injection (treatment).
+5. The `BenchmarkClassReport` gains an optional `hypothesis_injection` field containing the `Phase3ClassResult` with control and treatment survival reports plus per-metric deltas.
+6. A/B delta is computed per metric (CFSR, CSR, OSR, RAS) as `treatment - control`. Positive delta = hypothesis helped.
+
+**Data types:**
+- `SurvivalHypothesis`: extracted from `MetaLesson`, contains `feature_name`, `category`, `direction`, and a human-readable `hint` for prompt injection.
+- `Phase3ValidationReport`: contains per-hypothesis treatment vs control survival rates, absolute improvement, and promotion/rejection decisions.
+- `Phase3ClassResult`: per-class A/B result with control and treatment survival, hypotheses, and metric deltas.
+- `HypothesisValidationResult`: per-hypothesis validation comparing treatment vs control across classes.
+
+**Promotion criteria:**
+- If treatment survival rate > control by >= 5% absolute across >= 3 benchmark classes, and positive in > 50% of classes, the hypothesis is promoted from `Hypothesis` to `Lesson` (status: `Active`).
+- If treatment <= control across >= 3 classes, the hypothesis is rejected (status: `Rejected`).
+- Otherwise the hypothesis remains `Open` for further cycles.
+
+**Statistical safeguards:**
+- Only hypotheses with `sparse_cells: false` and `adjusted_p_value < 0.05` are eligible for injection.
+- A hypothesis is only promoted if the improvement is consistent (positive in > 50% of individual benchmark classes).
+
+**Convergence:** After 5 validation cycles with no hypothesis producing > 5% improvement, the metacognitive loop is declared converged and stops generating new hypotheses.
+
+**Output:** `Phase3ValidationReport` serialized to `phase3-report.json` alongside the suite report.
+
 ## CLI
 
 ```
