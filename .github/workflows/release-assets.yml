@@ -52,16 +52,16 @@ jobs:
           done
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            # Release exists — force it to draft so assets can be uploaded
             is_draft=$(gh release view "$RELEASE_TAG" --json isDraft -q '.isDraft')
-            if [ "$is_draft" != "true" ]; then
-              echo "Release exists but is published. Converting to draft."
-              gh release edit "$RELEASE_TAG" --draft
-            else
+            if [ "$is_draft" = "true" ]; then
               echo "Release already in draft state."
+            else
+              # Published releases are immutable on GitHub — delete and recreate as draft.
+              echo "Release exists but is published (immutable). Recreating as draft."
+              gh release delete "$RELEASE_TAG" --yes
+              gh release create "$RELEASE_TAG" --draft --title "${RELEASE_TAG#ice-}" --generate-notes
             fi
           else
-            # No release yet — create a draft
             echo "No release found for $RELEASE_TAG. Creating draft."
             gh release create "$RELEASE_TAG" --draft --title "${RELEASE_TAG#ice-}" --generate-notes
           fi
