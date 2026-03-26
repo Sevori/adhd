@@ -971,7 +971,7 @@ fn run_phase3_injection(
 }
 
 /// Aggregate per-class Phase 3 results into a suite-level validation report.
-pub fn generate_phase3_report(
+pub(crate) fn generate_phase3_report(
     class_results: &[Phase3ClassResult],
     hypotheses: &[SurvivalHypothesis],
     cycle: usize,
@@ -1893,7 +1893,7 @@ pub struct Phase3ClassResult {
 ///
 /// Only hypotheses with `sparse_cells: false` and `adjusted_p_value < 0.05`
 /// are eligible for prompt injection.
-pub fn extract_eligible_hypotheses(report: &MetaLessonReport) -> Vec<SurvivalHypothesis> {
+pub(crate) fn extract_eligible_hypotheses(report: &MetaLessonReport) -> Vec<SurvivalHypothesis> {
     report
         .lessons
         .iter()
@@ -2382,7 +2382,7 @@ fn compare_feature_distributions(
     (lessons, candidates_tested)
 }
 
-pub fn generate_meta_lessons(
+pub(crate) fn generate_meta_lessons(
     reports: &[BenchmarkSuiteReport],
     fdr_threshold: f64,
 ) -> MetaLessonReport {

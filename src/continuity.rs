@@ -1519,35 +1519,28 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
         has_provenance: primary_fact.5,
     });
 
-    if let Some(item) = read.decisions.first() {
-        registers.push(HandoffProofRegister {
-            label: "pd1".to_string(),
-            register_kind: "decision".to_string(),
+    let push_item_register = |regs: &mut Vec<HandoffProofRegister>,
+                              label: &str,
+                              kind: &str,
+                              item: &ContinuityItemRecord| {
+        regs.push(HandoffProofRegister {
+            label: label.to_string(),
+            register_kind: kind.to_string(),
             source_id: item.id.clone(),
             title: item.title.clone(),
             body: trim_text(&item.body, PROOF_TRIM_LIMIT),
             has_provenance: !item.supports.is_empty(),
         });
+    };
+
+    if let Some(item) = read.decisions.first() {
+        push_item_register(&mut registers, "pd1", "decision", item);
     }
     if let Some(item) = read.constraints.first() {
-        registers.push(HandoffProofRegister {
-            label: "pk1".to_string(),
-            register_kind: "constraint".to_string(),
-            source_id: item.id.clone(),
-            title: item.title.clone(),
-            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
-            has_provenance: !item.supports.is_empty(),
-        });
+        push_item_register(&mut registers, "pk1", "constraint", item);
     }
     if let Some(item) = read.operational_scars.first() {
-        registers.push(HandoffProofRegister {
-            label: "ps1".to_string(),
-            register_kind: "scar".to_string(),
-            source_id: item.id.clone(),
-            title: item.title.clone(),
-            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
-            has_provenance: !item.supports.is_empty(),
-        });
+        push_item_register(&mut registers, "ps1", "scar", item);
     }
     if let Some(item) = read
         .working_state
@@ -1557,14 +1550,7 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
         })
         .or_else(|| read.working_state.first())
     {
-        registers.push(HandoffProofRegister {
-            label: "pn1".to_string(),
-            register_kind: "next_step".to_string(),
-            source_id: item.id.clone(),
-            title: item.title.clone(),
-            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
-            has_provenance: !item.supports.is_empty(),
-        });
+        push_item_register(&mut registers, "pn1", "next_step", item);
     }
 
     let digest = registers

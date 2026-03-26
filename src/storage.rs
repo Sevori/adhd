@@ -7102,33 +7102,21 @@ fn compiler_rank_items_by_support_graph(
         }
     }
 
+    let score_of = |id: &str| -> (bool, f64) {
+        let outgoing = outgoing_support_scores.get(id).copied().unwrap_or_default();
+        let incoming = incoming_support_scores.get(id).copied().unwrap_or_default();
+        (outgoing > 0.0, outgoing * 1.2 + incoming * 0.35)
+    };
+
     items.sort_by(|left, right| {
-        let left_outgoing = outgoing_support_scores
-            .get(&left.id)
-            .copied()
-            .unwrap_or_default();
-        let right_outgoing = outgoing_support_scores
-            .get(&right.id)
-            .copied()
-            .unwrap_or_default();
-        let left_incoming = incoming_support_scores
-            .get(&left.id)
-            .copied()
-            .unwrap_or_default();
-        let right_incoming = incoming_support_scores
-            .get(&right.id)
-            .copied()
-            .unwrap_or_default();
-        let left_graph_score = left_outgoing * 1.2 + left_incoming * 0.35;
-        let right_graph_score = right_outgoing * 1.2 + right_incoming * 0.35;
-        let left_anchor = left_outgoing > 0.0;
-        let right_anchor = right_outgoing > 0.0;
+        let (left_anchor, left_graph) = score_of(&left.id);
+        let (right_anchor, right_graph) = score_of(&right.id);
 
         right_anchor
             .cmp(&left_anchor)
             .then_with(|| {
-                right_graph_score
-                    .partial_cmp(&left_graph_score)
+                right_graph
+                    .partial_cmp(&left_graph)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| {
