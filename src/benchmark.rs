@@ -576,6 +576,8 @@ pub struct BaselineRunReport {
     pub model_metrics: ModelCallMetrics,
     pub envelope_tokens: usize,
     pub evaluation: Evaluation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub survival: Option<SurvivalReport>,
     pub failure: Option<String>,
     pub artifacts: Vec<String>,
     pub continuity_path: Option<ContinuityPathReport>,
@@ -1956,6 +1958,7 @@ fn analyze_and_write_back(
         model_metrics: context.model_metrics,
         envelope_tokens: context.envelope.token_estimate,
         evaluation: context.evaluation,
+        survival: context.survival,
         failure: context.failure,
         artifacts: context.artifacts,
         continuity_path: context.continuity_path,
@@ -1992,6 +1995,7 @@ fn run_baseline(
         model_metrics: run.model_metrics,
         envelope_tokens: run.envelope.token_estimate,
         evaluation: run.evaluation,
+        survival: run.survival,
         failure: run.failure,
         artifacts: run.artifacts,
         continuity_path: run.continuity_path,
@@ -2003,6 +2007,7 @@ struct BaselineExecution {
     output: AgentContinuationOutput,
     model_metrics: ModelCallMetrics,
     evaluation: Evaluation,
+    survival: Option<SurvivalReport>,
     status: BaselineStatus,
     failure: Option<String>,
     artifacts: Vec<String>,
@@ -2036,15 +2041,17 @@ fn run_baseline_inner(
         config.candidate_limit,
         config.recent_window,
     )?;
-    let (output, model_metrics, evaluation, status, failure) =
+    let (output, model_metrics, evaluation, survival, status, failure) =
         match adapter.analyze(&scenario.objective, &envelope.text) {
             Ok((output, model_metrics)) => {
                 let repaired = repair_output_from_envelope(output, &envelope);
                 let evaluation = evaluate_output(&repaired, &scenario.truth, &envelope);
+                let survival = benchmark_survival_analysis(&repaired, &scenario.truth, &envelope);
                 (
                     repaired,
                     model_metrics,
                     evaluation,
+                    Some(survival),
                     BaselineStatus::Ok,
                     None,
                 )
@@ -2053,6 +2060,7 @@ fn run_baseline_inner(
                 AgentContinuationOutput::default(),
                 ModelCallMetrics::default(),
                 failed_evaluation(&envelope),
+                None,
                 BaselineStatus::Failed,
                 Some(error.to_string()),
             ),
@@ -2064,6 +2072,7 @@ fn run_baseline_inner(
         output,
         model_metrics,
         evaluation,
+        survival,
         status,
         failure,
         artifacts,
@@ -2695,6 +2704,302 @@ fn count_items(output: &AgentContinuationOutput) -> usize {
         + output.avoid_repeating.len()
         + usize::from(!output.next_step.text.trim().is_empty())
 }
+
+// ---------------------------------------------------------------------------
+// Survival analysis — Phase 1 of metacognitive continuity
+// ---------------------------------------------------------------------------
+
+/// Category of a ground truth item in the survival analysis.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TruthCategory {
+    CriticalFact,
+    Constraint,
+    Decision,
+    OperationalScar,
+}
+
+/// Whether a ground truth item survived or was lost during a benchmark run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurvivalOutcome {
+    Survived,
+    Lost,
+}
+
+/// Textual features extracted from the ground truth keywords and matching note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemFeatures {
+    /// Number of keywords in the ground truth item.
+    pub keyword_count: usize,
+    /// Total character length of all keywords.
+    pub keyword_char_length: usize,
+    /// Whether any keyword looks like a file path (contains `/` or `.rs`, `.py`, etc.).
+    pub contains_file_path: bool,
+    /// Whether any keyword looks like an error code or numeric reference.
+    pub contains_numeric_ref: bool,
+    /// The text of the note that matched, if any.
+    pub matched_note_text: Option<String>,
+    /// Approximate token count of the matched note (whitespace split).
+    pub matched_note_tokens: Option<usize>,
+    /// Whether the matched note uses prohibition framing ("do not", "never", "avoid").
+    pub prohibition_framing: Option<bool>,
+    /// Whether the matched note uses aspiration framing ("try to", "prefer", "consider").
+    pub aspiration_framing: Option<bool>,
+    /// Number of evidence IDs on the matching note.
+    pub evidence_count: Option<usize>,
+}
+
+/// Per-item survival record for a single ground truth item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurvivalRecord {
+    pub category: TruthCategory,
+    pub outcome: SurvivalOutcome,
+    pub keywords: Vec<String>,
+    pub features: ItemFeatures,
+}
+
+/// Aggregate survival statistics for a single category.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CategoryStats {
+    pub total: usize,
+    pub survived: usize,
+    pub lost: usize,
+    pub rate: f64,
+    /// Average keyword count for survived items.
+    pub avg_keyword_count_survived: f64,
+    /// Average keyword count for lost items.
+    pub avg_keyword_count_lost: f64,
+    /// Fraction of survived items containing file paths.
+    pub file_path_rate_survived: f64,
+    /// Fraction of lost items containing file paths.
+    pub file_path_rate_lost: f64,
+    /// Fraction of survived items using prohibition framing.
+    pub prohibition_rate_survived: f64,
+    /// Fraction of survived items using aspiration framing.
+    pub aspiration_rate_survived: f64,
+}
+
+/// Full survival analysis report for a benchmark run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurvivalReport {
+    pub records: Vec<SurvivalRecord>,
+    pub facts: CategoryStats,
+    pub constraints: CategoryStats,
+    pub decisions: CategoryStats,
+    pub scars: CategoryStats,
+    pub surfaced_item_count: usize,
+    pub surfaced_with_provenance: usize,
+    pub total_envelope_tokens: usize,
+}
+
+/// Run survival analysis comparing model output against ground truth.
+fn benchmark_survival_analysis(
+    output: &AgentContinuationOutput,
+    truth: &GroundTruth,
+    envelope: &ContextEnvelope,
+) -> SurvivalReport {
+    let evidence_labels: HashSet<String> =
+        envelope.surfaced.iter().map(|s| s.label.clone()).collect();
+
+    let mut records = Vec::new();
+
+    // Critical facts
+    for item in &truth.critical_facts {
+        let matched_note = output
+            .critical_facts
+            .iter()
+            .find(|note| match_keywords(&note.text, &item.keywords));
+        records.push(survival_record(
+            TruthCategory::CriticalFact,
+            item,
+            matched_note.map(|n| (n.text.as_str(), n.evidence.len())),
+        ));
+    }
+
+    // Constraints
+    for item in &truth.constraints {
+        let matched_note = output
+            .constraints
+            .iter()
+            .find(|note| match_keywords(&note.text, &item.keywords));
+        records.push(survival_record(
+            TruthCategory::Constraint,
+            item,
+            matched_note.map(|n| (n.text.as_str(), n.evidence.len())),
+        ));
+    }
+
+    // Decisions (stricter: requires rationale + evidence)
+    for item in &truth.decisions {
+        let matched_note = output.decisions.iter().find(|note| {
+            match_keywords(&note.text, &item.keywords)
+                && (item.rationale_keywords.is_empty()
+                    || match_keywords(&note.rationale, &item.rationale_keywords))
+                && note.evidence.iter().any(|id| evidence_labels.contains(id))
+        });
+        records.push(survival_record(
+            TruthCategory::Decision,
+            item,
+            matched_note.map(|n| (n.text.as_str(), n.evidence.len())),
+        ));
+    }
+
+    // Operational scars
+    for item in &truth.scars {
+        let matched_note = output
+            .operational_scars
+            .iter()
+            .find(|note| match_keywords(&note.text, &item.keywords));
+        records.push(survival_record(
+            TruthCategory::OperationalScar,
+            item,
+            matched_note.map(|n| (n.text.as_str(), n.evidence.len())),
+        ));
+    }
+
+    let facts = category_stats(&records, TruthCategory::CriticalFact);
+    let constraints = category_stats(&records, TruthCategory::Constraint);
+    let decisions = category_stats(&records, TruthCategory::Decision);
+    let scars = category_stats(&records, TruthCategory::OperationalScar);
+
+    SurvivalReport {
+        records,
+        facts,
+        constraints,
+        decisions,
+        scars,
+        surfaced_item_count: envelope.surfaced.len(),
+        surfaced_with_provenance: envelope
+            .surfaced
+            .iter()
+            .filter(|s| s.has_provenance)
+            .count(),
+        total_envelope_tokens: envelope.token_estimate,
+    }
+}
+
+fn survival_record(
+    category: TruthCategory,
+    truth_item: &TruthItem,
+    matched: Option<(&str, usize)>,
+) -> SurvivalRecord {
+    let keywords: Vec<String> = truth_item.keywords.iter().map(|k| k.to_string()).collect();
+    let contains_file_path = keywords.iter().any(|k| {
+        k.contains('/')
+            || k.ends_with(".rs")
+            || k.ends_with(".py")
+            || k.ends_with(".ts")
+            || k.ends_with(".go")
+    });
+    let contains_numeric_ref = keywords
+        .iter()
+        .any(|k| k.chars().any(|c| c.is_ascii_digit()));
+
+    let (outcome, matched_note_text, matched_note_tokens, prohibition, aspiration, evidence_count) =
+        match matched {
+            Some((text, ev_count)) => {
+                let lower = text.to_lowercase();
+                let prohibition = lower.contains("do not")
+                    || lower.contains("don't")
+                    || lower.contains("never")
+                    || lower.contains("avoid")
+                    || lower.contains("must not");
+                let aspiration = lower.contains("try to")
+                    || lower.contains("prefer")
+                    || lower.contains("consider")
+                    || lower.contains("should")
+                    || lower.contains("ideally");
+                let tokens = text.split_whitespace().count();
+                (
+                    SurvivalOutcome::Survived,
+                    Some(text.to_string()),
+                    Some(tokens),
+                    Some(prohibition),
+                    Some(aspiration),
+                    Some(ev_count),
+                )
+            }
+            None => (SurvivalOutcome::Lost, None, None, None, None, None),
+        };
+
+    SurvivalRecord {
+        category,
+        outcome,
+        keywords,
+        features: ItemFeatures {
+            keyword_count: truth_item.keywords.len(),
+            keyword_char_length: truth_item.keywords.iter().map(|k| k.len()).sum(),
+            contains_file_path,
+            contains_numeric_ref,
+            matched_note_text,
+            matched_note_tokens,
+            prohibition_framing: prohibition,
+            aspiration_framing: aspiration,
+            evidence_count,
+        },
+    }
+}
+
+fn category_stats(records: &[SurvivalRecord], category: TruthCategory) -> CategoryStats {
+    let items: Vec<&SurvivalRecord> = records.iter().filter(|r| r.category == category).collect();
+    let total = items.len();
+    if total == 0 {
+        return CategoryStats::default();
+    }
+    let survived: Vec<&&SurvivalRecord> = items
+        .iter()
+        .filter(|r| r.outcome == SurvivalOutcome::Survived)
+        .collect();
+    let lost: Vec<&&SurvivalRecord> = items
+        .iter()
+        .filter(|r| r.outcome == SurvivalOutcome::Lost)
+        .collect();
+
+    let avg_kw = |group: &[&&SurvivalRecord]| -> f64 {
+        if group.is_empty() {
+            return 0.0;
+        }
+        group
+            .iter()
+            .map(|r| r.features.keyword_count as f64)
+            .sum::<f64>()
+            / group.len() as f64
+    };
+    let file_path_rate = |group: &[&&SurvivalRecord]| -> f64 {
+        if group.is_empty() {
+            return 0.0;
+        }
+        group
+            .iter()
+            .filter(|r| r.features.contains_file_path)
+            .count() as f64
+            / group.len() as f64
+    };
+    let framing_rate =
+        |group: &[&&SurvivalRecord], extract: fn(&ItemFeatures) -> Option<bool>| -> f64 {
+            let with_data: Vec<_> = group.iter().filter_map(|r| extract(&r.features)).collect();
+            if with_data.is_empty() {
+                return 0.0;
+            }
+            with_data.iter().filter(|&&v| v).count() as f64 / with_data.len() as f64
+        };
+
+    CategoryStats {
+        total,
+        survived: survived.len(),
+        lost: lost.len(),
+        rate: survived.len() as f64 / total as f64,
+        avg_keyword_count_survived: avg_kw(&survived),
+        avg_keyword_count_lost: avg_kw(&lost),
+        file_path_rate_survived: file_path_rate(&survived),
+        file_path_rate_lost: file_path_rate(&lost),
+        prohibition_rate_survived: framing_rate(&survived, |f| f.prohibition_framing),
+        aspiration_rate_survived: framing_rate(&survived, |f| f.aspiration_framing),
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 fn repair_output_from_envelope(
     mut output: AgentContinuationOutput,
@@ -4205,12 +4510,13 @@ mod tests {
     use super::{
         BaselineKind, BaselineRunReport, BaselineStatus, BenchmarkClass, BenchmarkClassReport,
         BenchmarkMetrics, ContextEnvelope, ContinuityBenchConfig, ContinuityPathKind,
-        ContinuityPathReport, ContinuityPathRole, Evaluation, JudgeCalibrationVerdict,
+        ContinuityPathReport, ContinuityPathRole, Evaluation, GroundTruth, JudgeCalibrationVerdict,
         JudgeEvaluation, MarketHeadChallengeCaseEvaluation, MarketHeadChallengeConfig,
         MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
         MarketHeadJudgeCaseEvaluation, MarketHeadJudgeComparisonEntry,
         MarketHeadJudgeEvaluationReport, MarketHeadJudgeSamePackComparisonReport,
-        MarketHeadJudgeSummary, ResourceEnvelope, SurfacedItem, build_context_envelope,
+        MarketHeadJudgeSummary, ResourceEnvelope, SurfacedItem, SurvivalOutcome, TruthCategory,
+        TruthItem, benchmark_survival_analysis, build_context_envelope,
         compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
         compare_market_head_judge_pack, compare_market_head_same_pack,
         evaluate_market_head_challenge, evaluate_market_head_judge_challenge,
@@ -5243,6 +5549,7 @@ mod tests {
                     model_metrics: ModelCallMetrics::default(),
                     envelope_tokens: 42,
                     evaluation: Evaluation::default(),
+                    survival: None,
                     failure: None,
                     artifacts: Vec::new(),
                     continuity_path: Some(ContinuityPathReport {
@@ -5286,6 +5593,7 @@ mod tests {
                     model_metrics: ModelCallMetrics::default(),
                     envelope_tokens: 42,
                     evaluation: Evaluation::default(),
+                    survival: None,
                     failure: None,
                     artifacts: Vec::new(),
                     continuity_path: Some(ContinuityPathReport {
@@ -5584,5 +5892,244 @@ mod tests {
         assert_eq!(continuity_path.proof_register_count, 0);
         assert!(!envelope.text.contains("Section: handoff_proof"));
         assert!(!envelope.text.contains("[pd1][handoff_proof][decision]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Survival analysis tests
+    // -----------------------------------------------------------------------
+
+    fn test_truth() -> GroundTruth {
+        GroundTruth {
+            critical_facts: vec![
+                TruthItem {
+                    keywords: vec!["selector_missing", "src/query.rs"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+                TruthItem {
+                    keywords: vec!["context", "primary"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+            ],
+            constraints: vec![TruthItem {
+                keywords: vec!["preserve", "provenance"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            decisions: vec![TruthItem {
+                keywords: vec!["unified", "continuity", "interface"],
+                rationale_keywords: vec!["agent", "swap"],
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            scars: vec![TruthItem {
+                keywords: vec!["naive", "probe"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            avoid_repeating: Vec::new(),
+            next_step_keywords: Vec::new(),
+        }
+    }
+
+    fn test_envelope() -> ContextEnvelope {
+        ContextEnvelope {
+            provider: BaselineKind::SharedContinuity,
+            retrieval_ms: 42,
+            text: String::new(),
+            token_estimate: 500,
+            surfaced: vec![SurfacedItem {
+                label: "f1".into(),
+                support_type: "event".into(),
+                support_id: "ev-001".into(),
+                text: "selector_missing in src/query.rs".into(),
+                has_provenance: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn survival_analysis_classifies_survived_and_lost() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            critical_facts: vec![EvidenceNote {
+                text: "The selector_missing bug is in src/query.rs".into(),
+                evidence: vec!["f1".into()],
+            }],
+            constraints: vec![EvidenceNote {
+                text: "Do NOT modify provenance chains; preserve provenance at all costs".into(),
+                evidence: Vec::new(),
+            }],
+            decisions: vec![],
+            operational_scars: vec![EvidenceNote {
+                text: "Naive probe approach caused timeout cascade".into(),
+                evidence: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        // critical_facts: first survived (selector_missing + src/query.rs), second lost (context + primary)
+        assert_eq!(report.facts.total, 2);
+        assert_eq!(report.facts.survived, 1);
+        assert_eq!(report.facts.lost, 1);
+        assert!((report.facts.rate - 0.5).abs() < f64::EPSILON);
+
+        // constraints: survived (preserve + provenance)
+        assert_eq!(report.constraints.total, 1);
+        assert_eq!(report.constraints.survived, 1);
+
+        // decisions: lost (no output decisions at all)
+        assert_eq!(report.decisions.total, 1);
+        assert_eq!(report.decisions.lost, 1);
+
+        // scars: survived (naive + probe)
+        assert_eq!(report.scars.total, 1);
+        assert_eq!(report.scars.survived, 1);
+
+        // total records
+        assert_eq!(report.records.len(), 5);
+    }
+
+    #[test]
+    fn survival_analysis_extracts_file_path_feature() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            critical_facts: vec![EvidenceNote {
+                text: "selector_missing in src/query.rs is the root cause".into(),
+                evidence: vec!["f1".into()],
+            }],
+            ..Default::default()
+        };
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        let fact_with_path = report
+            .records
+            .iter()
+            .find(|r| {
+                r.category == TruthCategory::CriticalFact && r.outcome == SurvivalOutcome::Survived
+            })
+            .unwrap();
+        assert!(fact_with_path.features.contains_file_path);
+        assert!(fact_with_path.features.matched_note_tokens.unwrap() > 0);
+    }
+
+    #[test]
+    fn survival_analysis_detects_prohibition_framing() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            constraints: vec![EvidenceNote {
+                text: "You must NEVER break provenance. Always preserve the chain.".into(),
+                evidence: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        let constraint = report
+            .records
+            .iter()
+            .find(|r| {
+                r.category == TruthCategory::Constraint && r.outcome == SurvivalOutcome::Survived
+            })
+            .unwrap();
+        assert_eq!(constraint.features.prohibition_framing, Some(true));
+        assert_eq!(constraint.features.aspiration_framing, Some(false));
+    }
+
+    #[test]
+    fn survival_analysis_detects_aspiration_framing() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            constraints: vec![EvidenceNote {
+                text: "Try to preserve provenance where possible, consider the chain".into(),
+                evidence: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        let constraint = report
+            .records
+            .iter()
+            .find(|r| {
+                r.category == TruthCategory::Constraint && r.outcome == SurvivalOutcome::Survived
+            })
+            .unwrap();
+        assert_eq!(constraint.features.aspiration_framing, Some(true));
+    }
+
+    #[test]
+    fn survival_analysis_decision_requires_evidence() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        // Decision with right keywords but no matching evidence label -> LOST
+        let output = AgentContinuationOutput {
+            decisions: vec![DecisionNote {
+                text: "Use the unified continuity interface for all operations".into(),
+                rationale: "Agent swap requires consistent interface".into(),
+                evidence: vec!["nonexistent-label".into()],
+            }],
+            ..Default::default()
+        };
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        assert_eq!(report.decisions.total, 1);
+        assert_eq!(report.decisions.lost, 1);
+    }
+
+    #[test]
+    fn survival_analysis_empty_output_all_lost() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput::default();
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        assert_eq!(report.facts.lost, 2);
+        assert_eq!(report.constraints.lost, 1);
+        assert_eq!(report.decisions.lost, 1);
+        assert_eq!(report.scars.lost, 1);
+        assert_eq!(report.facts.rate, 0.0);
+        assert!(
+            report
+                .records
+                .iter()
+                .all(|r| r.outcome == SurvivalOutcome::Lost)
+        );
+    }
+
+    #[test]
+    fn survival_analysis_category_stats_file_path_rates() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        // Only the first fact (with file path keywords) survives
+        let output = AgentContinuationOutput {
+            critical_facts: vec![EvidenceNote {
+                text: "selector_missing in src/query.rs".into(),
+                evidence: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+
+        // The survived fact has a file path keyword, the lost one doesn't
+        assert_eq!(report.facts.file_path_rate_survived, 1.0);
+        assert_eq!(report.facts.file_path_rate_lost, 0.0);
     }
 }
