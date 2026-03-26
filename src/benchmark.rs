@@ -2824,7 +2824,13 @@ pub struct MetaLessonEvidence {
     pub rate_with_feature: f64,
     pub rate_without_feature: f64,
     pub chi_squared: f64,
+    /// Raw p-value from chi-squared test.
     pub p_value: f64,
+    /// Benjamini-Hochberg adjusted p-value controlling false discovery rate.
+    pub adjusted_p_value: f64,
+    /// Whether any cell in the 2x2 table has expected count < 5
+    /// (chi-squared unreliable; Fisher's exact test would be more appropriate).
+    pub sparse_cells: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2835,7 +2841,10 @@ pub struct MetaLesson {
     pub direction: LessonDirection,
     pub evidence: MetaLessonEvidence,
     pub confidence: f64,
-    pub support_runs: usize,
+    /// Number of survival records in the category (not independent benchmark runs).
+    pub sample_size: usize,
+    /// Number of distinct benchmark classes contributing records.
+    pub benchmark_classes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2843,6 +2852,8 @@ pub struct MetaLessonReport {
     pub generated_at: String,
     pub total_records: usize,
     pub lessons: Vec<MetaLesson>,
+    /// Number of candidate hypotheses tested before FDR correction.
+    pub candidates_tested: usize,
 }
 
 /// Run survival analysis comparing model output against ground truth.
@@ -3122,17 +3133,76 @@ const FEATURE_EXTRACTORS: &[FeatureExtractor] = &[
     },
 ];
 
+/// Check whether any expected cell count is < 5 (chi-squared unreliable).
+fn has_sparse_cells(a: usize, b: usize, c: usize, d: usize) -> bool {
+    let n = (a + b + c + d) as f64;
+    if n == 0.0 {
+        return true;
+    }
+    let row1 = (a + b) as f64;
+    let row2 = (c + d) as f64;
+    let col1 = (a + c) as f64;
+    let col2 = (b + d) as f64;
+    let expected = [
+        row1 * col1 / n,
+        row1 * col2 / n,
+        row2 * col1 / n,
+        row2 * col2 / n,
+    ];
+    expected.iter().any(|&e| e < 5.0)
+}
+
+/// Benjamini-Hochberg FDR correction on a set of p-values.
+/// Returns adjusted p-values in the same order as input.
+fn benjamini_hochberg(p_values: &[f64]) -> Vec<f64> {
+    let m = p_values.len();
+    if m == 0 {
+        return Vec::new();
+    }
+    let mut indexed: Vec<(usize, f64)> = p_values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut adjusted = vec![0.0f64; m];
+    let mut cumulative_min = f64::INFINITY;
+    for (rank_rev, &(orig_idx, raw_p)) in indexed.iter().enumerate().rev() {
+        let rank = rank_rev + 1; // 1-based rank from smallest p
+        let corrected = raw_p * (m as f64) / (rank as f64);
+        cumulative_min = cumulative_min.min(corrected).min(1.0);
+        adjusted[orig_idx] = cumulative_min;
+    }
+    adjusted
+}
+
+struct CandidateLesson {
+    pattern: String,
+    feature_name: String,
+    category: TruthCategory,
+    direction: LessonDirection,
+    survived_with: usize,
+    lost_with: usize,
+    survived_without: usize,
+    lost_without: usize,
+    rate_with: f64,
+    rate_without: f64,
+    chi2: f64,
+    raw_p: f64,
+    sparse_cells: bool,
+    sample_size: usize,
+    benchmark_classes: usize,
+}
+
 fn compare_feature_distributions(
     records: &[SurvivalRecord],
-    significance_threshold: f64,
-) -> Vec<MetaLesson> {
-    let mut lessons = Vec::new();
+    fdr_threshold: f64,
+) -> (Vec<MetaLesson>, usize) {
     let categories = [
         TruthCategory::CriticalFact,
         TruthCategory::Constraint,
         TruthCategory::Decision,
         TruthCategory::OperationalScar,
     ];
+
+    let mut candidates: Vec<CandidateLesson> = Vec::new();
 
     for &category in &categories {
         let cat_records: Vec<_> = records.iter().filter(|r| r.category == category).collect();
@@ -3166,11 +3236,9 @@ fn compare_feature_distributions(
                 continue;
             }
 
-            let (chi2, p) =
+            let (chi2, raw_p) =
                 chi_squared_2x2(survived_with, lost_with, survived_without, lost_without);
-            if p >= significance_threshold {
-                continue;
-            }
+            let sparse = has_sparse_cells(survived_with, lost_with, survived_without, lost_without);
 
             let rate_with = survived_with as f64 / total_with as f64 * 100.0;
             let rate_without = survived_without as f64 / total_without as f64 * 100.0;
@@ -3185,56 +3253,113 @@ fn compare_feature_distributions(
                 .replace("{with}", &format!("{rate_with:.0}"))
                 .replace("{without}", &format!("{rate_without:.0}"));
 
-            lessons.push(MetaLesson {
+            candidates.push(CandidateLesson {
                 pattern,
                 feature_name: extractor.name.to_string(),
                 category,
                 direction,
-                evidence: MetaLessonEvidence {
-                    survived_with_feature: survived_with,
-                    lost_with_feature: lost_with,
-                    survived_without_feature: survived_without,
-                    lost_without_feature: lost_without,
-                    rate_with_feature: rate_with / 100.0,
-                    rate_without_feature: rate_without / 100.0,
-                    chi_squared: chi2,
-                    p_value: p,
-                },
-                confidence: (1.0 - p).min(0.99),
-                support_runs: cat_records.len(),
+                survived_with,
+                lost_with,
+                survived_without,
+                lost_without,
+                rate_with: rate_with / 100.0,
+                rate_without: rate_without / 100.0,
+                chi2,
+                raw_p,
+                sparse_cells: sparse,
+                sample_size: cat_records.len(),
+                benchmark_classes: 0, // filled by caller
             });
         }
     }
 
-    lessons
+    let candidates_tested = candidates.len();
+    let raw_ps: Vec<f64> = candidates.iter().map(|c| c.raw_p).collect();
+    let adjusted = benjamini_hochberg(&raw_ps);
+
+    let lessons = candidates
+        .into_iter()
+        .zip(adjusted)
+        .filter(|(_, adj_p)| *adj_p < fdr_threshold)
+        .map(|(c, adj_p)| MetaLesson {
+            pattern: c.pattern,
+            feature_name: c.feature_name,
+            category: c.category,
+            direction: c.direction,
+            evidence: MetaLessonEvidence {
+                survived_with_feature: c.survived_with,
+                lost_with_feature: c.lost_with,
+                survived_without_feature: c.survived_without,
+                lost_without_feature: c.lost_without,
+                rate_with_feature: c.rate_with,
+                rate_without_feature: c.rate_without,
+                chi_squared: c.chi2,
+                p_value: c.raw_p,
+                adjusted_p_value: adj_p,
+                sparse_cells: c.sparse_cells,
+            },
+            confidence: (1.0 - adj_p).min(0.99),
+            sample_size: c.sample_size,
+            benchmark_classes: c.benchmark_classes,
+        })
+        .collect();
+
+    (lessons, candidates_tested)
 }
 
 pub fn generate_meta_lessons(
     reports: &[BenchmarkSuiteReport],
-    significance_threshold: f64,
+    fdr_threshold: f64,
 ) -> MetaLessonReport {
     let mut all_records = Vec::new();
+    let mut class_count = 0usize;
     for report in reports {
         for class_report in &report.classes {
+            let mut has_records = false;
             if let Some(ref survival) = class_report.continuity.survival {
                 all_records.extend(survival.records.clone());
+                has_records = true;
             }
             for baseline_report in &class_report.baselines {
                 if let Some(ref survival) = baseline_report.survival {
                     all_records.extend(survival.records.clone());
+                    has_records = true;
                 }
+            }
+            if has_records {
+                class_count += 1;
             }
         }
     }
     let total_records = all_records.len();
-    let lessons = compare_feature_distributions(&all_records, significance_threshold);
+    let (mut lessons, candidates_tested) =
+        compare_feature_distributions(&all_records, fdr_threshold);
+    for lesson in &mut lessons {
+        lesson.benchmark_classes = class_count;
+    }
     MetaLessonReport {
         generated_at: Utc::now().to_rfc3339(),
         total_records,
         lessons,
+        candidates_tested,
     }
 }
 
+/// Write meta-lesson hypotheses to the continuity kernel.
+///
+/// These are written as `ContinuityKind::Hypothesis` (not Lesson) with
+/// `Scope::Project` (not Global) because they are unvalidated candidate
+/// patterns. Promotion to Lesson/Constraint requires closed-loop evidence
+/// that the hypothesis actually improves downstream continuity quality.
+///
+/// **Limitations:**
+/// - Chi-squared with Yates correction is unreliable when expected cell
+///   counts are < 5. Hypotheses with `sparse_cells: true` should be treated
+///   with extra scepticism. Fisher's exact test would be more appropriate
+///   for those cases but is not yet implemented.
+/// - Benjamini-Hochberg FDR correction is applied, but with few tests the
+///   correction has limited power. The adjusted p-values should be
+///   interpreted as "less likely to be false discovery" not "confirmed."
 pub fn write_meta_lessons_to_kernel(
     kernel: &SharedContinuityKernel,
     context_id: &str,
@@ -3246,42 +3371,63 @@ pub fn write_meta_lessons_to_kernel(
     let inputs: Vec<ContinuityItemInput> = report
         .lessons
         .iter()
-        .map(|lesson| ContinuityItemInput {
-            context_id: context_id.to_string(),
-            author_agent_id: "metacognitive-analyser".to_string(),
-            kind: ContinuityKind::Lesson,
-            title: format!(
-                "meta-lesson: {} ({:?})",
-                lesson.feature_name, lesson.category
-            ),
-            body: format!(
-                "{}\n\nStatistical evidence: chi²={:.2}, p={:.4}, n={}\n\
-                 Survival rate with feature: {:.1}%, without: {:.1}%",
-                lesson.pattern,
-                lesson.evidence.chi_squared,
-                lesson.evidence.p_value,
-                lesson.support_runs,
-                lesson.evidence.rate_with_feature * 100.0,
-                lesson.evidence.rate_without_feature * 100.0,
-            ),
-            scope: Scope::Global,
-            status: Some(ContinuityStatus::Active),
-            importance: Some((lesson.confidence * 0.9).min(0.95)),
-            confidence: Some(lesson.confidence),
-            salience: Some(0.85),
-            layer: Some(MemoryLayer::Semantic),
-            supports: Vec::new(),
-            dimensions: vec![crate::model::DimensionValue {
-                key: "metacognitive_phase".into(),
-                value: "2".into(),
-                weight: 100,
-            }],
-            extra: serde_json::json!({
-                "feature_name": lesson.feature_name,
-                "category": lesson.category,
-                "direction": lesson.direction,
-                "evidence": lesson.evidence,
-            }),
+        .map(|lesson| {
+            let sparse_warning = if lesson.evidence.sparse_cells {
+                "\n\nWARNING: sparse cells detected (expected count < 5). \
+                 Chi-squared unreliable; Fisher's exact test recommended."
+            } else {
+                ""
+            };
+            ContinuityItemInput {
+                context_id: context_id.to_string(),
+                author_agent_id: "metacognitive-analyser".to_string(),
+                kind: ContinuityKind::Hypothesis,
+                title: format!(
+                    "survival-hypothesis: {} ({:?})",
+                    lesson.feature_name, lesson.category
+                ),
+                body: format!(
+                    "{}\n\nStatistical evidence: chi²={:.2}, raw p={:.4}, \
+                     BH-adjusted p={:.4}, sample_size={}, classes={}\n\
+                     Survival rate with feature: {:.1}%, without: {:.1}%\n\
+                     Status: UNVALIDATED candidate hypothesis. \
+                     Requires closed-loop A/B testing before promotion.{sparse_warning}",
+                    lesson.pattern,
+                    lesson.evidence.chi_squared,
+                    lesson.evidence.p_value,
+                    lesson.evidence.adjusted_p_value,
+                    lesson.sample_size,
+                    lesson.benchmark_classes,
+                    lesson.evidence.rate_with_feature * 100.0,
+                    lesson.evidence.rate_without_feature * 100.0,
+                ),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some((lesson.confidence * 0.7).min(0.8)),
+                confidence: Some(lesson.confidence * 0.8),
+                salience: Some(0.6),
+                layer: Some(MemoryLayer::Episodic),
+                supports: Vec::new(),
+                dimensions: vec![
+                    crate::model::DimensionValue {
+                        key: "metacognitive_phase".into(),
+                        value: "2".into(),
+                        weight: 100,
+                    },
+                    crate::model::DimensionValue {
+                        key: "validation_status".into(),
+                        value: "unvalidated".into(),
+                        weight: 50,
+                    },
+                ],
+                extra: serde_json::json!({
+                    "feature_name": lesson.feature_name,
+                    "category": lesson.category,
+                    "direction": lesson.direction,
+                    "evidence": lesson.evidence,
+                    "requires_validation": true,
+                }),
+            }
         })
         .collect();
 
@@ -4810,7 +4956,8 @@ mod tests {
         MarketHeadJudgeSummary, MetaLesson, MetaLessonEvidence, MetaLessonReport,
         LessonDirection, ResourceEnvelope, SurfacedItem, SurvivalOutcome, TruthCategory,
         TruthItem, benchmark_survival_analysis, build_context_envelope,
-        chi_squared_2x2, compare_feature_distributions, erfc_approx, generate_meta_lessons,
+        benjamini_hochberg, chi_squared_2x2, compare_feature_distributions, erfc_approx,
+        generate_meta_lessons,
         compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
         compare_market_head_judge_pack, compare_market_head_same_pack,
         evaluate_market_head_challenge, evaluate_market_head_judge_challenge,
@@ -6467,6 +6614,27 @@ mod tests {
     }
 
     #[test]
+    fn benjamini_hochberg_corrects_multiple_tests() {
+        use super::benjamini_hochberg;
+        // 5 tests: 3 significant raw, BH should keep fewer
+        let raw = vec![0.001, 0.01, 0.04, 0.20, 0.80];
+        let adj = benjamini_hochberg(&raw);
+        // Adjusted p-values must be >= raw p-values
+        for (r, a) in raw.iter().zip(adj.iter()) {
+            assert!(*a >= *r, "adjusted {a} must be >= raw {r}");
+        }
+        // Adjusted p-values must be monotone with rank
+        assert!(adj[0] <= adj[1]);
+        // All adjusted <= 1.0
+        for a in &adj {
+            assert!(*a <= 1.0, "adjusted p must be <= 1.0");
+        }
+        // The clearly non-significant ones should stay non-significant
+        assert!(adj[3] > 0.05);
+        assert!(adj[4] > 0.05);
+    }
+
+    #[test]
     fn compare_feature_distributions_finds_signal() {
         use super::{ItemFeatures, SurvivalRecord};
         let mut records = Vec::new();
@@ -6498,7 +6666,7 @@ mod tests {
                 },
             });
         }
-        let lessons = compare_feature_distributions(&records, 0.05);
+        let (lessons, _) = compare_feature_distributions(&records, 0.05);
         let fp_lesson = lessons.iter().find(|l| l.feature_name == "file_path");
         assert!(fp_lesson.is_some(), "should detect file_path signal");
         assert_eq!(fp_lesson.unwrap().direction, LessonDirection::SurvivedMore);
@@ -6529,7 +6697,7 @@ mod tests {
                 },
             })
             .collect();
-        let lessons = compare_feature_distributions(&records, 0.05);
+        let (lessons, _) = compare_feature_distributions(&records, 0.05);
         assert!(lessons.is_empty(), "should skip categories with < 10 records");
     }
 
@@ -6545,6 +6713,7 @@ mod tests {
         let report = MetaLessonReport {
             generated_at: "2026-03-26T00:00:00Z".into(),
             total_records: 100,
+            candidates_tested: 16,
             lessons: vec![MetaLesson {
                 pattern: "File paths survive 3x better".into(),
                 feature_name: "file_path".into(),
@@ -6559,9 +6728,12 @@ mod tests {
                     rate_without_feature: 0.1,
                     chi_squared: 12.8,
                     p_value: 0.0003,
+                    adjusted_p_value: 0.005,
+                    sparse_cells: false,
                 },
-                confidence: 0.9997,
-                support_runs: 20,
+                confidence: 0.995,
+                sample_size: 20,
+                benchmark_classes: 3,
             }],
         };
         let json = serde_json::to_string(&report).unwrap();
