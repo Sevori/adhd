@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -666,7 +666,6 @@ pub struct Evaluation {
 #[derive(Debug, Clone)]
 struct Scenario {
     id: String,
-    title: String,
     namespace: String,
     task_id: String,
     objective: String,
@@ -696,7 +695,6 @@ struct ScenarioMark {
 
 #[derive(Debug, Clone)]
 struct TruthItem {
-    id: &'static str,
     keywords: Vec<&'static str>,
     rationale_keywords: Vec<&'static str>,
     judge_note: Option<&'static str>,
@@ -708,7 +706,6 @@ struct GroundTruth {
     critical_facts: Vec<TruthItem>,
     constraints: Vec<TruthItem>,
     decisions: Vec<TruthItem>,
-    hypotheses: Vec<TruthItem>,
     scars: Vec<TruthItem>,
     avoid_repeating: Vec<TruthItem>,
     next_step_keywords: Vec<&'static str>,
@@ -1519,7 +1516,7 @@ fn run_class(
         agent_id: Some(planner.config().agent_id.clone()),
         attachment_id: Some(attach.id),
     })?;
-    let labels = populate_scenario(&kernel, &context.id, &scenario)?;
+    populate_scenario(&kernel, &context.id, &scenario)?;
 
     let mut pvl_ms = 0.0_f64;
     if matches!(class, BenchmarkClass::CrossAgentCollaborative) {
@@ -1605,7 +1602,6 @@ fn run_class(
         &scenario,
         &small_b,
         config,
-        &labels,
     )?;
     let mut baselines = Vec::new();
     for baseline in [
@@ -1623,7 +1619,6 @@ fn run_class(
             &scenario,
             &small_b,
             config,
-            &labels,
         )?);
     }
 
@@ -1743,7 +1738,7 @@ fn build_market_head_challenge_case(
         agent_id: Some(planner.config().agent_id.clone()),
         attachment_id: Some(attach.id),
     })?;
-    let _labels = populate_scenario(&kernel, &context.id, &scenario)?;
+    populate_scenario(&kernel, &context.id, &scenario)?;
 
     if matches!(class, BenchmarkClass::CrossAgentCollaborative) {
         let subscription = kernel.subscribe(crate::model::SubscriptionInput {
@@ -1878,8 +1873,7 @@ fn populate_scenario(
     kernel: &SharedContinuityKernel,
     context_id: &str,
     scenario: &Scenario,
-) -> Result<HashMap<String, SupportLabel>> {
-    let mut labels = HashMap::new();
+) -> Result<()> {
     let mut counter = 0usize;
     for phase in &scenario.phases {
         counter += 1;
@@ -1905,17 +1899,8 @@ fn populate_scenario(
             },
         }])?;
         let event_id = manifests[0].event.id.clone();
-        let label = format!("e{}", counter);
-        labels.insert(
-            label.clone(),
-            SupportLabel {
-                label,
-                support_type: "event".into(),
-                support_id: event_id.clone(),
-            },
-        );
         for mark in &phase.marks {
-            let item = kernel.write_derivations(vec![ContinuityItemInput {
+            kernel.write_derivations(vec![ContinuityItemInput {
                 context_id: context_id.to_string(),
                 author_agent_id: phase.actor_id.clone(),
                 kind: mark.kind,
@@ -1936,18 +1921,9 @@ fn populate_scenario(
                 dimensions: mark.dimensions.clone(),
                 extra: serde_json::json!({}),
             }])?;
-            let mark_label = format!("c{}", labels.len() + 1);
-            labels.insert(
-                mark_label.clone(),
-                SupportLabel {
-                    label: mark_label,
-                    support_type: "continuity".into(),
-                    support_id: item[0].id.clone(),
-                },
-            );
         }
     }
-    Ok(labels)
+    Ok(())
 }
 
 fn analyze_and_write_back(
@@ -1968,7 +1944,6 @@ fn analyze_and_write_back(
         scenario,
         adapter,
         config,
-        &HashMap::new(),
     )?;
     if context.status == BaselineStatus::Ok {
         write_model_output(
@@ -2001,19 +1976,18 @@ fn run_baseline(
     scenario: &Scenario,
     adapter: &impl AgentAdapter,
     config: &ContinuityBenchConfig,
-    labels: &HashMap<String, SupportLabel>,
 ) -> Result<BaselineRunReport> {
     let run = if matches!(class, BenchmarkClass::CrashRecovery)
         && baseline == BaselineKind::SharedContinuity
     {
         let reopened = SharedContinuityKernel::open(class_root)?;
         run_baseline_inner(
-            class_root, class, baseline, context_id, scenario, adapter, config, labels,
+            class_root, class, baseline, context_id, scenario, adapter, config,
         )?
         .with_kernel(reopened)
     } else {
         run_baseline_inner(
-            class_root, class, baseline, context_id, scenario, adapter, config, labels,
+            class_root, class, baseline, context_id, scenario, adapter, config,
         )?
     };
     Ok(BaselineRunReport {
@@ -2055,7 +2029,6 @@ fn run_baseline_inner(
     scenario: &Scenario,
     adapter: &impl AgentAdapter,
     config: &ContinuityBenchConfig,
-    _labels: &HashMap<String, SupportLabel>,
 ) -> Result<BaselineExecution> {
     let kernel = SharedContinuityKernel::open(class_root)?;
     let (envelope, continuity_path) = build_context_envelope(
@@ -3190,7 +3163,6 @@ fn scenario_for(class: BenchmarkClass) -> Scenario {
     let base_truth = GroundTruth {
         critical_facts: vec![
             TruthItem {
-                id: "selector_missing",
                 keywords: vec!["selector_missing", "src/query.rs"],
                 rationale_keywords: Vec::new(),
                 judge_note: Some(
@@ -3199,7 +3171,6 @@ fn scenario_for(class: BenchmarkClass) -> Scenario {
                 judge_required_concepts: vec!["selector/support-memory failure", "src/query.rs"],
             },
             TruthItem {
-                id: "context_primary",
                 keywords: vec!["context", "primary"],
                 rationale_keywords: Vec::new(),
                 judge_note: Some(
@@ -3209,35 +3180,24 @@ fn scenario_for(class: BenchmarkClass) -> Scenario {
             },
         ],
         constraints: vec![TruthItem {
-            id: "preserve_provenance",
             keywords: vec!["preserve", "provenance"],
             rationale_keywords: Vec::new(),
             judge_note: None,
             judge_required_concepts: Vec::new(),
         }],
         decisions: vec![TruthItem {
-            id: "use_uci",
             keywords: vec!["unified", "continuity", "interface"],
             rationale_keywords: vec!["agent", "swap"],
             judge_note: None,
             judge_required_concepts: Vec::new(),
         }],
-        hypotheses: vec![TruthItem {
-            id: "adapter_timeout",
-            keywords: vec!["timeout", "adapter"],
-            rationale_keywords: Vec::new(),
-            judge_note: None,
-            judge_required_concepts: Vec::new(),
-        }],
         scars: vec![TruthItem {
-            id: "naive_probe",
             keywords: vec!["naive", "probe"],
             rationale_keywords: Vec::new(),
             judge_note: None,
             judge_required_concepts: Vec::new(),
         }],
         avoid_repeating: vec![TruthItem {
-            id: "manual_probe",
             keywords: vec!["manual", "probe"],
             rationale_keywords: Vec::new(),
             judge_note: None,
@@ -3375,7 +3335,6 @@ fn scenario_for(class: BenchmarkClass) -> Scenario {
     }
     Scenario {
         id: class.slug().to_string(),
-        title: format!("{} continuity scenario", class.slug()),
         namespace: "bench".into(),
         task_id: format!("task-{}", class.slug()),
         objective: format!(
@@ -5634,9 +5593,3 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SupportLabel {
-    label: String,
-    support_type: String,
-    support_id: String,
-}
