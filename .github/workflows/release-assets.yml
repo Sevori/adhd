@@ -18,8 +18,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ensure-draft:
+    name: Ensure draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          fi
+          if [ -z "$tag" ]; then
+            echo "release tag is required" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure draft release exists for tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          # Wait up to 30s for the release to appear (release-please may still be creating it)
+          for _ in $(seq 1 6); do
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Release exists — force it to draft so assets can be uploaded
+            is_draft=$(gh release view "$RELEASE_TAG" --json isDraft -q '.isDraft')
+            if [ "$is_draft" != "true" ]; then
+              echo "Release exists but is published. Converting to draft."
+              gh release edit "$RELEASE_TAG" --draft
+            else
+              echo "Release already in draft state."
+            fi
+          else
+            # No release yet — create a draft
+            echo "No release found for $RELEASE_TAG. Creating draft."
+            gh release create "$RELEASE_TAG" --draft --title "${RELEASE_TAG#ice-}" --generate-notes
+          fi
+
   build-assets:
     name: Build ${{ matrix.target }}
+    needs: ensure-draft
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -42,30 +91,12 @@ jobs:
           if [ -n "$INPUT_TAG" ]; then
             tag="$INPUT_TAG"
           fi
-          if [ -z "$tag" ]; then
-            echo "release tag is required" >&2
-            exit 1
-          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.release.outputs.tag }}
-
-      - name: Wait for draft release to exist
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          for _ in $(seq 1 6); do
-            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "release $RELEASE_TAG was not visible before asset upload" >&2
-          exit 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -94,3 +125,28 @@ jobs:
             "dist/ice-${{ matrix.target }}.tar.gz" \
             "dist/ice-${{ matrix.target }}.tar.gz.sha256" \
             --clobber
+
+  publish:
+    name: Publish release
+    needs: build-assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          echo "All assets uploaded. Publishing release $RELEASE_TAG."
+          gh release edit "$RELEASE_TAG" --draft=false
