@@ -9,6 +9,7 @@ pub mod dogfood;
 pub mod embedding;
 pub mod engine;
 pub mod http;
+pub mod market_head;
 pub mod mcp;
 pub mod model;
 pub mod query;
