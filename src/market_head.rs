@@ -10,11 +10,10 @@ use crate::adapters::{
     render_structured_resume_prompt, structured_output_schema,
 };
 use crate::benchmark::{
-    BaselineKind, BaselineStatus, BenchmarkClass, ContinuityBenchConfig,
-    ContextEnvelope, Evaluation, GroundTruth,
-    TruthItem, analyze_and_write_back, build_context_envelope, evaluate_output,
-    failed_evaluation, format_continuity_path_label, match_keywords, populate_scenario,
-    repair_output_from_envelope, scenario_for,
+    BaselineKind, BaselineStatus, BenchmarkClass, ContextEnvelope, ContinuityBenchConfig,
+    Evaluation, GroundTruth, TruthItem, analyze_and_write_back, build_context_envelope,
+    evaluate_output, failed_evaluation, format_continuity_path_label, match_keywords,
+    populate_scenario, repair_output_from_envelope, scenario_for,
 };
 use crate::continuity::{
     AttachAgentInput, OpenContextInput, SharedContinuityKernel, SignalInput, SnapshotInput,
@@ -1995,7 +1994,7 @@ fn relative_display(root: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::adapters::AgentContinuationOutput;
-    use crate::benchmark::{scenario_for, BaselineStatus, BenchmarkClass, Evaluation};
+    use crate::benchmark::{BaselineStatus, BenchmarkClass, Evaluation, scenario_for};
     use std::path::PathBuf;
     use tempfile::tempdir;
 

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr:*)",
+      "Bash(cargo build:*)",
+      "Bash(git tag:*)",
+      "Bash(gh run:*)",
+      "mcp__ice-shared-continuity-kernel__continuity_write_item",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "Bash(wc -l src/*.rs)",
+      "Bash(python3:*)"
+    ]
+  }
+}
