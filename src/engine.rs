@@ -56,6 +56,17 @@ impl Drop for EngineStorageGuard<'_> {
     }
 }
 
+fn matches_scope_filter(
+    memory: &MemoryRecord,
+    session: Option<&str>,
+    task: Option<&str>,
+    agent: Option<&str>,
+) -> bool {
+    session.is_none_or(|v| memory.session_id == v)
+        && task.is_none_or(|v| memory.task_id.as_deref() == Some(v))
+        && agent.is_none_or(|v| memory.agent_id == v)
+}
+
 impl Engine {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let config = EngineConfig::with_root(root);
@@ -337,11 +348,7 @@ impl Engine {
         let mut scored = storage
             .vector_memories()?
             .into_iter()
-            .filter(|(memory, _)| session_id.is_none_or(|value| memory.session_id == value))
-            .filter(|(memory, _)| {
-                task_id.is_none_or(|value| memory.task_id.as_deref() == Some(value))
-            })
-            .filter(|(memory, _)| agent_id.is_none_or(|value| memory.agent_id == value))
+            .filter(|(memory, _)| matches_scope_filter(memory, session_id, task_id, agent_id))
             .map(|(memory, vector)| (memory, cosine_similarity(&query_vector, &vector)))
             .collect::<Vec<_>>();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -363,9 +370,7 @@ impl Engine {
         Ok(storage
             .list_memory(Some(MemoryLayer::Summary), limit.saturating_mul(8))?
             .into_iter()
-            .filter(|memory| session_id.is_none_or(|value| memory.session_id == value))
-            .filter(|memory| task_id.is_none_or(|value| memory.task_id.as_deref() == Some(value)))
-            .filter(|memory| agent_id.is_none_or(|value| memory.agent_id == value))
+            .filter(|memory| matches_scope_filter(memory, session_id, task_id, agent_id))
             .take(limit)
             .collect())
     }
@@ -441,6 +446,66 @@ mod tests {
                     .and_then(|value| value.parse::<f64>().ok())
             })
             .unwrap_or_else(|| panic!("missing labeled sum metric {name} for {operation}"))
+    }
+
+    fn make_memory_record(session_id: &str, task_id: Option<&str>, agent_id: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: "test-id".to_string(),
+            layer: crate::model::MemoryLayer::Hot,
+            scope: crate::model::Scope::Shared,
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            task_id: task_id.map(str::to_string),
+            ts: chrono::Utc::now(),
+            importance: 1.0,
+            confidence: 1.0,
+            token_estimate: 10,
+            source_event_id: None,
+            scope_key: "key".to_string(),
+            body: "body".to_string(),
+            extra: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn matches_scope_filter_passes_when_all_filters_are_none() {
+        let memory = make_memory_record("s1", Some("t1"), "a1");
+        assert!(matches_scope_filter(&memory, None, None, None));
+    }
+
+    #[test]
+    fn matches_scope_filter_passes_on_exact_match() {
+        let memory = make_memory_record("s1", Some("t1"), "a1");
+        assert!(matches_scope_filter(
+            &memory,
+            Some("s1"),
+            Some("t1"),
+            Some("a1")
+        ));
+    }
+
+    #[test]
+    fn matches_scope_filter_rejects_wrong_session() {
+        let memory = make_memory_record("s1", Some("t1"), "a1");
+        assert!(!matches_scope_filter(&memory, Some("other"), None, None));
+    }
+
+    #[test]
+    fn matches_scope_filter_rejects_wrong_task() {
+        let memory = make_memory_record("s1", Some("t1"), "a1");
+        assert!(!matches_scope_filter(&memory, None, Some("other"), None));
+    }
+
+    #[test]
+    fn matches_scope_filter_rejects_wrong_agent() {
+        let memory = make_memory_record("s1", Some("t1"), "a1");
+        assert!(!matches_scope_filter(&memory, None, None, Some("other")));
+    }
+
+    #[test]
+    fn matches_scope_filter_rejects_task_filter_when_task_id_is_none() {
+        let memory = make_memory_record("s1", None, "a1");
+        assert!(!matches_scope_filter(&memory, None, Some("t1"), None));
     }
 
     #[test]

@@ -17,6 +17,9 @@ use crate::query::build_context_pack;
 pub const MACHINE_NAMESPACE_ALIAS: &str = "@machine";
 pub const DEFAULT_MACHINE_TASK_ID: &str = "machine-organism";
 
+const PROOF_TRIM_LIMIT: usize = 220;
+const DEFAULT_DIMENSION_WEIGHT: i32 = 100;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinuityKind {
@@ -1095,33 +1098,33 @@ impl UnifiedContinuityInterface for Engine {
             DimensionValue {
                 key: "signal.lane".to_string(),
                 value: input.lane.as_str().to_string(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             },
             DimensionValue {
                 key: "signal.severity".to_string(),
                 value: severity.as_str().to_string(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             },
         ];
         if let Some(target_agent_id) = &input.target_agent_id {
             dimensions.push(DimensionValue {
                 key: "signal.target_agent".to_string(),
                 value: target_agent_id.clone(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             });
         }
         if let Some(claim_id) = &input.claim_id {
             dimensions.push(DimensionValue {
                 key: "claim.id".to_string(),
                 value: claim_id.clone(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             });
         }
         if let Some(resource) = &input.resource {
             dimensions.push(DimensionValue {
                 key: "claim.resource".to_string(),
                 value: resource.clone(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             });
         }
         self.publish_signal(SignalInput {
@@ -1389,7 +1392,7 @@ impl UnifiedContinuityInterface for Engine {
                     vec![DimensionValue {
                         key: "outcome_quality".to_string(),
                         value: format!("{:.2}", input.quality),
-                        weight: 100,
+                        weight: DEFAULT_DIMENSION_WEIGHT,
                     }],
                 ),
                 extra: serde_json::json!({
@@ -1512,7 +1515,7 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
         register_kind: primary_fact.1.to_string(),
         source_id: primary_fact.2,
         title: primary_fact.3,
-        body: trim_text(&primary_fact.4, 220),
+        body: trim_text(&primary_fact.4, PROOF_TRIM_LIMIT),
         has_provenance: primary_fact.5,
     });
 
@@ -1522,7 +1525,7 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
             register_kind: "decision".to_string(),
             source_id: item.id.clone(),
             title: item.title.clone(),
-            body: trim_text(&item.body, 220),
+            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
             has_provenance: !item.supports.is_empty(),
         });
     }
@@ -1532,7 +1535,7 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
             register_kind: "constraint".to_string(),
             source_id: item.id.clone(),
             title: item.title.clone(),
-            body: trim_text(&item.body, 220),
+            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
             has_provenance: !item.supports.is_empty(),
         });
     }
@@ -1542,7 +1545,7 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
             register_kind: "scar".to_string(),
             source_id: item.id.clone(),
             title: item.title.clone(),
-            body: trim_text(&item.body, 220),
+            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
             has_provenance: !item.supports.is_empty(),
         });
     }
@@ -1559,7 +1562,7 @@ fn compile_handoff_proof(read: &ContextRead) -> HandoffProof {
             register_kind: "next_step".to_string(),
             source_id: item.id.clone(),
             title: item.title.clone(),
-            body: trim_text(&item.body, 220),
+            body: trim_text(&item.body, PROOF_TRIM_LIMIT),
             has_provenance: !item.supports.is_empty(),
         });
     }
@@ -1594,17 +1597,17 @@ fn inject_context(event: &mut EventInput, context: &ContextRecord) {
             DimensionValue {
                 key: "context".to_string(),
                 value: context.id.clone(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             },
             DimensionValue {
                 key: "context_namespace".to_string(),
                 value: context.namespace.clone(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             },
             DimensionValue {
                 key: "context_task".to_string(),
                 value: context.task_id.clone(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             },
         ],
     );
@@ -2533,7 +2536,7 @@ mod tests {
                 dimensions: vec![DimensionValue {
                     key: "decision.identity".into(),
                     value: "context-first".into(),
-                    weight: 100,
+                    weight: DEFAULT_DIMENSION_WEIGHT,
                 }],
                 extra: serde_json::json!({}),
             })
@@ -2560,7 +2563,7 @@ mod tests {
                 dimensions: vec![DimensionValue {
                     key: "scar.runtime".into(),
                     value: "ollama-probe".into(),
-                    weight: 100,
+                    weight: DEFAULT_DIMENSION_WEIGHT,
                 }],
                 extra: serde_json::json!({}),
             })
@@ -3004,7 +3007,7 @@ mod tests {
                 namespace: None,
                 task_id: None,
                 objective: "What trauma matters if observability lies after a restart?".into(),
-                token_budget: 220,
+                token_budget: PROOF_TRIM_LIMIT,
                 selector: None,
                 agent_id: Some("reader".into()),
                 session_id: Some("session-2".into()),
@@ -3178,7 +3181,7 @@ mod tests {
                 namespace: None,
                 task_id: None,
                 objective: "What does Alice smell like?".into(),
-                token_budget: 220,
+                token_budget: PROOF_TRIM_LIMIT,
                 selector: None,
                 agent_id: Some("reader-a".into()),
                 session_id: Some("session-a".into()),
@@ -3217,7 +3220,7 @@ mod tests {
                 namespace: None,
                 task_id: None,
                 objective: "What does Alice smell like now?".into(),
-                token_budget: 220,
+                token_budget: PROOF_TRIM_LIMIT,
                 selector: None,
                 agent_id: Some("reader-b".into()),
                 session_id: Some("session-b".into()),
@@ -3277,7 +3280,7 @@ mod tests {
                 namespace: None,
                 task_id: None,
                 objective: "What does Alice smell like?".into(),
-                token_budget: 220,
+                token_budget: PROOF_TRIM_LIMIT,
                 selector: None,
                 agent_id: Some("reader".into()),
                 session_id: Some("session-a".into()),
@@ -4844,13 +4847,13 @@ mod tests {
         let base = vec![DimensionValue {
             key: "k1".into(),
             value: "v1".into(),
-            weight: 100,
+            weight: DEFAULT_DIMENSION_WEIGHT,
         }];
         let extra = vec![
             DimensionValue {
                 key: "k1".into(),
                 value: "v1".into(),
-                weight: 100,
+                weight: DEFAULT_DIMENSION_WEIGHT,
             },
             DimensionValue {
                 key: "k2".into(),

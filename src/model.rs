@@ -4,6 +4,16 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+macro_rules! impl_snake_case_display {
+    ($ty:ty, $($variant:ident => $label:expr),+ $(,)?) => {
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(match self { $(Self::$variant => $label),+ })
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -23,27 +33,13 @@ pub enum EventKind {
     Note,
 }
 
-impl fmt::Display for EventKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Prompt => "prompt",
-            Self::Response => "response",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::ShellCommand => "shell_command",
-            Self::ShellOutput => "shell_output",
-            Self::FileDiff => "file_diff",
-            Self::Error => "error",
-            Self::Exception => "exception",
-            Self::Document => "document",
-            Self::Trace => "trace",
-            Self::ApiRequest => "api_request",
-            Self::ApiResponse => "api_response",
-            Self::Note => "note",
-        };
-        f.write_str(value)
-    }
-}
+impl_snake_case_display!(EventKind,
+    Prompt => "prompt", Response => "response", ToolCall => "tool_call",
+    ToolResult => "tool_result", ShellCommand => "shell_command",
+    ShellOutput => "shell_output", FileDiff => "file_diff", Error => "error",
+    Exception => "exception", Document => "document", Trace => "trace",
+    ApiRequest => "api_request", ApiResponse => "api_response", Note => "note",
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -55,18 +51,10 @@ pub enum Scope {
     Global,
 }
 
-impl fmt::Display for Scope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Agent => "agent",
-            Self::Session => "session",
-            Self::Shared => "shared",
-            Self::Project => "project",
-            Self::Global => "global",
-        };
-        f.write_str(value)
-    }
-}
+impl_snake_case_display!(Scope,
+    Agent => "agent", Session => "session", Shared => "shared",
+    Project => "project", Global => "global",
+);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -84,18 +72,10 @@ impl MemoryLayer {
     }
 }
 
-impl fmt::Display for MemoryLayer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Hot => "hot",
-            Self::Episodic => "episodic",
-            Self::Semantic => "semantic",
-            Self::Summary => "summary",
-            Self::Cold => "cold",
-        };
-        f.write_str(value)
-    }
-}
+impl_snake_case_display!(MemoryLayer,
+    Hot => "hot", Episodic => "episodic", Semantic => "semantic",
+    Summary => "summary", Cold => "cold",
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DimensionValue {
@@ -140,20 +120,10 @@ pub enum ViewOp {
     Merge,
 }
 
-impl fmt::Display for ViewOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Project => "project",
-            Self::Slice => "slice",
-            Self::Intersect => "intersect",
-            Self::Union => "union",
-            Self::Snapshot => "snapshot",
-            Self::Fork => "fork",
-            Self::Merge => "merge",
-        };
-        f.write_str(value)
-    }
-}
+impl_snake_case_display!(ViewOp,
+    Project => "project", Slice => "slice", Intersect => "intersect",
+    Union => "union", Snapshot => "snapshot", Fork => "fork", Merge => "merge",
+);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -163,16 +133,9 @@ pub enum SnapshotResolution {
     Fine,
 }
 
-impl fmt::Display for SnapshotResolution {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Coarse => "coarse",
-            Self::Medium => "medium",
-            Self::Fine => "fine",
-        };
-        f.write_str(value)
-    }
-}
+impl_snake_case_display!(SnapshotResolution,
+    Coarse => "coarse", Medium => "medium", Fine => "fine",
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventInput {

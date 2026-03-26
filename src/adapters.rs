@@ -382,6 +382,14 @@ pub fn hypotheses_from_meta_lessons(
 
 /// Extract survival hypotheses from kernel Hypothesis items written by Phase 2.
 ///
+fn json_str(extra: &serde_json::Value, key: &str, default: &str) -> String {
+    extra
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .to_string()
+}
+
 /// Filters for items that have `requires_validation: true` in extra and
 /// are not flagged with `sparse_cells: true` in their evidence.
 pub fn hypotheses_from_kernel_items(
@@ -405,24 +413,9 @@ pub fn hypotheses_from_kernel_items(
                     != Some(true)
         })
         .map(|item| {
-            let feature_name = item
-                .extra
-                .get("feature_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let category = item
-                .extra
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let direction = item
-                .extra
-                .get("direction")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let feature_name = json_str(&item.extra, "feature_name", "unknown");
+            let category = json_str(&item.extra, "category", "unknown");
+            let direction = json_str(&item.extra, "direction", "unknown");
             SurvivalHypothesis {
                 feature_name,
                 category,
