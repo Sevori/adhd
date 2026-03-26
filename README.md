@@ -1,0 +1,182 @@
+# Infinite Continuity Engine
+
+Local, self-hostable continuity substrate for interchangeable agents.
+
+One persistent working mind on disk while agents come and go. Context identity is primary, agent identity is disposable, and continuity survives swaps, restarts, and role changes.
+
+> **Disclaimer**: This repository is a brute-force validation of a hypothesis that drives the [Sevori Continuity Protocol](https://github.com/Sevori/continuity-protocol) spec and research. It has no intention of building a real product or producing quality code — it exists solely to stress-test an idea until it either proves itself or breaks.
+
+> **Why "adhd"?** This was built around one person's very specific way of learning. A brain with ADHD doesn't fit the normal flow — thoughts need to be typed, structured, and externalised because the default doesn't work. This engine is the tool that emerged from that constraint.
+
+## Install
+
+Install the latest release:
+
+```bash
+gh api repos/Sevori/adhd/contents/scripts/install.sh -H 'Accept: application/vnd.github.raw' > install-ice.sh
+sh install-ice.sh --version latest
+```
+
+Useful variants:
+
+```bash
+sh install-ice.sh --dry-run --version latest
+sh install-ice.sh --bin-dir "$HOME/.local/bin"
+sh install-ice.sh --from-source --version latest
+```
+
+The installer now expects `gh` to be installed and authenticated for the target repository.
+
+## Claude Code
+
+Claude Code is now a repo-owned install path.
+
+Install the managed MCP entry:
+
+```bash
+ice claude install-global
+```
+
+Check the install:
+
+```bash
+ice claude status
+```
+
+Update later by rerunning the installer. That replaces the `ice` binary in place and keeps the same Claude MCP entry and organism root.
+
+What this does:
+
+- writes a managed MCP entry into `~/.claude.json`
+- points it at `ice --root ~/.claude/organisms/ice mcp`
+- refuses to overwrite an unmanaged same-name entry
+
+To use a custom organism root:
+
+```bash
+ice claude install-global --root /path/to/shared-organism
+```
+
+To remove the managed entry:
+
+```bash
+ice claude uninstall
+```
+
+Restart Claude Code after installation so it reloads MCP servers.
+
+## Quick Start
+
+### The idea
+
+Open two terminals (or two agents). One ices knowledge, the other recalls it. They share the same brain on disk.
+
+### From the terminal
+
+**Terminal A — ice knowledge:**
+
+```bash
+ice --root .ice ingest \
+  --kind note \
+  --agent "me" \
+  --session "study-1" \
+  --namespace "personal" \
+  --text "My name is Renato. I am a TDD developer — Trauma Driven Development. My sense of humour is not common."
+```
+
+**Terminal B — a cold session recalls it:**
+
+```bash
+ice --root .ice query \
+  --agent "someone-else" \
+  --session "cold-session" \
+  --namespace "personal" \
+  --text "What do you know about Renato?" \
+  --budget-tokens 128
+```
+
+The cold session has never seen Renato, but the iced knowledge surfaces immediately.
+
+### From Claude Code (via MCP)
+
+After installing the MCP entry (`ice claude install-global`), restart Claude Code. The continuity tools become native MCP calls.
+
+**Terminal 1 — tell Claude to ice it:**
+
+> "Hey Claude, my name is Renato, I'm a TDD developer (Trauma Driven Development) and my sense of humour isn't common. Ice it."
+
+Claude bootstraps a context and writes the facts:
+
+```json
+// Claude calls continuity_bootstrap to open a context
+continuity_bootstrap({
+  "agent_id": "claude-code",
+  "agent_type": "claude",
+  "namespace": "personal",
+  "task_id": "getting-to-know",
+  "session_id": "session-1",
+  "objective": "Learn about the human and ice it for future agents"
+})
+
+// Then ices the knowledge as typed facts
+continuity_write_items({
+  "context_id": "<from bootstrap>",
+  "author_agent_id": "claude-code",
+  "items": [
+    {"kind": "fact", "title": "Human identity", "body": "The human's name is Renato."},
+    {"kind": "fact", "title": "Development philosophy", "body": "Renato is a TDD developer — Trauma Driven Development. He builds robust systems because past trauma taught him what breaks."},
+    {"kind": "fact", "title": "Sense of humour", "body": "Renato's sense of humour is not common. Expect dry, dark, or absurd jokes. Do not over-explain or soften them."}
+  ]
+})
+```
+
+**Terminal 2 — a cold agent asks what it knows:**
+
+> "What do you know about Renato?"
+
+A completely fresh Claude session (or Codex, or any agent) bootstraps into the same namespace and gets everything back:
+
+```json
+// Cold agent bootstraps into the same namespace/task
+continuity_bootstrap({
+  "agent_id": "cold-agent",
+  "agent_type": "claude",
+  "namespace": "personal",
+  "task_id": "getting-to-know",
+  "session_id": "fresh-session",
+  "objective": "What do you know about Renato?"
+})
+
+// The bootstrap response already contains the recalled facts:
+// - "The human's name is Renato."
+// - "Renato is a TDD developer — Trauma Driven Development."
+// - "Renato's sense of humour is not common. Expect dry, dark, or absurd jokes."
+```
+
+The cold agent never saw the original conversation. It just bootstrapped into the same shared brain and got the iced knowledge back, ranked by relevance.
+
+The MCP server reads from the same on-disk root, so knowledge iced from the terminal, from Claude, or from Codex all lives in the same place.
+
+## Other Ways to Run
+
+Run the MCP bridge directly (without the managed install):
+
+```bash
+ice --root .ice mcp
+```
+
+Run the HTTP API:
+
+```bash
+ice --root .ice serve --addr 127.0.0.1:4040
+```
+
+Run the local benchmark:
+
+```bash
+ice --root .ice-bench bench \
+  --mode continuity \
+  --budget-tokens 192 \
+  --candidate-limit 12 \
+  --recent-window 6
+```

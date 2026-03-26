@@ -1,0 +1,96 @@
+name: Release Assets
+
+on:
+  push:
+    tags:
+      - ice-v*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload assets for
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-assets:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          fi
+          if [ -z "$tag" ]; then
+            echo "release tag is required" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Wait for draft release to exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          for _ in $(seq 1 6); do
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "release $RELEASE_TAG was not visible before asset upload" >&2
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          asset="ice-${{ matrix.target }}.tar.gz"
+          tar -czf "dist/${asset}" -C "target/${{ matrix.target }}/release" ice
+          shasum -a 256 "dist/${asset}" > "dist/${asset}.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "dist/ice-${{ matrix.target }}.tar.gz" \
+            "dist/ice-${{ matrix.target }}.tar.gz.sha256" \
+            --clobber

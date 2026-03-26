@@ -1,0 +1,18 @@
+pub mod adapters;
+pub mod benchmark;
+pub mod claude_install;
+pub mod codex;
+pub mod config;
+pub mod continuity;
+pub mod dispatch;
+pub mod dogfood;
+pub mod embedding;
+pub mod engine;
+pub mod http;
+pub mod mcp;
+pub mod model;
+pub mod query;
+pub mod storage;
+pub mod telemetry;
+
+pub use engine::Engine;
