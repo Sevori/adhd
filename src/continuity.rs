@@ -4256,4 +4256,680 @@ mod tests {
             Some(ContinuityStatus::Resolved.as_str())
         );
     }
+
+    #[test]
+    fn continuity_kind_default_layer_maps_correctly() {
+        assert_eq!(
+            ContinuityKind::WorkingState.default_layer(),
+            MemoryLayer::Hot
+        );
+        assert_eq!(ContinuityKind::WorkClaim.default_layer(), MemoryLayer::Hot);
+        assert_eq!(ContinuityKind::Signal.default_layer(), MemoryLayer::Hot);
+        assert_eq!(
+            ContinuityKind::Derivation.default_layer(),
+            MemoryLayer::Semantic
+        );
+        assert_eq!(ContinuityKind::Fact.default_layer(), MemoryLayer::Semantic);
+        assert_eq!(
+            ContinuityKind::Decision.default_layer(),
+            MemoryLayer::Semantic
+        );
+        assert_eq!(
+            ContinuityKind::Constraint.default_layer(),
+            MemoryLayer::Semantic
+        );
+        assert_eq!(
+            ContinuityKind::OperationalScar.default_layer(),
+            MemoryLayer::Semantic
+        );
+        assert_eq!(
+            ContinuityKind::Hypothesis.default_layer(),
+            MemoryLayer::Episodic
+        );
+        assert_eq!(
+            ContinuityKind::Incident.default_layer(),
+            MemoryLayer::Episodic
+        );
+        assert_eq!(
+            ContinuityKind::Outcome.default_layer(),
+            MemoryLayer::Episodic
+        );
+        assert_eq!(
+            ContinuityKind::Lesson.default_layer(),
+            MemoryLayer::Episodic
+        );
+        assert_eq!(
+            ContinuityKind::Summary.default_layer(),
+            MemoryLayer::Summary
+        );
+    }
+
+    #[test]
+    fn continuity_kind_as_str_round_trips_through_serde() {
+        let all_kinds = [
+            ContinuityKind::WorkingState,
+            ContinuityKind::WorkClaim,
+            ContinuityKind::Derivation,
+            ContinuityKind::Fact,
+            ContinuityKind::Decision,
+            ContinuityKind::Constraint,
+            ContinuityKind::Hypothesis,
+            ContinuityKind::Incident,
+            ContinuityKind::OperationalScar,
+            ContinuityKind::Outcome,
+            ContinuityKind::Signal,
+            ContinuityKind::Summary,
+            ContinuityKind::Lesson,
+        ];
+        for kind in all_kinds {
+            let json = serde_json::to_string(&kind).unwrap();
+            let deserialized: ContinuityKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, kind);
+            assert_eq!(
+                json.trim_matches('"'),
+                kind.as_str(),
+                "as_str should match serde serialization for {:?}",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn continuity_status_as_str_all_variants() {
+        assert_eq!(ContinuityStatus::Open.as_str(), "open");
+        assert_eq!(ContinuityStatus::Active.as_str(), "active");
+        assert_eq!(ContinuityStatus::Resolved.as_str(), "resolved");
+        assert_eq!(ContinuityStatus::Superseded.as_str(), "superseded");
+        assert_eq!(ContinuityStatus::Rejected.as_str(), "rejected");
+    }
+
+    #[test]
+    fn continuity_status_is_open_distinguishes_active_from_closed() {
+        assert!(ContinuityStatus::Open.is_open());
+        assert!(ContinuityStatus::Active.is_open());
+        assert!(!ContinuityStatus::Resolved.is_open());
+        assert!(!ContinuityStatus::Superseded.is_open());
+        assert!(!ContinuityStatus::Rejected.is_open());
+    }
+
+    #[test]
+    fn context_status_as_str_all_variants() {
+        assert_eq!(ContextStatus::Open.as_str(), "open");
+        assert_eq!(ContextStatus::Paused.as_str(), "paused");
+        assert_eq!(ContextStatus::Closed.as_str(), "closed");
+    }
+
+    #[test]
+    fn coordination_lane_as_str_all_variants() {
+        assert_eq!(CoordinationLane::Anxiety.as_str(), "anxiety");
+        assert_eq!(CoordinationLane::Review.as_str(), "review");
+        assert_eq!(CoordinationLane::Warning.as_str(), "warning");
+        assert_eq!(CoordinationLane::Backoff.as_str(), "backoff");
+        assert_eq!(CoordinationLane::Coach.as_str(), "coach");
+    }
+
+    #[test]
+    fn coordination_severity_as_str_all_variants() {
+        assert_eq!(CoordinationSeverity::Info.as_str(), "info");
+        assert_eq!(CoordinationSeverity::Warn.as_str(), "warn");
+        assert_eq!(CoordinationSeverity::Block.as_str(), "block");
+    }
+
+    #[test]
+    fn default_coordination_severity_maps_lanes() {
+        assert_eq!(
+            default_coordination_severity(CoordinationLane::Review),
+            CoordinationSeverity::Info
+        );
+        assert_eq!(
+            default_coordination_severity(CoordinationLane::Coach),
+            CoordinationSeverity::Info
+        );
+        assert_eq!(
+            default_coordination_severity(CoordinationLane::Warning),
+            CoordinationSeverity::Warn
+        );
+        assert_eq!(
+            default_coordination_severity(CoordinationLane::Anxiety),
+            CoordinationSeverity::Warn
+        );
+        assert_eq!(
+            default_coordination_severity(CoordinationLane::Backoff),
+            CoordinationSeverity::Block
+        );
+    }
+
+    #[test]
+    fn normalize_work_claim_resources_deduplicates_and_sorts() {
+        let input = vec![
+            "  SRC/main.rs ".to_string(),
+            "src/lib.rs".to_string(),
+            "SRC/MAIN.RS".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+        ];
+        let result = normalize_work_claim_resources(&input);
+        assert_eq!(result, vec!["src/lib.rs", "src/main.rs"]);
+    }
+
+    #[test]
+    fn normalize_work_claim_resources_empty_input() {
+        let result = normalize_work_claim_resources(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn work_claim_key_uses_title_when_no_resources() {
+        let key = work_claim_key("ctx-1", Scope::Project, "agent-a", "Fix the bug!", &[]);
+        assert!(key.starts_with("ctx-1:"));
+        assert!(key.contains("agent-a"));
+        assert!(key.contains("fix-the-bug"));
+        assert!(!key.contains("!"));
+    }
+
+    #[test]
+    fn work_claim_key_uses_resources_when_present() {
+        let resources = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+        let key = work_claim_key("ctx-1", Scope::Shared, "agent-a", "title", &resources);
+        assert!(key.contains("src/main.rs|src/lib.rs"));
+        assert!(!key.contains("title"));
+    }
+
+    #[test]
+    fn merge_work_claim_extra_into_null() {
+        let coordination = WorkClaimCoordination {
+            claim_key: "key".into(),
+            resources: vec!["file.rs".into()],
+            exclusive: true,
+            ..Default::default()
+        };
+        let result = merge_work_claim_extra(serde_json::Value::Null, &coordination);
+        assert!(result["coordination"]["claim_key"].as_str() == Some("key"));
+        assert!(result["coordination"]["exclusive"].as_bool() == Some(true));
+    }
+
+    #[test]
+    fn merge_work_claim_extra_into_object() {
+        let coordination = WorkClaimCoordination::default();
+        let existing = serde_json::json!({"user_data": 42});
+        let result = merge_work_claim_extra(existing, &coordination);
+        assert_eq!(result["user_data"].as_u64(), Some(42));
+        assert!(result["coordination"].is_object());
+    }
+
+    #[test]
+    fn merge_work_claim_extra_into_non_object() {
+        let coordination = WorkClaimCoordination::default();
+        let result = merge_work_claim_extra(serde_json::json!("string payload"), &coordination);
+        assert_eq!(result["payload"].as_str(), Some("string payload"));
+        assert!(result["coordination"].is_object());
+    }
+
+    #[test]
+    fn work_claim_coordination_from_extra_finds_nested_and_top_level() {
+        let with_user = serde_json::json!({
+            "user": { "coordination": { "claim_key": "from-user", "resources": [], "exclusive": false } }
+        });
+        let result = work_claim_coordination_from_extra(&with_user).unwrap();
+        assert_eq!(result.claim_key, "from-user");
+
+        let top_level = serde_json::json!({
+            "coordination": { "claim_key": "from-top", "resources": [], "exclusive": true }
+        });
+        let result = work_claim_coordination_from_extra(&top_level).unwrap();
+        assert_eq!(result.claim_key, "from-top");
+
+        let empty = serde_json::json!({});
+        assert!(work_claim_coordination_from_extra(&empty).is_none());
+    }
+
+    #[test]
+    fn merge_coordination_signal_extra_into_null() {
+        let result = merge_coordination_signal_extra(
+            serde_json::Value::Null,
+            CoordinationLane::Anxiety,
+            CoordinationSeverity::Warn,
+            Some("target-agent".into()),
+            None,
+            Some("claim-1".into()),
+            Some("src/file.rs".into()),
+            vec!["proj-1".into()],
+            Vec::new(),
+        );
+        assert_eq!(
+            result["coordination_signal"]["lane"].as_str(),
+            Some("anxiety")
+        );
+        assert_eq!(
+            result["coordination_signal"]["severity"].as_str(),
+            Some("warn")
+        );
+        assert_eq!(
+            result["coordination_signal"]["target_agent_id"].as_str(),
+            Some("target-agent")
+        );
+        assert_eq!(
+            result["coordination_signal"]["claim_id"].as_str(),
+            Some("claim-1")
+        );
+    }
+
+    #[test]
+    fn merge_coordination_signal_extra_into_object_preserves_fields() {
+        let existing = serde_json::json!({"metadata": "keep"});
+        let result = merge_coordination_signal_extra(
+            existing,
+            CoordinationLane::Review,
+            CoordinationSeverity::Info,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(result["metadata"].as_str(), Some("keep"));
+        assert_eq!(
+            result["coordination_signal"]["lane"].as_str(),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn merge_coordination_signal_extra_wraps_non_object() {
+        let result = merge_coordination_signal_extra(
+            serde_json::json!(42),
+            CoordinationLane::Backoff,
+            CoordinationSeverity::Block,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(result["payload"].as_u64(), Some(42));
+        assert_eq!(
+            result["coordination_signal"]["lane"].as_str(),
+            Some("backoff")
+        );
+    }
+
+    #[test]
+    fn coordination_signal_from_extra_finds_nested_and_top_level() {
+        let with_user = serde_json::json!({
+            "user": { "coordination_signal": { "lane": "anxiety", "severity": "warn" } }
+        });
+        let result = coordination_signal_from_extra(&with_user).unwrap();
+        assert_eq!(result.lane, "anxiety");
+
+        let top_level = serde_json::json!({
+            "coordination_signal": { "lane": "review", "severity": "info" }
+        });
+        let result = coordination_signal_from_extra(&top_level).unwrap();
+        assert_eq!(result.lane, "review");
+
+        let empty = serde_json::json!({});
+        assert!(coordination_signal_from_extra(&empty).is_none());
+    }
+
+    fn make_test_item(
+        id: &str,
+        kind: ContinuityKind,
+        status: ContinuityStatus,
+        extra: serde_json::Value,
+    ) -> ContinuityItemRecord {
+        ContinuityItemRecord {
+            id: id.into(),
+            memory_id: format!("mem-{id}"),
+            context_id: "ctx-1".into(),
+            namespace: "ns".into(),
+            task_id: "task".into(),
+            author_agent_id: "agent-a".into(),
+            kind,
+            scope: Scope::Project,
+            status,
+            title: format!("Item {id}"),
+            body: "body".into(),
+            importance: 0.9,
+            confidence: 0.9,
+            salience: 0.9,
+            retention: ContinuityRetentionState {
+                class: kind.as_str().to_string(),
+                age_hours: 1.0,
+                half_life_hours: 36.0,
+                floor: 0.03,
+                decay_multiplier: 1.0,
+                effective_salience: 0.9,
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            supersedes_id: None,
+            resolved_at: None,
+            supports: Vec::new(),
+            extra,
+        }
+    }
+
+    #[test]
+    fn filter_kind_returns_only_matching() {
+        let items = vec![
+            make_test_item(
+                "1",
+                ContinuityKind::Fact,
+                ContinuityStatus::Open,
+                serde_json::json!({}),
+            ),
+            make_test_item(
+                "2",
+                ContinuityKind::Decision,
+                ContinuityStatus::Open,
+                serde_json::json!({}),
+            ),
+            make_test_item(
+                "3",
+                ContinuityKind::Fact,
+                ContinuityStatus::Active,
+                serde_json::json!({}),
+            ),
+        ];
+        let facts = filter_kind(&items, ContinuityKind::Fact);
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|item| item.kind == ContinuityKind::Fact));
+
+        let empty = filter_kind(&items, ContinuityKind::Lesson);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn work_claim_is_live_requires_kind_and_open_status() {
+        let now = Utc::now();
+        let non_claim = make_test_item(
+            "1",
+            ContinuityKind::Fact,
+            ContinuityStatus::Open,
+            serde_json::json!({}),
+        );
+        assert!(!work_claim_is_live(&non_claim, now));
+
+        let resolved_claim = make_test_item(
+            "2",
+            ContinuityKind::WorkClaim,
+            ContinuityStatus::Resolved,
+            serde_json::json!({}),
+        );
+        assert!(!work_claim_is_live(&resolved_claim, now));
+    }
+
+    #[test]
+    fn work_claim_is_live_with_no_coordination_defaults_to_true() {
+        let now = Utc::now();
+        let claim = make_test_item(
+            "1",
+            ContinuityKind::WorkClaim,
+            ContinuityStatus::Open,
+            serde_json::json!({}),
+        );
+        assert!(work_claim_is_live(&claim, now));
+    }
+
+    #[test]
+    fn work_claim_is_live_respects_lease_expiry() {
+        let now = Utc::now();
+        let future = now + Duration::hours(1);
+        let past = now - Duration::hours(1);
+
+        let live_claim = make_test_item(
+            "1",
+            ContinuityKind::WorkClaim,
+            ContinuityStatus::Active,
+            serde_json::json!({
+                "coordination": {
+                    "claim_key": "k",
+                    "resources": [],
+                    "exclusive": false,
+                    "lease_expires_at": future.to_rfc3339()
+                }
+            }),
+        );
+        assert!(work_claim_is_live(&live_claim, now));
+
+        let expired_claim = make_test_item(
+            "2",
+            ContinuityKind::WorkClaim,
+            ContinuityStatus::Active,
+            serde_json::json!({
+                "coordination": {
+                    "claim_key": "k",
+                    "resources": [],
+                    "exclusive": false,
+                    "lease_expires_at": past.to_rfc3339()
+                }
+            }),
+        );
+        assert!(!work_claim_is_live(&expired_claim, now));
+    }
+
+    #[test]
+    fn counts_as_open_thread_filters_resolved_and_expired_claims() {
+        let now = Utc::now();
+        let resolved = make_test_item(
+            "1",
+            ContinuityKind::Fact,
+            ContinuityStatus::Resolved,
+            serde_json::json!({}),
+        );
+        assert!(!counts_as_open_thread(&resolved, now));
+
+        let open_fact = make_test_item(
+            "2",
+            ContinuityKind::Fact,
+            ContinuityStatus::Open,
+            serde_json::json!({}),
+        );
+        assert!(counts_as_open_thread(&open_fact, now));
+
+        let open_claim_no_coord = make_test_item(
+            "3",
+            ContinuityKind::WorkClaim,
+            ContinuityStatus::Open,
+            serde_json::json!({}),
+        );
+        assert!(counts_as_open_thread(&open_claim_no_coord, now));
+
+        let past = now - Duration::hours(1);
+        let expired_claim = make_test_item(
+            "4",
+            ContinuityKind::WorkClaim,
+            ContinuityStatus::Open,
+            serde_json::json!({
+                "coordination": {
+                    "claim_key": "k",
+                    "resources": [],
+                    "exclusive": false,
+                    "lease_expires_at": past.to_rfc3339()
+                }
+            }),
+        );
+        assert!(!counts_as_open_thread(&expired_claim, now));
+    }
+
+    #[test]
+    fn work_claims_conflict_requires_exclusive_and_shared_resource() {
+        let now = Utc::now();
+        let future = now + Duration::hours(1);
+
+        let make_claim = |id: &str, resources: Vec<&str>, exclusive: bool| {
+            make_test_item(
+                id,
+                ContinuityKind::WorkClaim,
+                ContinuityStatus::Active,
+                serde_json::json!({
+                    "coordination": {
+                        "claim_key": format!("k-{id}"),
+                        "resources": resources,
+                        "exclusive": exclusive,
+                        "lease_expires_at": future.to_rfc3339()
+                    }
+                }),
+            )
+        };
+
+        let claim_a = make_claim("a", vec!["file.rs"], true);
+        let claim_b = make_claim("b", vec!["file.rs"], false);
+        assert!(work_claims_conflict(&claim_a, &claim_b, now));
+
+        let claim_c = make_claim("c", vec!["file.rs"], false);
+        let claim_d = make_claim("d", vec!["file.rs"], false);
+        assert!(!work_claims_conflict(&claim_c, &claim_d, now));
+
+        let claim_e = make_claim("e", vec!["a.rs"], true);
+        let claim_f = make_claim("f", vec!["b.rs"], true);
+        assert!(!work_claims_conflict(&claim_e, &claim_f, now));
+
+        assert!(!work_claims_conflict(&claim_a, &claim_a, now));
+    }
+
+    #[test]
+    fn coordination_signal_requires_signal_kind_and_open_status() {
+        let signal_item = make_test_item(
+            "1",
+            ContinuityKind::Signal,
+            ContinuityStatus::Active,
+            serde_json::json!({
+                "coordination_signal": {
+                    "lane": "anxiety",
+                    "severity": "warn"
+                }
+            }),
+        );
+        assert!(coordination_signal(&signal_item).is_some());
+
+        let resolved_signal = make_test_item(
+            "2",
+            ContinuityKind::Signal,
+            ContinuityStatus::Resolved,
+            serde_json::json!({
+                "coordination_signal": { "lane": "anxiety", "severity": "warn" }
+            }),
+        );
+        assert!(coordination_signal(&resolved_signal).is_none());
+
+        let wrong_kind = make_test_item(
+            "3",
+            ContinuityKind::Fact,
+            ContinuityStatus::Open,
+            serde_json::json!({
+                "coordination_signal": { "lane": "anxiety", "severity": "warn" }
+            }),
+        );
+        assert!(coordination_signal(&wrong_kind).is_none());
+    }
+
+    #[test]
+    fn trim_text_within_limit_returns_trimmed() {
+        assert_eq!(trim_text("  hello  ", 100), "hello");
+    }
+
+    #[test]
+    fn trim_text_beyond_limit_truncates_with_ellipsis() {
+        let long = "a".repeat(300);
+        let trimmed = trim_text(&long, 10);
+        assert!(trimmed.ends_with("..."));
+        assert!(trimmed.chars().count() <= 10);
+    }
+
+    #[test]
+    fn augment_dimensions_avoids_duplicates() {
+        let base = vec![DimensionValue {
+            key: "k1".into(),
+            value: "v1".into(),
+            weight: 100,
+        }];
+        let extra = vec![
+            DimensionValue {
+                key: "k1".into(),
+                value: "v1".into(),
+                weight: 100,
+            },
+            DimensionValue {
+                key: "k2".into(),
+                value: "v2".into(),
+                weight: 50,
+            },
+        ];
+        let merged = augment_dimensions(base, extra);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].key, "k1");
+        assert_eq!(merged[1].key, "k2");
+    }
+
+    #[test]
+    fn default_functions_return_expected_values() {
+        assert_eq!(default_support_weight(), 1.0);
+        assert_eq!(default_candidate_limit(), 24);
+        assert_eq!(default_token_budget(), 384);
+        assert_eq!(default_snapshot_resolution(), SnapshotResolution::Medium);
+        assert_eq!(default_work_claim_lease_seconds(), 180);
+    }
+
+    #[test]
+    fn if_empty_then_uses_fallback_for_blank() {
+        assert_eq!("".to_string().if_empty_then("fallback"), "fallback");
+        assert_eq!("  ".to_string().if_empty_then("fallback"), "fallback");
+        assert_eq!("value".to_string().if_empty_then("fallback"), "value");
+    }
+
+    #[test]
+    fn continuity_kind_serde_roundtrip() {
+        let kind = ContinuityKind::OperationalScar;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"operational_scar\"");
+        let back: ContinuityKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn continuity_status_serde_roundtrip() {
+        for status in [
+            ContinuityStatus::Open,
+            ContinuityStatus::Active,
+            ContinuityStatus::Resolved,
+            ContinuityStatus::Superseded,
+            ContinuityStatus::Rejected,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: ContinuityStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+            assert_eq!(json.trim_matches('"'), status.as_str());
+        }
+    }
+
+    #[test]
+    fn coordination_lane_serde_roundtrip() {
+        for lane in [
+            CoordinationLane::Anxiety,
+            CoordinationLane::Review,
+            CoordinationLane::Warning,
+            CoordinationLane::Backoff,
+            CoordinationLane::Coach,
+        ] {
+            let json = serde_json::to_string(&lane).unwrap();
+            let back: CoordinationLane = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, lane);
+        }
+    }
+
+    #[test]
+    fn coordination_severity_serde_roundtrip() {
+        for severity in [
+            CoordinationSeverity::Info,
+            CoordinationSeverity::Warn,
+            CoordinationSeverity::Block,
+        ] {
+            let json = serde_json::to_string(&severity).unwrap();
+            let back: CoordinationSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, severity);
+        }
+    }
 }

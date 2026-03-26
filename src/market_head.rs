@@ -1994,7 +1994,9 @@ fn relative_display(root: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::adapters::AgentContinuationOutput;
-    use crate::benchmark::{BaselineStatus, BenchmarkClass, Evaluation, scenario_for};
+    use crate::benchmark::{
+        BaselineStatus, BenchmarkClass, Evaluation, GroundTruth, TruthItem, scenario_for,
+    };
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -2828,5 +2830,432 @@ mod tests {
         assert!(markdown.contains("Market-Head Judge Disagreement Report"));
         assert!(markdown.contains("| agent-swap-survival | 0.50 | 1.00 | +0.50 |"));
         assert!(markdown.contains("canonical_lexical_gap"));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_market_head_judge_drift
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_drift_aligned_when_zero_delta() {
+        assert_eq!(classify_market_head_judge_drift(0.0, &[]), "aligned");
+    }
+
+    #[test]
+    fn classify_drift_lexical_gap() {
+        let diagnostics = vec![MarketHeadJudgeCriticalFactDiagnostic {
+            index: 0,
+            expectation: "something".into(),
+            strictness_note: None,
+            required_concepts: Vec::new(),
+            canonical_matched: false,
+            canonical_note_text: None,
+            judge_score: Some(3),
+            judge_reason: None,
+        }];
+        assert_eq!(
+            classify_market_head_judge_drift(0.5, &diagnostics),
+            "canonical_lexical_gap"
+        );
+    }
+
+    #[test]
+    fn classify_drift_partial_gap() {
+        let diagnostics = vec![MarketHeadJudgeCriticalFactDiagnostic {
+            index: 0,
+            expectation: "something".into(),
+            strictness_note: None,
+            required_concepts: Vec::new(),
+            canonical_matched: false,
+            canonical_note_text: None,
+            judge_score: Some(2),
+            judge_reason: None,
+        }];
+        assert_eq!(
+            classify_market_head_judge_drift(0.3, &diagnostics),
+            "canonical_partial_gap"
+        );
+    }
+
+    #[test]
+    fn classify_drift_judge_undercredit() {
+        let diagnostics = vec![MarketHeadJudgeCriticalFactDiagnostic {
+            index: 0,
+            expectation: "something".into(),
+            strictness_note: None,
+            required_concepts: Vec::new(),
+            canonical_matched: true,
+            canonical_note_text: Some("matched text".into()),
+            judge_score: Some(1),
+            judge_reason: None,
+        }];
+        assert_eq!(
+            classify_market_head_judge_drift(0.2, &diagnostics),
+            "judge_undercredit"
+        );
+    }
+
+    #[test]
+    fn classify_drift_mixed_lexical_gap_and_undercredit() {
+        let diagnostics = vec![
+            MarketHeadJudgeCriticalFactDiagnostic {
+                index: 0,
+                expectation: "something".into(),
+                strictness_note: None,
+                required_concepts: Vec::new(),
+                canonical_matched: false,
+                canonical_note_text: None,
+                judge_score: Some(3),
+                judge_reason: None,
+            },
+            MarketHeadJudgeCriticalFactDiagnostic {
+                index: 1,
+                expectation: "other".into(),
+                strictness_note: None,
+                required_concepts: Vec::new(),
+                canonical_matched: true,
+                canonical_note_text: Some("matched".into()),
+                judge_score: Some(1),
+                judge_reason: None,
+            },
+        ];
+        assert_eq!(
+            classify_market_head_judge_drift(0.4, &diagnostics),
+            "mixed_lexical_gap_and_judge_undercredit"
+        );
+    }
+
+    #[test]
+    fn classify_drift_mixed_partial_gap_and_undercredit() {
+        let diagnostics = vec![
+            MarketHeadJudgeCriticalFactDiagnostic {
+                index: 0,
+                expectation: "something".into(),
+                strictness_note: None,
+                required_concepts: Vec::new(),
+                canonical_matched: false,
+                canonical_note_text: None,
+                judge_score: Some(2),
+                judge_reason: None,
+            },
+            MarketHeadJudgeCriticalFactDiagnostic {
+                index: 1,
+                expectation: "other".into(),
+                strictness_note: None,
+                required_concepts: Vec::new(),
+                canonical_matched: true,
+                canonical_note_text: Some("matched".into()),
+                judge_score: Some(2),
+                judge_reason: None,
+            },
+        ];
+        assert_eq!(
+            classify_market_head_judge_drift(0.3, &diagnostics),
+            "mixed_partial_gap_and_judge_undercredit"
+        );
+    }
+
+    #[test]
+    fn classify_drift_unclassified() {
+        let diagnostics = vec![MarketHeadJudgeCriticalFactDiagnostic {
+            index: 0,
+            expectation: "something".into(),
+            strictness_note: None,
+            required_concepts: Vec::new(),
+            canonical_matched: false,
+            canonical_note_text: None,
+            judge_score: Some(0),
+            judge_reason: None,
+        }];
+        assert_eq!(
+            classify_market_head_judge_drift(0.5, &diagnostics),
+            "unclassified_cfsr_drift"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // judge_category_rate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn judge_category_rate_perfect_score() {
+        let scores = vec![
+            JudgeItemScore {
+                index: 0,
+                score: 3,
+                reason: String::new(),
+            },
+            JudgeItemScore {
+                index: 1,
+                score: 3,
+                reason: String::new(),
+            },
+        ];
+        assert!((judge_category_rate(&scores, 2) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn judge_category_rate_zero_expected_returns_one() {
+        assert!((judge_category_rate(&[], 0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn judge_category_rate_partial_scores() {
+        let scores = vec![
+            JudgeItemScore {
+                index: 0,
+                score: 2,
+                reason: String::new(),
+            },
+            JudgeItemScore {
+                index: 1,
+                score: 1,
+                reason: String::new(),
+            },
+        ];
+        // (2 + 1) / (2 * 3) = 0.5
+        assert!((judge_category_rate(&scores, 2) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn judge_category_rate_out_of_bounds_index_ignored() {
+        let scores = vec![
+            JudgeItemScore {
+                index: 0,
+                score: 3,
+                reason: String::new(),
+            },
+            JudgeItemScore {
+                index: 99,
+                score: 3,
+                reason: String::new(),
+            },
+        ];
+        // Only index 0 counts, expected 2 -> 3 / (2*3) = 0.5
+        assert!((judge_category_rate(&scores, 2) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn judge_category_rate_score_clamped_at_three() {
+        let scores = vec![JudgeItemScore {
+            index: 0,
+            score: 10,
+            reason: String::new(),
+        }];
+        // Clamped to 3 -> 3 / (1*3) = 1.0
+        assert!((judge_category_rate(&scores, 1) - 1.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // judge_evaluate_response
+    // -----------------------------------------------------------------------
+
+    fn test_truth() -> GroundTruth {
+        GroundTruth {
+            critical_facts: vec![
+                TruthItem {
+                    keywords: vec!["selector_missing", "src/query.rs"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+                TruthItem {
+                    keywords: vec!["primary", "context"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+            ],
+            constraints: vec![TruthItem {
+                keywords: vec!["preserve", "provenance"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            decisions: vec![TruthItem {
+                keywords: vec!["unified", "continuity", "interface"],
+                rationale_keywords: vec!["agent", "swap"],
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            scars: vec![TruthItem {
+                keywords: vec!["naive", "probe"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            avoid_repeating: Vec::new(),
+            next_step_keywords: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn judge_evaluate_response_empty_response() {
+        let truth = test_truth();
+        let response = JudgeResponse::default();
+        let eval = judge_evaluate_response(&response, &truth);
+        assert_eq!(eval.critical_fact_rate, 0.0);
+        assert_eq!(eval.comprehension_score, 0.0);
+    }
+
+    #[test]
+    fn judge_evaluate_response_perfect_scores() {
+        let truth = test_truth();
+        let response = JudgeResponse {
+            summary: "Good".into(),
+            critical_facts: vec![
+                JudgeItemScore {
+                    index: 0,
+                    score: 3,
+                    reason: String::new(),
+                },
+                JudgeItemScore {
+                    index: 1,
+                    score: 3,
+                    reason: String::new(),
+                },
+            ],
+            constraints: vec![JudgeItemScore {
+                index: 0,
+                score: 3,
+                reason: String::new(),
+            }],
+            decisions: vec![JudgeItemScore {
+                index: 0,
+                score: 3,
+                reason: String::new(),
+            }],
+            scars: vec![JudgeItemScore {
+                index: 0,
+                score: 3,
+                reason: String::new(),
+            }],
+            next_step: Vec::new(),
+        };
+        let eval = judge_evaluate_response(&response, &truth);
+        assert!((eval.critical_fact_rate - 1.0).abs() < f64::EPSILON);
+        assert!((eval.constraint_rate - 1.0).abs() < f64::EPSILON);
+        assert!((eval.decision_rate - 1.0).abs() < f64::EPSILON);
+        assert!((eval.scar_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_market_head_challenge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_market_head_challenge_empty_cases() {
+        let summary = summarize_market_head_challenge(&[]);
+        assert_eq!(summary.class_count, 0);
+        assert_eq!(summary.avg_cfsr, 0.0);
+    }
+
+    #[test]
+    fn summarize_market_head_challenge_averages_correctly() {
+        let cases = vec![
+            MarketHeadChallengeCaseEvaluation {
+                class: BenchmarkClass::AgentSwapSurvival,
+                scenario_id: "s1".into(),
+                protocol: "p1".into(),
+                response_path: "r1".into(),
+                status: BaselineStatus::Ok,
+                raw_evaluation: Evaluation {
+                    critical_fact_survival_rate: 0.8,
+                    decision_lineage_fidelity: 0.6,
+                    operational_scar_retention: 1.0,
+                    resume_accuracy_score: 0.7,
+                    ..Default::default()
+                },
+                evaluation: Evaluation {
+                    critical_fact_survival_rate: 1.0,
+                    decision_lineage_fidelity: 0.8,
+                    operational_scar_retention: 1.0,
+                    resume_accuracy_score: 0.9,
+                    memory_pollution_rate: 0.1,
+                    provenance_coverage: 0.8,
+                    ..Default::default()
+                },
+                failure: None,
+            },
+            MarketHeadChallengeCaseEvaluation {
+                class: BenchmarkClass::StrongToSmallContinuation,
+                scenario_id: "s2".into(),
+                protocol: "p2".into(),
+                response_path: "r2".into(),
+                status: BaselineStatus::Failed,
+                raw_evaluation: Evaluation::default(),
+                evaluation: Evaluation::default(),
+                failure: Some("error".into()),
+            },
+        ];
+        let summary = summarize_market_head_challenge(&cases);
+        assert_eq!(summary.class_count, 2);
+        assert_eq!(summary.failed_cases, 1);
+        assert!((summary.avg_absorption_cfsr - 0.4).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_market_head_judge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_market_head_judge_empty_cases() {
+        let summary = summarize_market_head_judge(&[]);
+        assert_eq!(summary.class_count, 0);
+    }
+
+    #[test]
+    fn summarize_market_head_judge_averages_correctly() {
+        let cases = vec![MarketHeadJudgeCaseEvaluation {
+            class: BenchmarkClass::AgentSwapSurvival,
+            scenario_id: "s1".into(),
+            protocol: "p1".into(),
+            response_path: "r1".into(),
+            status: BaselineStatus::Ok,
+            evaluation: JudgeEvaluation {
+                critical_fact_rate: 0.8,
+                constraint_rate: 0.9,
+                decision_rate: 0.7,
+                scar_rate: 1.0,
+                next_step_rate: 0.5,
+                comprehension_score: 0.78,
+            },
+            failure: None,
+        }];
+        let summary = summarize_market_head_judge(&cases);
+        assert_eq!(summary.class_count, 1);
+        assert!((summary.avg_judge_cfsr - 0.8).abs() < f64::EPSILON);
+        assert!((summary.avg_judge_comprehension - 0.78).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize_market_head_judge_disagreement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_market_head_judge_disagreement_empty() {
+        let summary = summarize_market_head_judge_disagreement(&[]);
+        assert_eq!(summary.class_count, 0);
+        assert_eq!(summary.divergent_cases, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // MarketHeadChallengeConfig.selected_classes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn market_head_config_selected_classes_defaults() {
+        let config = market_head_config(PathBuf::from("/tmp"), Vec::new());
+        let classes = config.selected_classes();
+        assert_eq!(classes.len(), 5);
+    }
+
+    #[test]
+    fn market_head_config_selected_classes_custom() {
+        let config = market_head_config(
+            PathBuf::from("/tmp"),
+            vec![BenchmarkClass::AgentSwapSurvival],
+        );
+        assert_eq!(config.selected_classes().len(), 1);
     }
 }
