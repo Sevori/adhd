@@ -3411,10 +3411,16 @@ mod tests {
         HypothesisValidationResult, LessonDirection, MetaLesson, MetaLessonEvidence,
         MetaLessonReport, Phase3ClassResult, Phase3ValidationReport, ResourceEnvelope,
         SurfacedItem, SurvivalOutcome, SurvivalReport, TruthCategory, TruthItem,
-        benchmark_survival_analysis, build_context_envelope, chi_squared_2x2,
-        compare_feature_distributions, erfc_approx, evaluate_output, extract_eligible_hypotheses,
-        generate_meta_lessons, generate_phase3_report, populate_scenario, render_suite_markdown,
-        repair_output_from_envelope, scenario_for, write_phase3_outcomes_to_kernel,
+        benchmark_survival_analysis, build_context_envelope, category_rate, chi_squared_2x2,
+        compare_feature_distributions, count_items, erfc_approx, estimate_tokens, evaluate_output,
+        extract_eligible_hypotheses, failed_evaluation, flatten_keywords,
+        format_continuity_path_label, generate_meta_lessons, generate_phase3_report,
+        has_sparse_cells, inferred_hrt, looks_like_placeholder, match_keywords,
+        normalized_decision_probe, normalized_text, populate_scenario, primary_note_text,
+        ratio_or_zero, render_suite_markdown, repair_output_from_envelope, scenario_for,
+        score_decisions, score_notes, section_prefix, split_title_and_rationale,
+        strip_placeholder_title, summarize, trim_text, unsupported_items,
+        write_phase3_outcomes_to_kernel,
     };
     use crate::adapters::{
         AgentContinuationOutput, DecisionNote, EvidenceNote, ModelCallMetrics, SurvivalHypothesis,
@@ -5273,5 +5279,1221 @@ mod tests {
         let json = serde_json::to_string_pretty(&phase3_report).unwrap();
         assert!(json.contains("hypotheses_tested"));
         assert!(json.contains("cycle"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Evaluation scoring logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_output_all_matched() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            critical_facts: vec![
+                EvidenceNote {
+                    text: "selector_missing in src/query.rs".into(),
+                    evidence: vec!["f1".into()],
+                },
+                EvidenceNote {
+                    text: "Primary context for this scenario".into(),
+                    evidence: vec!["f1".into()],
+                },
+            ],
+            constraints: vec![EvidenceNote {
+                text: "Must preserve provenance chains".into(),
+                evidence: vec!["f1".into()],
+            }],
+            decisions: vec![DecisionNote {
+                text: "Use the unified continuity interface".into(),
+                rationale: "Agent swap requires consistent handling".into(),
+                evidence: vec!["f1".into()],
+            }],
+            operational_scars: vec![EvidenceNote {
+                text: "Naive probe approach was unreliable".into(),
+                evidence: vec!["f1".into()],
+            }],
+            ..Default::default()
+        };
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert!((eval.critical_fact_survival_rate - 1.0).abs() < f64::EPSILON);
+        assert!((eval.constraint_survival_rate - 1.0).abs() < f64::EPSILON);
+        assert!((eval.decision_lineage_fidelity - 1.0).abs() < f64::EPSILON);
+        assert!((eval.operational_scar_retention - 1.0).abs() < f64::EPSILON);
+        assert_eq!(eval.matched_critical_facts, 2);
+        assert_eq!(eval.matched_constraints, 1);
+        assert_eq!(eval.matched_decisions, 1);
+        assert_eq!(eval.matched_scars, 1);
+    }
+
+    #[test]
+    fn evaluate_output_empty_output_yields_zero_category_rates() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput::default();
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert_eq!(eval.critical_fact_survival_rate, 0.0);
+        assert_eq!(eval.constraint_survival_rate, 0.0);
+        assert_eq!(eval.decision_lineage_fidelity, 0.0);
+        assert_eq!(eval.operational_scar_retention, 0.0);
+        // resume_accuracy = (0 + 0 + 0 + 0 + next_step) / 5
+        // next_step is 0 when no keywords match empty text, but truth has empty next_step_keywords
+        // match_keywords("", &[]) returns true -> next_step = 1.0 -> ras = 0.2
+        assert!((eval.resume_accuracy_score - 0.2).abs() < f64::EPSILON);
+        assert_eq!(eval.memory_pollution_rate, 0.0);
+    }
+
+    #[test]
+    fn evaluate_output_mistake_recurrence_detects_repeated_mistake() {
+        let truth = GroundTruth {
+            critical_facts: Vec::new(),
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            scars: Vec::new(),
+            avoid_repeating: vec![TruthItem {
+                keywords: vec!["naive", "probe"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            next_step_keywords: vec!["benchmark"],
+        };
+        let envelope = test_envelope();
+        // next_step repeats the mistake keywords -> MRR = 1.0
+        let output = AgentContinuationOutput {
+            next_step: crate::adapters::ActionNote {
+                text: "Run a naive probe on the query module".into(),
+                evidence: Vec::new(),
+            },
+            ..Default::default()
+        };
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert!((eval.mistake_recurrence_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn evaluate_output_mistake_recurrence_zero_when_avoid_matched() {
+        let truth = GroundTruth {
+            critical_facts: Vec::new(),
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            scars: Vec::new(),
+            avoid_repeating: vec![TruthItem {
+                keywords: vec!["naive", "probe"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            next_step_keywords: Vec::new(),
+        };
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            avoid_repeating: vec![EvidenceNote {
+                text: "Do not run naive probe tests".into(),
+                evidence: Vec::new(),
+            }],
+            ..Default::default()
+        };
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert_eq!(eval.mistake_recurrence_rate, 0.0);
+    }
+
+    #[test]
+    fn evaluate_output_duplicate_work_detected() {
+        let truth = GroundTruth {
+            critical_facts: Vec::new(),
+            constraints: Vec::new(),
+            decisions: vec![TruthItem {
+                keywords: vec!["unified", "interface"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            scars: Vec::new(),
+            avoid_repeating: Vec::new(),
+            next_step_keywords: Vec::new(),
+        };
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            next_step: crate::adapters::ActionNote {
+                text: "Build the unified interface layer".into(),
+                evidence: Vec::new(),
+            },
+            ..Default::default()
+        };
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert!((eval.duplicate_work_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn evaluate_output_memory_pollution_with_unsupported_items() {
+        let truth = test_truth();
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput {
+            critical_facts: vec![
+                EvidenceNote {
+                    text: "selector_missing in src/query.rs".into(),
+                    evidence: Vec::new(),
+                },
+                EvidenceNote {
+                    text: "Completely fabricated fact about aliens".into(),
+                    evidence: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert!(eval.memory_pollution_rate > 0.0);
+        assert_eq!(eval.unsupported_items, 1);
+    }
+
+    #[test]
+    fn evaluate_output_provenance_coverage() {
+        let envelope = ContextEnvelope {
+            provider: BaselineKind::SharedContinuity,
+            retrieval_ms: 10,
+            text: String::new(),
+            token_estimate: 100,
+            surfaced: vec![
+                SurfacedItem {
+                    label: "f1".into(),
+                    support_type: "continuity".into(),
+                    support_id: "ev-1".into(),
+                    text: "item 1".into(),
+                    has_provenance: true,
+                },
+                SurfacedItem {
+                    label: "f2".into(),
+                    support_type: "continuity".into(),
+                    support_id: "ev-2".into(),
+                    text: "item 2".into(),
+                    has_provenance: false,
+                },
+            ],
+        };
+        let truth = GroundTruth {
+            critical_facts: Vec::new(),
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            scars: Vec::new(),
+            avoid_repeating: Vec::new(),
+            next_step_keywords: Vec::new(),
+        };
+        let output = AgentContinuationOutput::default();
+
+        let eval = evaluate_output(&output, &truth, &envelope);
+        assert!((eval.provenance_coverage - 0.5).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // score_notes / score_decisions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn score_notes_empty_truth_returns_zero() {
+        let notes = vec![EvidenceNote {
+            text: "some fact".into(),
+            evidence: Vec::new(),
+        }];
+        let score = score_notes(&notes, &[]);
+        assert_eq!(score.matched, 0);
+        assert_eq!(score.rate, 0.0);
+    }
+
+    #[test]
+    fn score_notes_empty_notes_returns_zero() {
+        let truth = vec![TruthItem {
+            keywords: vec!["foo"],
+            rationale_keywords: Vec::new(),
+            judge_note: None,
+            judge_required_concepts: Vec::new(),
+        }];
+        let score = score_notes(&[], &truth);
+        assert_eq!(score.matched, 0);
+        assert_eq!(score.rate, 0.0);
+    }
+
+    #[test]
+    fn score_decisions_requires_rationale_when_specified() {
+        let truth = vec![TruthItem {
+            keywords: vec!["unified", "interface"],
+            rationale_keywords: vec!["agent", "swap"],
+            judge_note: None,
+            judge_required_concepts: Vec::new(),
+        }];
+        let labels: std::collections::HashSet<String> = ["f1".to_string()].into_iter().collect();
+
+        // Has keywords but wrong rationale -> no match
+        let notes = vec![DecisionNote {
+            text: "Use the unified interface".into(),
+            rationale: "Better performance".into(),
+            evidence: vec!["f1".into()],
+        }];
+        let score = score_decisions(&notes, &truth, &labels);
+        assert_eq!(score.matched, 0);
+
+        // Has keywords and correct rationale -> match
+        let notes = vec![DecisionNote {
+            text: "Use the unified interface".into(),
+            rationale: "Agent swap requires consistent handling".into(),
+            evidence: vec!["f1".into()],
+        }];
+        let score = score_decisions(&notes, &truth, &labels);
+        assert_eq!(score.matched, 1);
+    }
+
+    #[test]
+    fn score_decisions_requires_evidence_label() {
+        let truth = vec![TruthItem {
+            keywords: vec!["unified"],
+            rationale_keywords: Vec::new(),
+            judge_note: None,
+            judge_required_concepts: Vec::new(),
+        }];
+        let labels: std::collections::HashSet<String> = ["f1".to_string()].into_iter().collect();
+
+        // Right keywords but wrong evidence label
+        let notes = vec![DecisionNote {
+            text: "Use the unified approach".into(),
+            rationale: "".into(),
+            evidence: vec!["f999".into()],
+        }];
+        let score = score_decisions(&notes, &truth, &labels);
+        assert_eq!(score.matched, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // unsupported_items / count_items
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsupported_items_counts_unmatched_across_categories() {
+        let truth = test_truth();
+        let labels: std::collections::HashSet<String> = ["f1".to_string()].into_iter().collect();
+        let output = AgentContinuationOutput {
+            critical_facts: vec![EvidenceNote {
+                text: "Fabricated nonsense".into(),
+                evidence: Vec::new(),
+            }],
+            constraints: vec![EvidenceNote {
+                text: "Made-up constraint".into(),
+                evidence: Vec::new(),
+            }],
+            decisions: vec![DecisionNote {
+                text: "Random decision".into(),
+                rationale: "".into(),
+                evidence: vec!["f1".into()],
+            }],
+            ..Default::default()
+        };
+
+        let count = unsupported_items(&output, &truth, &labels);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn count_items_includes_all_categories() {
+        let output = AgentContinuationOutput {
+            critical_facts: vec![EvidenceNote {
+                text: "fact".into(),
+                evidence: Vec::new(),
+            }],
+            constraints: vec![EvidenceNote {
+                text: "c".into(),
+                evidence: Vec::new(),
+            }],
+            decisions: vec![DecisionNote {
+                text: "d".into(),
+                rationale: "".into(),
+                evidence: Vec::new(),
+            }],
+            open_hypotheses: vec![EvidenceNote {
+                text: "h".into(),
+                evidence: Vec::new(),
+            }],
+            operational_scars: vec![EvidenceNote {
+                text: "s".into(),
+                evidence: Vec::new(),
+            }],
+            avoid_repeating: vec![EvidenceNote {
+                text: "a".into(),
+                evidence: Vec::new(),
+            }],
+            next_step: crate::adapters::ActionNote {
+                text: "next".into(),
+                evidence: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(count_items(&output), 7);
+    }
+
+    #[test]
+    fn count_items_empty_next_step_not_counted() {
+        let output = AgentContinuationOutput {
+            next_step: crate::adapters::ActionNote {
+                text: "   ".into(),
+                evidence: Vec::new(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(count_items(&output), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // category_rate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn category_rate_returns_correct_field() {
+        let report = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats {
+                rate: 0.8,
+                ..Default::default()
+            },
+            constraints: CategoryStats {
+                rate: 0.7,
+                ..Default::default()
+            },
+            decisions: CategoryStats {
+                rate: 0.6,
+                ..Default::default()
+            },
+            scars: CategoryStats {
+                rate: 0.5,
+                ..Default::default()
+            },
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+        assert!((category_rate(&report, TruthCategory::CriticalFact) - 0.8).abs() < f64::EPSILON);
+        assert!((category_rate(&report, TruthCategory::Constraint) - 0.7).abs() < f64::EPSILON);
+        assert!((category_rate(&report, TruthCategory::Decision) - 0.6).abs() < f64::EPSILON);
+        assert!(
+            (category_rate(&report, TruthCategory::OperationalScar) - 0.5).abs() < f64::EPSILON
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // has_sparse_cells
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_sparse_cells_returns_true_for_zero_total() {
+        assert!(has_sparse_cells(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn has_sparse_cells_returns_false_for_large_balanced_table() {
+        assert!(!has_sparse_cells(20, 20, 20, 20));
+    }
+
+    #[test]
+    fn has_sparse_cells_returns_true_for_small_expected() {
+        // Table with small marginals -> expected cell < 5
+        assert!(has_sparse_cells(1, 1, 1, 50));
+    }
+
+    #[test]
+    fn has_sparse_cells_returns_true_for_unbalanced_margins() {
+        assert!(has_sparse_cells(2, 0, 8, 10));
+    }
+
+    // -----------------------------------------------------------------------
+    // summarize
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarize_empty_classes() {
+        let summary = summarize(&[]);
+        assert_eq!(summary.class_count, 0);
+        assert_eq!(summary.avg_cfsr, 0.0);
+    }
+
+    #[test]
+    fn summarize_averages_metrics() {
+        let classes = vec![
+            BenchmarkClassReport {
+                class: BenchmarkClass::AgentSwapSurvival,
+                scenario_id: "s1".into(),
+                continuity: BaselineRunReport {
+                    baseline: BaselineKind::SharedContinuity,
+                    status: BaselineStatus::Ok,
+                    model: "test".into(),
+                    retrieval_ms: 0,
+                    model_metrics: ModelCallMetrics::default(),
+                    envelope_tokens: 0,
+                    evaluation: Evaluation::default(),
+                    survival: None,
+                    failure: None,
+                    artifacts: Vec::new(),
+                    continuity_path: None,
+                },
+                baselines: vec![BaselineRunReport {
+                    baseline: BaselineKind::Isolated,
+                    status: BaselineStatus::Failed,
+                    model: "test".into(),
+                    retrieval_ms: 0,
+                    model_metrics: ModelCallMetrics::default(),
+                    envelope_tokens: 0,
+                    evaluation: Evaluation::default(),
+                    survival: None,
+                    failure: Some("boom".into()),
+                    artifacts: Vec::new(),
+                    continuity_path: None,
+                }],
+                metrics: BenchmarkMetrics {
+                    cfsr: 0.8,
+                    csr: 0.6,
+                    dlf: 0.4,
+                    ras: 0.7,
+                    mpr: 0.1,
+                    pc: 0.9,
+                    smcl: 0.5,
+                    sscr: 0.3,
+                    cgd: 0.2,
+                    ..Default::default()
+                },
+                resource: ResourceEnvelope::default(),
+                artifacts: Vec::new(),
+                hypothesis_injection: None,
+            },
+            BenchmarkClassReport {
+                class: BenchmarkClass::StrongToSmallContinuation,
+                scenario_id: "s2".into(),
+                continuity: BaselineRunReport {
+                    baseline: BaselineKind::SharedContinuity,
+                    status: BaselineStatus::Ok,
+                    model: "test".into(),
+                    retrieval_ms: 0,
+                    model_metrics: ModelCallMetrics::default(),
+                    envelope_tokens: 0,
+                    evaluation: Evaluation::default(),
+                    survival: None,
+                    failure: None,
+                    artifacts: Vec::new(),
+                    continuity_path: None,
+                },
+                baselines: Vec::new(),
+                metrics: BenchmarkMetrics {
+                    cfsr: 1.0,
+                    csr: 1.0,
+                    dlf: 1.0,
+                    ras: 1.0,
+                    mpr: 0.0,
+                    pc: 1.0,
+                    smcl: 1.0,
+                    sscr: 1.0,
+                    cgd: 1.0,
+                    ..Default::default()
+                },
+                resource: ResourceEnvelope::default(),
+                artifacts: Vec::new(),
+                hypothesis_injection: None,
+            },
+        ];
+        let summary = summarize(&classes);
+        assert_eq!(summary.class_count, 2);
+        assert!((summary.avg_cfsr - 0.9).abs() < f64::EPSILON);
+        assert!((summary.avg_csr - 0.8).abs() < f64::EPSILON);
+        assert_eq!(summary.failed_runs, 1);
+        assert_eq!(summary.total_runs, 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ratio_or_zero_handles_zero_denominator() {
+        assert_eq!(ratio_or_zero(5.0, 0.0), 0.0);
+        assert_eq!(ratio_or_zero(5.0, -1.0), 0.0);
+        assert!((ratio_or_zero(6.0, 3.0) - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn inferred_hrt_tiers() {
+        assert!((inferred_hrt(0.95) - 1.0).abs() < f64::EPSILON);
+        assert!((inferred_hrt(0.9) - 1.0).abs() < f64::EPSILON);
+        assert!((inferred_hrt(0.7) - 2.0).abs() < f64::EPSILON);
+        assert!((inferred_hrt(0.6) - 2.0).abs() < f64::EPSILON);
+        assert!((inferred_hrt(0.5) - 3.0).abs() < f64::EPSILON);
+        assert!((inferred_hrt(0.0) - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_tokens_minimum_one() {
+        assert_eq!(estimate_tokens(""), 1);
+        assert_eq!(estimate_tokens("ab"), 1);
+        assert!(estimate_tokens("Hello world, this is a longer string") > 1);
+    }
+
+    #[test]
+    fn trim_text_under_max() {
+        assert_eq!(trim_text("short", 100), "short");
+    }
+
+    #[test]
+    fn trim_text_over_max_truncates() {
+        let result = trim_text("abcdefghij", 5);
+        assert_eq!(result, "abcde...");
+    }
+
+    #[test]
+    fn match_keywords_case_insensitive() {
+        assert!(match_keywords("Hello WORLD", &["hello", "world"]));
+        assert!(!match_keywords("Hello", &["hello", "world"]));
+    }
+
+    #[test]
+    fn match_keywords_empty_keywords() {
+        assert!(match_keywords("anything", &[]));
+    }
+
+    #[test]
+    fn flatten_keywords_concatenates_all_items() {
+        let items = vec![
+            TruthItem {
+                keywords: vec!["a", "b"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            },
+            TruthItem {
+                keywords: vec!["c"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            },
+        ];
+        assert_eq!(flatten_keywords(&items), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn primary_note_text_strips_after_double_colon() {
+        assert_eq!(primary_note_text("Title :: body text"), "Title");
+        assert_eq!(primary_note_text("no separator"), "no separator");
+        // " :: body" -> split_once("::") -> (" ", " body") -> title = " ".trim() = ""
+        // -> empty so falls back to original text trimmed
+        assert_eq!(primary_note_text(" :: body"), ":: body");
+    }
+
+    #[test]
+    fn strip_placeholder_title_removes_decision_prefix() {
+        assert_eq!(
+            strip_placeholder_title("decision_text :: The actual title"),
+            Some("The actual title".to_string())
+        );
+        assert_eq!(strip_placeholder_title("Normal title :: rationale"), None);
+        assert_eq!(strip_placeholder_title("no separator"), None);
+    }
+
+    #[test]
+    fn split_title_and_rationale_extracts_both() {
+        assert_eq!(
+            split_title_and_rationale("Title :: Rationale"),
+            Some(("Title".to_string(), "Rationale".to_string()))
+        );
+        assert_eq!(split_title_and_rationale("no separator"), None);
+        assert_eq!(split_title_and_rationale(" :: Rationale"), None);
+        assert_eq!(split_title_and_rationale("Title :: "), None);
+    }
+
+    #[test]
+    fn split_title_and_rationale_strips_known_prefixes() {
+        assert_eq!(
+            split_title_and_rationale(
+                "decision_text: Actual Title :: rationale_text: Real Rationale"
+            ),
+            Some(("Actual Title".to_string(), "Real Rationale".to_string()))
+        );
+    }
+
+    #[test]
+    fn looks_like_placeholder_detects_patterns() {
+        assert!(looks_like_placeholder("decision_text"));
+        assert!(looks_like_placeholder("Decision Text Here"));
+        assert!(looks_like_placeholder("rationale_text something"));
+        assert!(!looks_like_placeholder("Use the unified interface"));
+    }
+
+    #[test]
+    fn normalized_text_strips_non_alphanumeric() {
+        assert_eq!(normalized_text("Hello, World! 123"), "helloworld123");
+        assert_eq!(normalized_text(""), "");
+    }
+
+    #[test]
+    fn normalized_decision_probe_prefers_rationale() {
+        let decision = DecisionNote {
+            text: "decision text".into(),
+            rationale: "the rationale".into(),
+            evidence: Vec::new(),
+        };
+        assert_eq!(normalized_decision_probe(&decision), "therationale");
+
+        let decision_empty_rationale = DecisionNote {
+            text: "the text".into(),
+            rationale: "  ".into(),
+            evidence: Vec::new(),
+        };
+        assert_eq!(
+            normalized_decision_probe(&decision_empty_rationale),
+            "thetext"
+        );
+    }
+
+    #[test]
+    fn failed_evaluation_preserves_provenance() {
+        let envelope = ContextEnvelope {
+            provider: BaselineKind::SharedContinuity,
+            retrieval_ms: 0,
+            text: String::new(),
+            token_estimate: 10,
+            surfaced: vec![
+                SurfacedItem {
+                    label: "f1".into(),
+                    support_type: "c".into(),
+                    support_id: "e1".into(),
+                    text: "a".into(),
+                    has_provenance: true,
+                },
+                SurfacedItem {
+                    label: "f2".into(),
+                    support_type: "c".into(),
+                    support_id: "e2".into(),
+                    text: "b".into(),
+                    has_provenance: true,
+                },
+                SurfacedItem {
+                    label: "f3".into(),
+                    support_type: "c".into(),
+                    support_id: "e3".into(),
+                    text: "c".into(),
+                    has_provenance: false,
+                },
+            ],
+        };
+        let eval = failed_evaluation(&envelope);
+        assert!((eval.provenance_coverage - 2.0 / 3.0).abs() < f64::EPSILON);
+        assert_eq!(eval.critical_fact_survival_rate, 0.0);
+    }
+
+    #[test]
+    fn format_continuity_path_label_handoff_proof() {
+        let path = ContinuityPathReport {
+            kind: ContinuityPathKind::HandoffProof,
+            role: ContinuityPathRole::ProofPath,
+            proof_register_count: 5,
+            proof_register_labels: Vec::new(),
+        };
+        assert_eq!(format_continuity_path_label(&path), "handoff-proof(5)");
+    }
+
+    #[test]
+    fn format_continuity_path_label_read_context_control() {
+        let path = ContinuityPathReport {
+            kind: ContinuityPathKind::ReadContextOnly,
+            role: ContinuityPathRole::ExplicitControl,
+            proof_register_count: 0,
+            proof_register_labels: Vec::new(),
+        };
+        assert_eq!(format_continuity_path_label(&path), "read-context-control");
+    }
+
+    #[test]
+    fn format_continuity_path_label_legacy() {
+        let path = ContinuityPathReport {
+            kind: ContinuityPathKind::ReadContextOnly,
+            role: ContinuityPathRole::Legacy,
+            proof_register_count: 0,
+            proof_register_labels: Vec::new(),
+        };
+        assert_eq!(format_continuity_path_label(&path), "read-context-only");
+    }
+
+    #[test]
+    fn section_prefix_returns_known_prefixes() {
+        assert_eq!(section_prefix("constraints"), "k");
+        assert_eq!(section_prefix("decisions"), "d");
+        assert_eq!(section_prefix("hypotheses"), "h");
+        assert_eq!(section_prefix("incidents"), "i");
+        assert_eq!(section_prefix("operational_scars"), "s");
+        assert_eq!(section_prefix("open_threads"), "t");
+        assert_eq!(section_prefix("unknown"), "x");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_phase3_report_skips_unknown_category() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "UnknownCategory".into(),
+            direction: "SurvivedMore".into(),
+            hint: "Include file paths".into(),
+        };
+
+        let class_results = vec![Phase3ClassResult {
+            class: BenchmarkClass::AgentSwapSurvival,
+            control_survival: None,
+            treatment_survival: None,
+            hypotheses: Vec::new(),
+            delta_ras: 0.0,
+            delta_cfsr: 0.0,
+            delta_csr: 0.0,
+            delta_osr: 0.0,
+        }];
+
+        let report = generate_phase3_report(&class_results, &[hypothesis], 1);
+        assert_eq!(report.hypotheses_tested, 0);
+    }
+
+    #[test]
+    fn generate_phase3_report_handles_fewer_than_three_classes() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "SurvivedMore".into(),
+            hint: "Include file paths".into(),
+        };
+
+        let survival = SurvivalReport {
+            records: Vec::new(),
+            facts: CategoryStats {
+                rate: 0.9,
+                ..Default::default()
+            },
+            constraints: CategoryStats::default(),
+            decisions: CategoryStats::default(),
+            scars: CategoryStats::default(),
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+
+        // Only 2 classes -> cannot promote (needs >= 3)
+        let class_results = vec![
+            Phase3ClassResult {
+                class: BenchmarkClass::AgentSwapSurvival,
+                control_survival: Some(SurvivalReport {
+                    facts: CategoryStats {
+                        rate: 0.5,
+                        ..Default::default()
+                    },
+                    ..survival.clone()
+                }),
+                treatment_survival: Some(survival.clone()),
+                hypotheses: vec![hypothesis.clone()],
+                delta_ras: 0.0,
+                delta_cfsr: 0.0,
+                delta_csr: 0.0,
+                delta_osr: 0.0,
+            },
+            Phase3ClassResult {
+                class: BenchmarkClass::StrongToSmallContinuation,
+                control_survival: Some(SurvivalReport {
+                    facts: CategoryStats {
+                        rate: 0.5,
+                        ..Default::default()
+                    },
+                    ..survival.clone()
+                }),
+                treatment_survival: Some(survival.clone()),
+                hypotheses: vec![hypothesis.clone()],
+                delta_ras: 0.0,
+                delta_cfsr: 0.0,
+                delta_csr: 0.0,
+                delta_osr: 0.0,
+            },
+        ];
+
+        let report = generate_phase3_report(&class_results, &[hypothesis], 1);
+        assert!(
+            !report.results[0].promoted,
+            "cannot promote with fewer than 3 classes"
+        );
+    }
+
+    #[test]
+    fn generate_phase3_report_direction_lost_more() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "numeric_ref".into(),
+            category: "Constraint".into(),
+            direction: "LostMore".into(),
+            hint: "Avoid numeric refs".into(),
+        };
+
+        let class_results: Vec<Phase3ClassResult> = [
+            BenchmarkClass::AgentSwapSurvival,
+            BenchmarkClass::StrongToSmallContinuation,
+            BenchmarkClass::SmallToSmallRelay,
+        ]
+        .iter()
+        .map(|&class| Phase3ClassResult {
+            class,
+            control_survival: Some(SurvivalReport {
+                records: Vec::new(),
+                facts: CategoryStats::default(),
+                constraints: CategoryStats {
+                    rate: 0.4,
+                    ..Default::default()
+                },
+                decisions: CategoryStats::default(),
+                scars: CategoryStats::default(),
+                surfaced_item_count: 0,
+                surfaced_with_provenance: 0,
+                total_envelope_tokens: 0,
+            }),
+            treatment_survival: Some(SurvivalReport {
+                records: Vec::new(),
+                facts: CategoryStats::default(),
+                constraints: CategoryStats {
+                    rate: 0.2,
+                    ..Default::default()
+                },
+                decisions: CategoryStats::default(),
+                scars: CategoryStats::default(),
+                surfaced_item_count: 0,
+                surfaced_with_provenance: 0,
+                total_envelope_tokens: 0,
+            }),
+            hypotheses: vec![hypothesis.clone()],
+            delta_ras: 0.0,
+            delta_cfsr: 0.0,
+            delta_csr: 0.0,
+            delta_osr: 0.0,
+        })
+        .collect();
+
+        let report = generate_phase3_report(&class_results, &[hypothesis], 1);
+        assert_eq!(report.results[0].direction, LessonDirection::LostMore);
+        assert!(report.results[0].rejected);
+    }
+
+    #[test]
+    fn generate_phase3_report_no_convergence_before_cycle_five() {
+        let hypothesis = SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "SurvivedMore".into(),
+            hint: "test".into(),
+        };
+        let report = generate_phase3_report(&[], &[hypothesis], 4);
+        assert!(!report.converged);
+    }
+
+    // -----------------------------------------------------------------------
+    // benjamini_hochberg edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn benjamini_hochberg_empty_input() {
+        use super::benjamini_hochberg;
+        assert!(benjamini_hochberg(&[]).is_empty());
+    }
+
+    #[test]
+    fn benjamini_hochberg_single_value() {
+        use super::benjamini_hochberg;
+        let adj = benjamini_hochberg(&[0.03]);
+        assert_eq!(adj.len(), 1);
+        assert!((adj[0] - 0.03).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn benjamini_hochberg_all_significant() {
+        use super::benjamini_hochberg;
+        let raw = vec![0.001, 0.002, 0.003];
+        let adj = benjamini_hochberg(&raw);
+        for a in &adj {
+            assert!(*a < 0.05, "all should remain significant, got {a}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Survival record feature extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn survival_record_extracts_numeric_ref() {
+        let truth = GroundTruth {
+            critical_facts: vec![TruthItem {
+                keywords: vec!["error", "42"],
+                rationale_keywords: Vec::new(),
+                judge_note: None,
+                judge_required_concepts: Vec::new(),
+            }],
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            scars: Vec::new(),
+            avoid_repeating: Vec::new(),
+            next_step_keywords: Vec::new(),
+        };
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput::default();
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+        let record = &report.records[0];
+        assert!(record.features.contains_numeric_ref);
+    }
+
+    #[test]
+    fn survival_record_file_extensions() {
+        let truth = GroundTruth {
+            critical_facts: vec![
+                TruthItem {
+                    keywords: vec!["app.py"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+                TruthItem {
+                    keywords: vec!["main.ts"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+                TruthItem {
+                    keywords: vec!["server.go"],
+                    rationale_keywords: Vec::new(),
+                    judge_note: None,
+                    judge_required_concepts: Vec::new(),
+                },
+            ],
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            scars: Vec::new(),
+            avoid_repeating: Vec::new(),
+            next_step_keywords: Vec::new(),
+        };
+        let envelope = test_envelope();
+        let output = AgentContinuationOutput::default();
+
+        let report = benchmark_survival_analysis(&output, &truth, &envelope);
+        for record in &report.records {
+            assert!(
+                record.features.contains_file_path,
+                "should detect file path for keywords {:?}",
+                record.keywords
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // BenchmarkClass and BaselineKind slug coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn benchmark_class_all_covers_all_variants() {
+        let all = BenchmarkClass::all();
+        assert_eq!(all.len(), 10);
+    }
+
+    #[test]
+    fn benchmark_class_slug_roundtrip() {
+        for class in BenchmarkClass::all() {
+            let slug = class.slug();
+            assert!(!slug.is_empty(), "slug should not be empty for {class:?}");
+        }
+    }
+
+    #[test]
+    fn baseline_kind_slug_all_variants() {
+        let kinds = [
+            BaselineKind::SharedContinuity,
+            BaselineKind::Isolated,
+            BaselineKind::RecentWindow,
+            BaselineKind::VectorOnly,
+            BaselineKind::RollingSummary,
+            BaselineKind::FullTranscript,
+        ];
+        let slugs: Vec<_> = kinds.iter().map(|k| k.slug()).collect();
+        assert_eq!(slugs.len(), 6);
+        assert!(slugs.contains(&"shared-continuity"));
+        assert!(slugs.contains(&"isolated"));
+        assert!(slugs.contains(&"recent-window"));
+        assert!(slugs.contains(&"vector-only"));
+        assert!(slugs.contains(&"rolling-summary"));
+        assert!(slugs.contains(&"full-transcript"));
+    }
+
+    #[test]
+    fn benchmark_class_uses_handoff_proof_coverage() {
+        use super::BenchmarkClass::*;
+        // BaselineIsolation does NOT use handoff proof
+        assert!(!BaselineIsolation.uses_handoff_proof());
+        // All others do
+        for class in [
+            AgentSwapSurvival,
+            StrongToSmallContinuation,
+            SmallToSmallRelay,
+            InterruptionStress,
+            OperationalScar,
+            CrossAgentCollaborative,
+            CrashRecovery,
+            MemoryPollution,
+            ContextBudgetCompression,
+        ] {
+            assert!(
+                class.uses_handoff_proof(),
+                "{class:?} should use handoff proof"
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_class_shared_path_role_coverage() {
+        use super::ContinuityPathRole::*;
+        assert_eq!(
+            BenchmarkClass::AgentSwapSurvival.shared_path_role(),
+            ProofPath
+        );
+        assert_eq!(
+            BenchmarkClass::BaselineIsolation.shared_path_role(),
+            ExplicitControl
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_meta_lessons with multiple suite reports
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_meta_lessons_multiple_suites_aggregates_records() {
+        use super::ItemFeatures;
+        // Build two suite reports with survival records
+        let make_survival = |records: Vec<super::SurvivalRecord>| SurvivalReport {
+            facts: super::category_stats(&records, TruthCategory::CriticalFact),
+            constraints: super::category_stats(&records, TruthCategory::Constraint),
+            decisions: super::category_stats(&records, TruthCategory::Decision),
+            scars: super::category_stats(&records, TruthCategory::OperationalScar),
+            records,
+            surfaced_item_count: 0,
+            surfaced_with_provenance: 0,
+            total_envelope_tokens: 0,
+        };
+
+        let make_records = || {
+            (0..6)
+                .map(|i| super::SurvivalRecord {
+                    category: TruthCategory::CriticalFact,
+                    outcome: if i < 4 {
+                        SurvivalOutcome::Survived
+                    } else {
+                        SurvivalOutcome::Lost
+                    },
+                    keywords: vec!["test".into()],
+                    features: ItemFeatures {
+                        keyword_count: 1,
+                        keyword_char_length: 4,
+                        contains_file_path: i < 3,
+                        contains_numeric_ref: false,
+                        matched_note_text: None,
+                        matched_note_tokens: None,
+                        prohibition_framing: None,
+                        aspiration_framing: None,
+                        evidence_count: None,
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let make_suite = |class: BenchmarkClass| BenchmarkSuiteReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            config: config_with_classes(vec![class]),
+            classes: vec![BenchmarkClassReport {
+                class,
+                scenario_id: class.slug().into(),
+                continuity: BaselineRunReport {
+                    baseline: BaselineKind::SharedContinuity,
+                    status: BaselineStatus::Ok,
+                    model: "test".into(),
+                    retrieval_ms: 0,
+                    model_metrics: ModelCallMetrics::default(),
+                    envelope_tokens: 0,
+                    evaluation: Evaluation::default(),
+                    survival: Some(make_survival(make_records())),
+                    failure: None,
+                    artifacts: Vec::new(),
+                    continuity_path: None,
+                },
+                baselines: Vec::new(),
+                metrics: BenchmarkMetrics::default(),
+                resource: ResourceEnvelope::default(),
+                artifacts: Vec::new(),
+                hypothesis_injection: None,
+            }],
+            summary: BenchmarkSummary::default(),
+            meta_lessons: None,
+            phase3: None,
+        };
+
+        let suites = vec![
+            make_suite(BenchmarkClass::AgentSwapSurvival),
+            make_suite(BenchmarkClass::StrongToSmallContinuation),
+            make_suite(BenchmarkClass::SmallToSmallRelay),
+        ];
+        let report = generate_meta_lessons(&suites, 0.10);
+        // 3 suites * 6 records = 18 total records
+        assert_eq!(report.total_records, 18);
+    }
+
+    // -----------------------------------------------------------------------
+    // scenario_for covers all classes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scenario_for_all_classes_produces_valid_scenarios() {
+        for class in BenchmarkClass::all() {
+            let scenario = scenario_for(class);
+            assert!(
+                !scenario.id.is_empty(),
+                "scenario id should not be empty for {class:?}"
+            );
+            assert!(
+                !scenario.truth.critical_facts.is_empty(),
+                "scenario should have critical facts for {class:?}"
+            );
+            assert!(
+                !scenario.phases.is_empty(),
+                "scenario should have phases for {class:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Chi-squared with moderate association
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chi_squared_moderate_association() {
+        let (chi2, p) = chi_squared_2x2(15, 5, 5, 15);
+        assert!(chi2 > 5.0, "moderate association chi2={chi2}");
+        assert!(p < 0.05, "should be significant p={p}");
+    }
+
+    #[test]
+    fn chi_squared_one_empty_row() {
+        let (chi2, p) = chi_squared_2x2(0, 0, 10, 10);
+        assert_eq!(chi2, 0.0);
+        assert_eq!(p, 1.0);
+    }
+
+    #[test]
+    fn chi_squared_one_empty_column() {
+        let (chi2, p) = chi_squared_2x2(10, 0, 10, 0);
+        assert_eq!(chi2, 0.0);
+        assert_eq!(p, 1.0);
     }
 }
