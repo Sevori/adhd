@@ -60,6 +60,23 @@ make build         # Clean build
 
 No exceptions. No "it passes locally". No "the lint warning is a false positive". Fix it or explain why it's unfixable with evidence.
 
+## Trust Hierarchy
+
+Not all files are equal. The spec is the source of truth. The code is downstream.
+
+**Severity tiers for changes:**
+
+| Tier | Files | Review bar |
+|------|-------|------------|
+| **Critical** | `SPEC.md`, `IDENTITY.md`, `AGENTS.md` | These define what the system IS. Changing them changes everything downstream. Treat like constitutional amendments. |
+| **High** | `CLAUDE.md`, `skills/*/SKILL.md` | Agent behaviour instructions. Changes alter how every future session operates. |
+| **Normal** | `src/**/*.rs`, `tests/**`, `Cargo.toml` | Implementation. Regenerable from the spec. Still review carefully, but the spec is what matters. |
+| **Low** | `Makefile`, `.github/**`, docs | Tooling and process. Change freely. |
+
+If a change to source code contradicts `SPEC.md`, the code is wrong. If a change to `SPEC.md` makes the benchmarks fail, update the code — the spec is the intent, the benchmarks validate it.
+
+Reference: [Bootstrapping Coding Agents](https://www.monperrus.net/martin/coding-agent-bootstrap) (Monperrus, 2026) — "The specification is the stable artifact, not the implementation."
+
 ## The Religion
 
 This is not a suggestion. This is not a guideline. This is how we work.

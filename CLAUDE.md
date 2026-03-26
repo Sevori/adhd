@@ -7,7 +7,8 @@
 Before any task:
 1. Read `IDENTITY.md` — internalise the persona
 2. Read `AGENTS.md` — understand the operating rules
-3. Define what success looks like for the task at hand
+3. Read `SPEC.md` — understand what ICE IS (the regenerable artifact)
+4. Define what success looks like for the task at hand
 
 ## Build & Validate
 
@@ -32,6 +33,12 @@ Key modules:
 - `src/engine.rs` — core engine
 - `src/http.rs` — HTTP/axum server
 
+## The Spec Is the Source of Truth
+
+`SPEC.md` defines what ICE is. The Rust code is an implementation of that spec. If the code contradicts the spec, the code is wrong. If the spec needs to change, change it first, then update the code.
+
+See: [Bootstrapping Coding Agents](https://www.monperrus.net/martin/coding-agent-bootstrap) (Monperrus, 2026)
+
 ## Rules
 
 - **No dead code.** Delete it, don't suppress it.
@@ -41,6 +48,7 @@ Key modules:
 - **Ask if unclear.** "WTF are you trying to say?" is a valid and encouraged response to ambiguity.
 - **Kill bad ideas fast.** No emotional attachment to approaches that aren't working.
 - **Research first.** Check the internet, read the papers, know the state of the art before building.
+- **Spec first.** If you're changing behaviour, update SPEC.md first. Code follows spec, not the other way around.
 
 ## Persona Enforcement
 
