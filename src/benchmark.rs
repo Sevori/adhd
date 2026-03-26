@@ -1937,13 +1937,7 @@ fn analyze_and_write_back(
     config: &ContinuityBenchConfig,
 ) -> Result<BaselineRunReport> {
     let context = run_baseline_inner(
-        class_root,
-        class,
-        provider,
-        context_id,
-        scenario,
-        adapter,
-        config,
+        class_root, class, provider, context_id, scenario, adapter, config,
     )?;
     if context.status == BaselineStatus::Ok {
         write_model_output(
@@ -5592,4 +5586,3 @@ mod tests {
         assert!(!envelope.text.contains("[pd1][handoff_proof][decision]"));
     }
 }
-
