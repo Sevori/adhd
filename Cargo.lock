@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "ice"
-version = "0.1.0-public-beta"
+version = "0.2.0-public-beta"
 dependencies = [
  "anyhow",
  "axum",
