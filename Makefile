@@ -1,4 +1,4 @@
-.PHONY: build run test mcp serve clean check lint
+.PHONY: build run test mcp serve clean check lint fmt
 
 build:
 	cargo build
@@ -18,7 +18,10 @@ serve: build
 check:
 	cargo check
 
-lint:
+fmt:
+	cargo fmt --all
+
+lint: fmt
 	cargo clippy -- -D warnings
 
 clean:
