@@ -3192,7 +3192,15 @@ struct CandidateLesson {
 fn compare_feature_distributions(
     records: &[SurvivalRecord],
     fdr_threshold: f64,
+    min_benchmark_classes: usize,
+    benchmark_classes: usize,
 ) -> (Vec<MetaLesson>, usize) {
+    // No hypothesis tests with fewer than 3 independent benchmark classes.
+    // Individual records from the same class are not independent observations.
+    if benchmark_classes < min_benchmark_classes {
+        return (Vec::new(), 0);
+    }
+
     let categories = [
         TruthCategory::CriticalFact,
         TruthCategory::Constraint,
@@ -3331,7 +3339,7 @@ pub fn generate_meta_lessons(
     }
     let total_records = all_records.len();
     let (mut lessons, candidates_tested) =
-        compare_feature_distributions(&all_records, fdr_threshold);
+        compare_feature_distributions(&all_records, fdr_threshold, 3, class_count);
     for lesson in &mut lessons {
         lesson.benchmark_classes = class_count;
     }
@@ -6665,7 +6673,8 @@ mod tests {
                 },
             });
         }
-        let (lessons, _) = compare_feature_distributions(&records, 0.05);
+        // min_benchmark_classes=1 to allow testing with synthetic data
+        let (lessons, _) = compare_feature_distributions(&records, 0.05, 1, 5);
         let fp_lesson = lessons.iter().find(|l| l.feature_name == "file_path");
         assert!(fp_lesson.is_some(), "should detect file_path signal");
         assert_eq!(fp_lesson.unwrap().direction, LessonDirection::SurvivedMore);
@@ -6696,10 +6705,55 @@ mod tests {
                 },
             })
             .collect();
-        let (lessons, _) = compare_feature_distributions(&records, 0.05);
+        let (lessons, _) = compare_feature_distributions(&records, 0.05, 1, 5);
         assert!(
             lessons.is_empty(),
             "should skip categories with < 10 records"
+        );
+    }
+
+    #[test]
+    fn compare_feature_distributions_requires_min_benchmark_classes() {
+        use super::{ItemFeatures, SurvivalRecord};
+        // 20 records with clear signal, but only 2 benchmark classes
+        let mut records = Vec::new();
+        for i in 0..20 {
+            let has_fp = i < 10;
+            let survived = if has_fp { i < 9 } else { i >= 18 };
+            records.push(SurvivalRecord {
+                category: TruthCategory::CriticalFact,
+                outcome: if survived {
+                    SurvivalOutcome::Survived
+                } else {
+                    SurvivalOutcome::Lost
+                },
+                keywords: vec!["test".into()],
+                features: ItemFeatures {
+                    keyword_count: 1,
+                    keyword_char_length: 4,
+                    contains_file_path: has_fp,
+                    contains_numeric_ref: false,
+                    matched_note_text: None,
+                    matched_note_tokens: None,
+                    prohibition_framing: None,
+                    aspiration_framing: None,
+                    evidence_count: None,
+                },
+            });
+        }
+        // With 2 classes (below min of 3), should produce nothing
+        let (lessons, candidates) = compare_feature_distributions(&records, 0.05, 3, 2);
+        assert!(
+            lessons.is_empty(),
+            "should reject with < 3 benchmark classes"
+        );
+        assert_eq!(candidates, 0, "should not even test candidates");
+
+        // With 3 classes, should find the signal
+        let (lessons, _) = compare_feature_distributions(&records, 0.05, 3, 3);
+        assert!(
+            lessons.iter().any(|l| l.feature_name == "file_path"),
+            "should detect signal with >= 3 classes"
         );
     }
 
