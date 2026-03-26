@@ -5369,13 +5369,14 @@ mod tests {
         build_context_envelope, chi_squared_2x2, compare_feature_distributions,
         compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
         compare_market_head_judge_pack, compare_market_head_same_pack, erfc_approx,
-        evaluate_market_head_challenge, evaluate_market_head_judge_challenge,
+        evaluate_market_head_challenge, evaluate_market_head_judge_challenge, evaluate_output,
         export_market_head_challenge, export_market_head_judge_challenge,
         extract_eligible_hypotheses, generate_meta_lessons, generate_phase3_report,
         populate_scenario, render_market_head_judge_calibration_markdown,
         render_market_head_judge_disagreement_markdown, render_market_head_judge_pack_markdown,
         render_market_head_judge_prompt, render_market_head_same_pack_markdown,
         render_suite_markdown, repair_output_from_envelope, scenario_for,
+        write_phase3_outcomes_to_kernel,
     };
     use crate::adapters::{
         AgentContinuationOutput, DecisionNote, EvidenceNote, ModelCallMetrics, SurvivalHypothesis,
@@ -7796,5 +7797,275 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].feature_name, "file_path");
         assert_eq!(result[0].category, "CriticalFact");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: write_phase3_outcomes_to_kernel with real kernel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_phase3_outcomes_to_kernel_promotes_to_real_kernel() {
+        let dir = tempdir().unwrap();
+        let kernel = SharedContinuityKernel::open(dir.path()).unwrap();
+        let attach = kernel
+            .attach_agent(AttachAgentInput {
+                agent_id: "validator".into(),
+                agent_type: "test".into(),
+                capabilities: vec![],
+                namespace: "bench".into(),
+                role: Some("validator".into()),
+                metadata: serde_json::json!({}),
+            })
+            .unwrap();
+        let context = kernel
+            .open_context(OpenContextInput {
+                namespace: "bench".into(),
+                task_id: "phase3-kernel-test".into(),
+                session_id: "kernel-write-session".into(),
+                objective: "test write_phase3_outcomes_to_kernel".into(),
+                selector: None,
+                agent_id: Some("validator".into()),
+                attachment_id: Some(attach.id),
+            })
+            .unwrap();
+
+        let report = Phase3ValidationReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            cycle: 2,
+            hypotheses_tested: 2,
+            results: vec![
+                HypothesisValidationResult {
+                    feature_name: "file_path".into(),
+                    category: TruthCategory::CriticalFact,
+                    direction: LessonDirection::SurvivedMore,
+                    control_survival_rate: 0.40,
+                    treatment_survival_rate: 0.55,
+                    absolute_improvement: 0.15,
+                    positive_classes: 3,
+                    total_classes: 4,
+                    promoted: true,
+                    rejected: false,
+                },
+                HypothesisValidationResult {
+                    feature_name: "numeric_ref".into(),
+                    category: TruthCategory::Constraint,
+                    direction: LessonDirection::SurvivedMore,
+                    control_survival_rate: 0.50,
+                    treatment_survival_rate: 0.48,
+                    absolute_improvement: -0.02,
+                    positive_classes: 1,
+                    total_classes: 4,
+                    promoted: false,
+                    rejected: true,
+                },
+            ],
+            promoted_count: 1,
+            rejected_count: 1,
+            converged: false,
+        };
+
+        let written = write_phase3_outcomes_to_kernel(&kernel, &context.id, &report);
+        assert!(
+            written.is_ok(),
+            "kernel write must succeed: {:?}",
+            written.err()
+        );
+        let records = written.unwrap();
+        assert_eq!(records.len(), 1, "only promoted hypotheses get written");
+        assert!(records[0].title.contains("file_path"));
+        assert!(records[0].body.contains("VALIDATED"));
+        assert!(records[0].body.contains("15.0%"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: end-to-end with real kernel (no Ollama)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn phase3_end_to_end_with_real_kernel() {
+        let dir = tempdir().unwrap();
+        let kernel = SharedContinuityKernel::open(dir.path()).unwrap();
+        let scenario = scenario_for(BenchmarkClass::AgentSwapSurvival);
+
+        let attach = kernel
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner-strong".into(),
+                agent_type: "ollama".into(),
+                capabilities: vec!["plan".into()],
+                namespace: scenario.namespace.clone(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({}),
+            })
+            .unwrap();
+        let context = kernel
+            .open_context(OpenContextInput {
+                namespace: scenario.namespace.clone(),
+                task_id: scenario.task_id.clone(),
+                session_id: "phase3-e2e".into(),
+                objective: scenario.objective.clone(),
+                selector: None,
+                agent_id: Some("planner-strong".into()),
+                attachment_id: Some(attach.id),
+            })
+            .unwrap();
+        populate_scenario(&kernel, &context.id, &scenario).unwrap();
+
+        // Build a real envelope from kernel
+        let (envelope, _) = build_context_envelope(
+            &kernel,
+            BenchmarkClass::AgentSwapSurvival,
+            BaselineKind::SharedContinuity,
+            &context.id,
+            &scenario,
+            "relay-a",
+            512,
+            24,
+            8,
+        )
+        .unwrap();
+        assert!(!envelope.surfaced.is_empty());
+
+        // Simulate control arm: partial output (some survive, some lost)
+        let control_output = AgentContinuationOutput {
+            summary: "Control arm resume".into(),
+            critical_facts: vec![EvidenceNote {
+                text: "selector_missing in src/query.rs caused failure".into(),
+                evidence: envelope
+                    .surfaced
+                    .iter()
+                    .filter(|s| s.label.starts_with('f'))
+                    .map(|s| s.label.clone())
+                    .take(1)
+                    .collect(),
+            }],
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            open_hypotheses: Vec::new(),
+            operational_scars: Vec::new(),
+            avoid_repeating: Vec::new(),
+            next_step: crate::adapters::ActionNote {
+                text: "run next benchmark".into(),
+                evidence: Vec::new(),
+            },
+        };
+
+        // Simulate treatment arm: better output (more items survive)
+        let treatment_output = AgentContinuationOutput {
+            summary: "Treatment arm resume with hints".into(),
+            critical_facts: vec![
+                EvidenceNote {
+                    text: "selector_missing in src/query.rs caused failure".into(),
+                    evidence: envelope
+                        .surfaced
+                        .iter()
+                        .filter(|s| s.label.starts_with('f'))
+                        .map(|s| s.label.clone())
+                        .take(1)
+                        .collect(),
+                },
+                EvidenceNote {
+                    text: "Primary context is bench for this scenario".into(),
+                    evidence: envelope
+                        .surfaced
+                        .iter()
+                        .filter(|s| s.label.starts_with('f'))
+                        .map(|s| s.label.clone())
+                        .skip(1)
+                        .take(1)
+                        .collect(),
+                },
+            ],
+            constraints: vec![EvidenceNote {
+                text: "Preserve provenance across handoffs".into(),
+                evidence: envelope
+                    .surfaced
+                    .iter()
+                    .filter(|s| s.label.starts_with('k'))
+                    .map(|s| s.label.clone())
+                    .take(1)
+                    .collect(),
+            }],
+            decisions: Vec::new(),
+            open_hypotheses: Vec::new(),
+            operational_scars: vec![EvidenceNote {
+                text: "naive probe caused data loss".into(),
+                evidence: envelope
+                    .surfaced
+                    .iter()
+                    .filter(|s| s.label.starts_with('s'))
+                    .map(|s| s.label.clone())
+                    .take(1)
+                    .collect(),
+            }],
+            avoid_repeating: Vec::new(),
+            next_step: crate::adapters::ActionNote {
+                text: "run benchmark adapter".into(),
+                evidence: Vec::new(),
+            },
+        };
+
+        // Evaluate both arms against real ground truth
+        let control_eval = evaluate_output(&control_output, &scenario.truth, &envelope);
+        let treatment_eval = evaluate_output(&treatment_output, &scenario.truth, &envelope);
+        let control_survival =
+            benchmark_survival_analysis(&control_output, &scenario.truth, &envelope);
+        let treatment_survival =
+            benchmark_survival_analysis(&treatment_output, &scenario.truth, &envelope);
+
+        // Treatment should score better (more items matched)
+        assert!(
+            treatment_eval.resume_accuracy_score >= control_eval.resume_accuracy_score,
+            "treatment ({}) should score >= control ({})",
+            treatment_eval.resume_accuracy_score,
+            control_eval.resume_accuracy_score
+        );
+
+        // Build Phase3ClassResult from real data
+        let class_result = Phase3ClassResult {
+            class: BenchmarkClass::AgentSwapSurvival,
+            control_survival: Some(control_survival),
+            treatment_survival: Some(treatment_survival),
+            hypotheses: vec![SurvivalHypothesis {
+                feature_name: "file_path".into(),
+                category: "CriticalFact".into(),
+                direction: "SurvivedMore".into(),
+                hint: "Prefer items with file paths".into(),
+            }],
+            delta_ras: treatment_eval.resume_accuracy_score - control_eval.resume_accuracy_score,
+            delta_cfsr: treatment_eval.critical_fact_survival_rate
+                - control_eval.critical_fact_survival_rate,
+            delta_csr: treatment_eval.constraint_survival_rate
+                - control_eval.constraint_survival_rate,
+            delta_osr: treatment_eval.operational_scar_retention
+                - control_eval.operational_scar_retention,
+        };
+
+        // Duplicate across 3 classes to meet minimum threshold
+        let class_results = vec![class_result.clone(), class_result.clone(), class_result];
+        let hypotheses = vec![SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "SurvivedMore".into(),
+            hint: "Prefer items with file paths".into(),
+        }];
+
+        let phase3_report = generate_phase3_report(&class_results, &hypotheses, 1);
+        assert!(
+            phase3_report.hypotheses_tested > 0,
+            "must test at least one hypothesis"
+        );
+
+        // Write outcomes to real kernel
+        let written = write_phase3_outcomes_to_kernel(&kernel, &context.id, &phase3_report);
+        assert!(
+            written.is_ok(),
+            "kernel write must succeed: {:?}",
+            written.err()
+        );
+
+        // Verify the full report serializes
+        let json = serde_json::to_string_pretty(&phase3_report).unwrap();
+        assert!(json.contains("hypotheses_tested"));
+        assert!(json.contains("cycle"));
     }
 }
