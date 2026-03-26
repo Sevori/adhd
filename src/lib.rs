@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod benchmark;
+pub mod market_head;
 pub mod claude_install;
 pub mod codex;
 pub mod config;

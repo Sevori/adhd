@@ -19,14 +19,15 @@ use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 use ice::Engine;
-use ice::benchmark::{
-    BenchmarkClass, ContinuityBenchConfig, MarketHeadChallengeConfig, MarketHeadChallengeManifest,
-    compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
-    compare_market_head_judge_pack, compare_market_head_same_pack, evaluate_market_head_challenge,
+use ice::benchmark::{BenchmarkClass, ContinuityBenchConfig, run_continuity_suite};
+use ice::market_head::{
+    MarketHeadChallengeConfig, MarketHeadChallengeManifest, compare_market_head_judge_calibration,
+    compare_market_head_judge_disagreement, compare_market_head_judge_pack,
+    compare_market_head_same_pack, evaluate_market_head_challenge,
     evaluate_market_head_judge_challenge, export_market_head_challenge,
     export_market_head_judge_challenge, render_market_head_judge_calibration_markdown,
     render_market_head_judge_disagreement_markdown, render_market_head_judge_pack_markdown,
-    render_market_head_same_pack_markdown, run_continuity_suite,
+    render_market_head_same_pack_markdown,
 };
 use ice::claude_install::{
     ClaudeCodeInstallRequest, ClaudeCodeStatusRequest, ClaudeCodeUninstallRequest,
@@ -1835,7 +1836,7 @@ mod tests {
         run_bench_market_judge_disagreement, run_bench_market_judge_pack_compare,
     };
     use chrono::Utc;
-    use ice::benchmark::{
+    use ice::market_head::{
         MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
         MarketHeadJudgeComparisonEntry, MarketHeadJudgeEvaluationReport,
         MarketHeadJudgeSamePackComparisonReport, MarketHeadJudgeSummary,
