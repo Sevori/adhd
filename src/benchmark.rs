@@ -3093,8 +3093,10 @@ fn chi_squared_2x2(a: usize, b: usize, c: usize, d: usize) -> (f64, f64) {
     if row1 == 0.0 || row2 == 0.0 || col1 == 0.0 || col2 == 0.0 {
         return (0.0, 1.0);
     }
-    let numerator =
-        n * ((a as f64 * d as f64 - b as f64 * c as f64).abs() - n / 2.0).max(0.0).powi(2);
+    let numerator = n
+        * ((a as f64 * d as f64 - b as f64 * c as f64).abs() - n / 2.0)
+            .max(0.0)
+            .powi(2);
     let chi2 = numerator / (row1 * row2 * col1 * col2);
     let p = erfc_approx((chi2 / 2.0).sqrt());
     (chi2, p)
@@ -3110,26 +3112,22 @@ const FEATURE_EXTRACTORS: &[FeatureExtractor] = &[
     FeatureExtractor {
         name: "file_path",
         extract: |r| Some(r.features.contains_file_path),
-        pattern_template:
-            "Items with file paths survive at {with}% vs {without}% without",
+        pattern_template: "Items with file paths survive at {with}% vs {without}% without",
     },
     FeatureExtractor {
         name: "numeric_ref",
         extract: |r| Some(r.features.contains_numeric_ref),
-        pattern_template:
-            "Items with numeric references survive at {with}% vs {without}% without",
+        pattern_template: "Items with numeric references survive at {with}% vs {without}% without",
     },
     FeatureExtractor {
         name: "prohibition_framing",
         extract: |r| r.features.prohibition_framing,
-        pattern_template:
-            "Prohibition-framed items survive at {with}% vs {without}% for others",
+        pattern_template: "Prohibition-framed items survive at {with}% vs {without}% for others",
     },
     FeatureExtractor {
         name: "aspiration_framing",
         extract: |r| r.features.aspiration_framing,
-        pattern_template:
-            "Aspiration-framed items survive at {with}% vs {without}% for others",
+        pattern_template: "Aspiration-framed items survive at {with}% vs {without}% for others",
     },
 ];
 
@@ -4949,20 +4947,18 @@ mod tests {
         BaselineKind, BaselineRunReport, BaselineStatus, BenchmarkClass, BenchmarkClassReport,
         BenchmarkMetrics, ContextEnvelope, ContinuityBenchConfig, ContinuityPathKind,
         ContinuityPathReport, ContinuityPathRole, Evaluation, GroundTruth, JudgeCalibrationVerdict,
-        JudgeEvaluation, MarketHeadChallengeCaseEvaluation, MarketHeadChallengeConfig,
-        MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
+        JudgeEvaluation, LessonDirection, MarketHeadChallengeCaseEvaluation,
+        MarketHeadChallengeConfig, MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
         MarketHeadJudgeCaseEvaluation, MarketHeadJudgeComparisonEntry,
         MarketHeadJudgeEvaluationReport, MarketHeadJudgeSamePackComparisonReport,
-        MarketHeadJudgeSummary, MetaLesson, MetaLessonEvidence, MetaLessonReport,
-        LessonDirection, ResourceEnvelope, SurfacedItem, SurvivalOutcome, TruthCategory,
-        TruthItem, benchmark_survival_analysis, build_context_envelope,
-        benjamini_hochberg, chi_squared_2x2, compare_feature_distributions, erfc_approx,
-        generate_meta_lessons,
+        MarketHeadJudgeSummary, MetaLesson, MetaLessonEvidence, MetaLessonReport, ResourceEnvelope,
+        SurfacedItem, SurvivalOutcome, TruthCategory, TruthItem, benchmark_survival_analysis,
+        benjamini_hochberg, build_context_envelope, chi_squared_2x2, compare_feature_distributions,
         compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
-        compare_market_head_judge_pack, compare_market_head_same_pack,
+        compare_market_head_judge_pack, compare_market_head_same_pack, erfc_approx,
         evaluate_market_head_challenge, evaluate_market_head_judge_challenge,
-        export_market_head_challenge, export_market_head_judge_challenge, populate_scenario,
-        render_market_head_judge_calibration_markdown,
+        export_market_head_challenge, export_market_head_judge_challenge, generate_meta_lessons,
+        populate_scenario, render_market_head_judge_calibration_markdown,
         render_market_head_judge_disagreement_markdown, render_market_head_judge_pack_markdown,
         render_market_head_judge_prompt, render_market_head_same_pack_markdown,
         render_suite_markdown, repair_output_from_envelope, scenario_for,
@@ -6583,7 +6579,10 @@ mod tests {
     #[test]
     fn chi_squared_2x2_known_values() {
         let (chi2, p) = chi_squared_2x2(30, 10, 10, 30);
-        assert!(chi2 > 15.0, "chi2={chi2} should be > 15 for strong association");
+        assert!(
+            chi2 > 15.0,
+            "chi2={chi2} should be > 15 for strong association"
+        );
         assert!(p < 0.001, "p={p} should be highly significant");
     }
 
@@ -6698,7 +6697,10 @@ mod tests {
             })
             .collect();
         let (lessons, _) = compare_feature_distributions(&records, 0.05);
-        assert!(lessons.is_empty(), "should skip categories with < 10 records");
+        assert!(
+            lessons.is_empty(),
+            "should skip categories with < 10 records"
+        );
     }
 
     #[test]
@@ -6784,7 +6786,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!envelope.surfaced.is_empty(), "real kernel must produce surfaced items");
+        assert!(
+            !envelope.surfaced.is_empty(),
+            "real kernel must produce surfaced items"
+        );
 
         // Partial output: some items survive, some lost
         let output = AgentContinuationOutput {
@@ -6822,8 +6827,16 @@ mod tests {
         let survival = benchmark_survival_analysis(&output, &scenario.truth, &envelope);
         assert!(!survival.records.is_empty());
 
-        let survived = survival.records.iter().filter(|r| r.outcome == SurvivalOutcome::Survived).count();
-        let lost = survival.records.iter().filter(|r| r.outcome == SurvivalOutcome::Lost).count();
+        let survived = survival
+            .records
+            .iter()
+            .filter(|r| r.outcome == SurvivalOutcome::Survived)
+            .count();
+        let lost = survival
+            .records
+            .iter()
+            .filter(|r| r.outcome == SurvivalOutcome::Lost)
+            .count();
         assert!(survived > 0, "some items must survive");
         assert!(lost > 0, "some items must be lost (constraints omitted)");
 
@@ -6859,7 +6872,11 @@ mod tests {
         assert!(meta.total_records > 0, "must see survival records");
 
         let written = super::write_meta_lessons_to_kernel(&kernel, &context.id, &meta);
-        assert!(written.is_ok(), "kernel write must succeed: {:?}", written.err());
+        assert!(
+            written.is_ok(),
+            "kernel write must succeed: {:?}",
+            written.err()
+        );
 
         let json = serde_json::to_string_pretty(&meta).unwrap();
         assert!(json.contains("total_records"));
