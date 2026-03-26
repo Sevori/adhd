@@ -291,4 +291,215 @@ mod tests {
 
         server.join().expect("server join");
     }
+
+    #[test]
+    fn hash_embed_empty_text_returns_zero_vector() {
+        let vector = hash_embed("", 64);
+        assert_eq!(vector.len(), 64);
+        assert!(vector.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn hash_embed_normalised_to_unit_length() {
+        let vector = hash_embed("database crashed at 3am during deploy", 128);
+        let norm = l2_norm(&vector);
+        assert!((norm - 1.0).abs() < 1e-6, "expected unit norm, got {norm}");
+    }
+
+    #[test]
+    fn hash_embed_deterministic() {
+        let a = hash_embed("same input text", 64);
+        let b = hash_embed("same input text", 64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_embed_different_texts_differ() {
+        let a = hash_embed("database crash", 64);
+        let b = hash_embed("network timeout", 64);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let a = hash_embed("test text", 64);
+        let similarity = cosine_similarity(&a, &a);
+        assert!((similarity - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_zero() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let similarity = cosine_similarity(&a, &b);
+        assert!((similarity - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_empty_vectors() {
+        let similarity = cosine_similarity(&[], &[]);
+        assert_eq!(similarity, 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vectors() {
+        let a = vec![0.0, 0.0, 0.0];
+        let similarity = cosine_similarity(&a, &a);
+        assert_eq!(similarity, 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_different_lengths_uses_min_for_dot() {
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.5, 0.5];
+        let similarity = cosine_similarity(&a, &b);
+        // dot product uses min(2,4)=2 elements -> dot=1.0
+        // norms use full vectors: norm_a=1.0, norm_b=sqrt(1.5)
+        let expected = 1.0 / (1.0 * (1.5_f64).sqrt());
+        assert!((similarity - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_norm_zero_vector() {
+        assert_eq!(l2_norm(&[0.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn l2_norm_unit_vector() {
+        let norm = l2_norm(&[1.0, 0.0, 0.0]);
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn embedding_backend_config_backend_key() {
+        let hash_config = EmbeddingBackendConfig::Hash { dim: 256 };
+        assert_eq!(hash_config.backend_key(), "hash:256");
+
+        let ollama_config = EmbeddingBackendConfig::Ollama {
+            endpoint: "http://localhost:11434".into(),
+            model: "nomic-embed-text".into(),
+            timeout_secs: 30,
+        };
+        assert_eq!(ollama_config.backend_key(), "ollama:nomic-embed-text");
+    }
+
+    #[test]
+    fn embedding_runtime_from_hash_config() {
+        let config = EmbeddingBackendConfig::Hash { dim: 32 };
+        let runtime = EmbeddingRuntime::from_config(&config).unwrap();
+        assert_eq!(runtime.backend_key(), "hash:32");
+        let vec = runtime.embed("test").unwrap();
+        assert_eq!(vec.len(), 32);
+    }
+
+    #[test]
+    fn ollama_adapter_backend_key() {
+        let adapter =
+            OllamaEmbeddingAdapter::new("http://127.0.0.1:11434".into(), "test-model".into(), 10)
+                .unwrap();
+        assert_eq!(adapter.backend_key(), "ollama:test-model");
+    }
+
+    #[test]
+    fn ollama_adapter_connection_refused_returns_error() {
+        let adapter =
+            OllamaEmbeddingAdapter::new("http://127.0.0.1:1".into(), "fake-model".into(), 1)
+                .unwrap();
+        let err = adapter.embed("test").unwrap_err();
+        assert!(err.to_string().contains("requesting embeddings"));
+    }
+
+    #[test]
+    fn ollama_embed_non_success_status_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read");
+            let body = "model not found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        let adapter =
+            OllamaEmbeddingAdapter::new(format!("http://{}", address), "bad-model".into(), 5)
+                .unwrap();
+        let err = adapter.embed("test").unwrap_err();
+        assert!(err.to_string().contains("ollama embed failed"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ollama_embed_empty_embeddings_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read");
+            let body = r#"{"embeddings":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        let adapter =
+            OllamaEmbeddingAdapter::new(format!("http://{}", address), "empty-model".into(), 5)
+                .unwrap();
+        let err = adapter.embed("test").unwrap_err();
+        assert!(err.to_string().contains("no embeddings"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ollama_embed_empty_vector_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read");
+            let body = r#"{"embeddings":[[]]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+        let adapter =
+            OllamaEmbeddingAdapter::new(format!("http://{}", address), "empty-vec-model".into(), 5)
+                .unwrap();
+        let err = adapter.embed("test").unwrap_err();
+        assert!(err.to_string().contains("empty vector"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hash_embed_token_splitting() {
+        let vector = hash_embed("hello/world.rs foo_bar-baz", 64);
+        assert_eq!(vector.len(), 64);
+        let norm = l2_norm(&vector);
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hash_embed_short_tokens_skip_trigrams() {
+        let a = hash_embed("ab", 64);
+        let b = hash_embed("ab", 64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ollama_timeout_clamped_to_minimum_five() {
+        let adapter =
+            OllamaEmbeddingAdapter::new("http://127.0.0.1:11434".into(), "test".into(), 1).unwrap();
+        assert_eq!(adapter.backend_key(), "ollama:test");
+    }
 }

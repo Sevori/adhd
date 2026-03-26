@@ -1073,4 +1073,216 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn build_context_pack_returns_pack_for_fresh_engine() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let pack = engine
+            .build_context_pack(QueryInput {
+                agent_id: Some("agent-test".to_string()),
+                session_id: Some("session-test".to_string()),
+                task_id: Some("task-test".to_string()),
+                namespace: Some("namespace-test".to_string()),
+                objective: Some("test objective".to_string()),
+                selector: None,
+                view_id: None,
+                query_text: "engine poison recovery".to_string(),
+                budget_tokens: 512,
+                candidate_limit: 24,
+            })
+            .unwrap();
+        assert!(!pack.id.is_empty());
+        assert!(pack.used_tokens > 0 || pack.items.is_empty());
+    }
+
+    #[test]
+    fn explain_context_pack_returns_manifest() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let pack = engine
+            .build_context_pack(QueryInput {
+                agent_id: Some("agent-test".to_string()),
+                session_id: None,
+                task_id: None,
+                namespace: Some("namespace-test".to_string()),
+                objective: Some("explain test".to_string()),
+                selector: None,
+                view_id: None,
+                query_text: "engine poison recovery".to_string(),
+                budget_tokens: 512,
+                candidate_limit: 24,
+            })
+            .unwrap();
+
+        let manifest = engine.explain_context_pack(&pack.id).unwrap();
+        assert_eq!(manifest.id, pack.id);
+    }
+
+    #[test]
+    fn create_handoff_and_get_handoff_round_trip() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let handoff = engine
+            .create_handoff(HandoffInput {
+                from_agent_id: "agent-a".to_string(),
+                to_agent_id: "agent-b".to_string(),
+                reason: "shift change".to_string(),
+                query_text: "engine poison recovery".to_string(),
+                budget_tokens: 256,
+                view_id: None,
+                selector: None,
+                objective: Some("test handoff".to_string()),
+                namespace: Some("namespace-test".to_string()),
+            })
+            .unwrap();
+
+        assert!(handoff.id.starts_with("handoff:"));
+        assert_eq!(handoff.from_agent_id, "agent-a");
+        assert_eq!(handoff.to_agent_id, "agent-b");
+
+        let fetched = engine.get_handoff(&handoff.id).unwrap();
+        assert_eq!(fetched.id, handoff.id);
+    }
+
+    #[test]
+    fn explain_handoff_returns_json() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let handoff = engine
+            .create_handoff(HandoffInput {
+                from_agent_id: "agent-x".to_string(),
+                to_agent_id: "agent-y".to_string(),
+                reason: "explain test".to_string(),
+                query_text: "engine poison recovery".to_string(),
+                budget_tokens: 256,
+                view_id: None,
+                selector: None,
+                objective: Some("explain handoff".to_string()),
+                namespace: Some("namespace-test".to_string()),
+            })
+            .unwrap();
+
+        let explanation = engine.explain_handoff(&handoff.id).unwrap();
+        assert!(explanation.is_object());
+        assert!(explanation["handoff"]["id"].as_str().is_some());
+    }
+
+    #[test]
+    fn vector_baseline_returns_results_after_ingest() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let results = engine
+            .vector_baseline("engine poison recovery", None, None, None, 10)
+            .unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn vector_baseline_filters_by_session() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let by_session = engine
+            .vector_baseline("engine", Some("session-test"), None, None, 10)
+            .unwrap();
+        let wrong = engine
+            .vector_baseline("engine", Some("nonexistent"), None, None, 10)
+            .unwrap();
+        assert!(wrong.is_empty());
+        let _ = by_session;
+    }
+
+    #[test]
+    fn vector_baseline_filters_by_agent() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let by_agent = engine
+            .vector_baseline("engine", None, None, Some("agent-test"), 10)
+            .unwrap();
+        let wrong = engine
+            .vector_baseline("engine", None, None, Some("nonexistent"), 10)
+            .unwrap();
+        assert!(wrong.is_empty());
+        let _ = by_agent;
+    }
+
+    #[test]
+    fn vector_baseline_empty_for_fresh_engine() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let results = engine
+            .vector_baseline("anything", None, None, None, 10)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn get_handoff_nonexistent_returns_error() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let err = engine.get_handoff("handoff:nonexistent").unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn explain_handoff_nonexistent_returns_error() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let err = engine.explain_handoff("handoff:nonexistent").unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn build_context_pack_with_empty_query() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let pack = engine
+            .build_context_pack(QueryInput {
+                agent_id: None,
+                session_id: None,
+                task_id: None,
+                namespace: None,
+                objective: None,
+                selector: None,
+                view_id: None,
+                query_text: String::new(),
+                budget_tokens: 128,
+                candidate_limit: 5,
+            })
+            .unwrap();
+        assert!(!pack.id.is_empty());
+    }
+
+    #[test]
+    fn summary_baseline_filters_by_task_and_agent() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        engine.ingest(sample_event()).unwrap();
+
+        let wrong_task = engine
+            .summary_baseline(None, Some("nonexistent"), None, 10)
+            .unwrap();
+        assert!(wrong_task.is_empty());
+
+        let wrong_agent = engine
+            .summary_baseline(None, None, Some("nonexistent"), 10)
+            .unwrap();
+        assert!(wrong_agent.is_empty());
+    }
 }

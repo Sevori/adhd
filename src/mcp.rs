@@ -1657,4 +1657,611 @@ mod tests {
             Some(1)
         );
     }
+
+    #[test]
+    fn parse_scope_alias_all_variants() {
+        assert_eq!(parse_scope_alias(Some("agent")), Scope::Agent);
+        assert_eq!(parse_scope_alias(Some("session")), Scope::Session);
+        assert_eq!(parse_scope_alias(Some("project")), Scope::Project);
+        assert_eq!(parse_scope_alias(Some("global")), Scope::Global);
+        assert_eq!(parse_scope_alias(Some("shared")), Scope::Shared);
+        assert_eq!(parse_scope_alias(Some("")), Scope::Shared);
+        assert_eq!(parse_scope_alias(None), Scope::Shared);
+        assert_eq!(parse_scope_alias(Some("unknown-garbage")), Scope::Shared);
+        assert_eq!(parse_scope_alias(Some("  AGENT  ")), Scope::Agent);
+    }
+
+    #[test]
+    fn parse_event_kind_alias_all_variants() {
+        assert!(parse_event_kind_alias("prompt").is_ok());
+        assert!(parse_event_kind_alias("response").is_ok());
+        assert!(parse_event_kind_alias("tool_call").is_ok());
+        assert!(parse_event_kind_alias("tool_result").is_ok());
+        assert!(parse_event_kind_alias("shell_command").is_ok());
+        assert!(parse_event_kind_alias("shell_output").is_ok());
+        assert!(parse_event_kind_alias("file_diff").is_ok());
+        assert!(parse_event_kind_alias("error").is_ok());
+        assert!(parse_event_kind_alias("exception").is_ok());
+        assert!(parse_event_kind_alias("document").is_ok());
+        assert!(parse_event_kind_alias("trace").is_ok());
+        assert!(parse_event_kind_alias("api_request").is_ok());
+        assert!(parse_event_kind_alias("api_response").is_ok());
+        assert!(parse_event_kind_alias("note").is_ok());
+        assert!(parse_event_kind_alias("observation").is_ok());
+        assert!(parse_event_kind_alias("log").is_ok());
+        let err = parse_event_kind_alias("bogus").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported continuity_write_event kind: bogus")
+        );
+    }
+
+    #[test]
+    fn parse_continuity_kind_alias_all_variants() {
+        assert_eq!(
+            parse_continuity_kind_alias("working_state").unwrap(),
+            ContinuityKind::WorkingState
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("work_claim").unwrap(),
+            ContinuityKind::WorkClaim
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("derivation").unwrap(),
+            ContinuityKind::Derivation
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("fact").unwrap(),
+            ContinuityKind::Fact
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("decision").unwrap(),
+            ContinuityKind::Decision
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("constraint").unwrap(),
+            ContinuityKind::Constraint
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("hypothesis").unwrap(),
+            ContinuityKind::Hypothesis
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("incident").unwrap(),
+            ContinuityKind::Incident
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("operational_scar").unwrap(),
+            ContinuityKind::OperationalScar
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("scar").unwrap(),
+            ContinuityKind::OperationalScar
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("outcome").unwrap(),
+            ContinuityKind::Outcome
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("signal").unwrap(),
+            ContinuityKind::Signal
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("summary").unwrap(),
+            ContinuityKind::Summary
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("lesson").unwrap(),
+            ContinuityKind::Lesson
+        );
+        assert_eq!(
+            parse_continuity_kind_alias("  FACT  ").unwrap(),
+            ContinuityKind::Fact
+        );
+        let err = parse_continuity_kind_alias("nonexistent").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported continuity_write_item kind: nonexistent")
+        );
+    }
+
+    #[test]
+    fn parse_continuity_status_alias_all_variants() {
+        assert_eq!(parse_continuity_status_alias(None).unwrap(), None);
+        assert_eq!(parse_continuity_status_alias(Some("")).unwrap(), None);
+        assert_eq!(
+            parse_continuity_status_alias(Some("open")).unwrap(),
+            Some(ContinuityStatus::Open)
+        );
+        assert_eq!(
+            parse_continuity_status_alias(Some("active")).unwrap(),
+            Some(ContinuityStatus::Active)
+        );
+        assert_eq!(
+            parse_continuity_status_alias(Some("resolved")).unwrap(),
+            Some(ContinuityStatus::Resolved)
+        );
+        assert_eq!(
+            parse_continuity_status_alias(Some("superseded")).unwrap(),
+            Some(ContinuityStatus::Superseded)
+        );
+        assert_eq!(
+            parse_continuity_status_alias(Some("rejected")).unwrap(),
+            Some(ContinuityStatus::Rejected)
+        );
+        assert_eq!(
+            parse_continuity_status_alias(Some("  OPEN  ")).unwrap(),
+            Some(ContinuityStatus::Open)
+        );
+        let err = parse_continuity_status_alias(Some("invalid")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported continuity status: invalid")
+        );
+    }
+
+    #[test]
+    fn parse_memory_layer_alias_all_variants() {
+        assert_eq!(parse_memory_layer_alias(None).unwrap(), None);
+        assert_eq!(parse_memory_layer_alias(Some("")).unwrap(), None);
+        assert_eq!(
+            parse_memory_layer_alias(Some("hot")).unwrap(),
+            Some(MemoryLayer::Hot)
+        );
+        assert_eq!(
+            parse_memory_layer_alias(Some("episodic")).unwrap(),
+            Some(MemoryLayer::Episodic)
+        );
+        assert_eq!(
+            parse_memory_layer_alias(Some("semantic")).unwrap(),
+            Some(MemoryLayer::Semantic)
+        );
+        assert_eq!(
+            parse_memory_layer_alias(Some("summary")).unwrap(),
+            Some(MemoryLayer::Summary)
+        );
+        assert_eq!(
+            parse_memory_layer_alias(Some("cold")).unwrap(),
+            Some(MemoryLayer::Cold)
+        );
+        assert_eq!(
+            parse_memory_layer_alias(Some("  HOT  ")).unwrap(),
+            Some(MemoryLayer::Hot)
+        );
+        let err = parse_memory_layer_alias(Some("invalid")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported memory layer: invalid")
+        );
+    }
+
+    #[test]
+    fn parse_explain_target_alias_all_variants() {
+        assert!(
+            matches!(parse_explain_target_alias("context", Some("id1".into())).unwrap(), ExplainTarget::Context { id } if id == "id1")
+        );
+        assert!(
+            matches!(parse_explain_target_alias("item", Some("id2".into())).unwrap(), ExplainTarget::ContinuityItem { id } if id == "id2")
+        );
+        assert!(
+            matches!(parse_explain_target_alias("continuity_item", Some("id3".into())).unwrap(), ExplainTarget::ContinuityItem { id } if id == "id3")
+        );
+        assert!(
+            matches!(parse_explain_target_alias("snapshot", Some("id4".into())).unwrap(), ExplainTarget::Snapshot { id } if id == "id4")
+        );
+        assert!(
+            matches!(parse_explain_target_alias("handoff", Some("id5".into())).unwrap(), ExplainTarget::Handoff { id } if id == "id5")
+        );
+        assert!(
+            matches!(parse_explain_target_alias("pack", Some("id6".into())).unwrap(), ExplainTarget::Pack { id } if id == "id6")
+        );
+        assert!(
+            matches!(parse_explain_target_alias("view", Some("id7".into())).unwrap(), ExplainTarget::View { id } if id == "id7")
+        );
+        let err = parse_explain_target_alias("context", None).unwrap_err();
+        assert!(err.to_string().contains("requires id"));
+        let err = parse_explain_target_alias("bogus", Some("id".into())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported continuity_explain kind: bogus")
+        );
+    }
+
+    #[test]
+    fn handle_jsonrpc_initialize_returns_protocol_version() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(1)),
+            method: "initialize".into(),
+            params: json!({"protocolVersion": "2025-06-18"}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(response["result"]["serverInfo"]["name"], MCP_SERVER_NAME);
+    }
+
+    #[test]
+    fn handle_jsonrpc_ping_returns_empty_result() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(2)),
+            method: "ping".into(),
+            params: json!({}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        assert_eq!(response["result"], json!({}));
+    }
+
+    #[test]
+    fn handle_jsonrpc_notifications_initialized_returns_none() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: None,
+            method: "notifications/initialized".into(),
+            params: json!({}),
+        };
+        let result = handle_jsonrpc_request(&engine, request).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn handle_jsonrpc_unsupported_method_returns_error() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(3)),
+            method: "bogus/method".into(),
+            params: json!({}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported MCP method")
+        );
+    }
+
+    #[test]
+    fn handle_jsonrpc_tools_list_returns_all_tools() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(4)),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools.len() > 10);
+    }
+
+    #[test]
+    fn handle_jsonrpc_resources_list_returns_empty() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(5)),
+            method: "resources/list".into(),
+            params: json!({}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        assert_eq!(response["result"]["resources"], json!([]));
+    }
+
+    #[test]
+    fn handle_jsonrpc_prompts_list_returns_empty() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(6)),
+            method: "prompts/list".into(),
+            params: json!({}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        assert_eq!(response["result"]["prompts"], json!([]));
+    }
+
+    #[test]
+    fn dispatch_tool_unknown_tool_returns_error() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let err = dispatch_tool(&engine, "nonexistent_tool", json!({})).unwrap_err();
+        assert!(err.to_string().contains("unknown MCP tool"));
+    }
+
+    #[test]
+    fn tools_call_dispatch_error_wraps_in_is_error_true() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(7)),
+            method: "tools/call".into(),
+            params: json!({"name": "nonexistent_tool", "arguments": {}}),
+        };
+        let response = handle_jsonrpc_request(&engine, request).unwrap().unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown MCP tool")
+        );
+    }
+
+    #[test]
+    fn write_item_work_claim_kind_rejects_with_guidance() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "test-a",
+                "agent_type": "test",
+                "namespace": "ns",
+                "task_id": "task",
+                "session_id": "s1",
+                "objective": "Test work_claim rejection"
+            }),
+        )
+        .unwrap();
+        let context_id = bootstrap["context"]["id"].as_str().unwrap();
+        let err = dispatch_tool(
+            &engine,
+            "continuity_write_item",
+            json!({
+                "context_id": context_id,
+                "author_agent_id": "test-a",
+                "kind": "work_claim",
+                "title": "Claim via write_item",
+                "body": "Should be rejected"
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("continuity_claim_work"));
+    }
+
+    #[test]
+    fn tool_success_and_error_format() {
+        let success = tool_success(json!({"key": "value"}));
+        assert_eq!(success["isError"], false);
+        assert!(
+            success["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("key")
+        );
+        assert_eq!(success["structuredContent"]["key"], "value");
+
+        let error = tool_error(anyhow!("test error message"));
+        assert_eq!(error["isError"], true);
+        assert!(
+            error["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("test error message")
+        );
+    }
+
+    #[test]
+    fn success_and_error_response_format() {
+        let success = success_response(Some(json!(42)), json!({"ok": true}));
+        assert_eq!(success["jsonrpc"], "2.0");
+        assert_eq!(success["id"], 42);
+        assert_eq!(success["result"]["ok"], true);
+
+        let err = error_response(
+            Some(json!(99)),
+            -32600,
+            "bad request".into(),
+            Some(json!("details")),
+        );
+        assert_eq!(err["jsonrpc"], "2.0");
+        assert_eq!(err["id"], 99);
+        assert_eq!(err["error"]["code"], -32600);
+        assert_eq!(err["error"]["message"], "bad request");
+        assert_eq!(err["error"]["data"], "details");
+    }
+
+    #[test]
+    fn success_response_null_id_when_none() {
+        let resp = success_response(None, json!("ok"));
+        assert!(resp["id"].is_null());
+    }
+
+    #[test]
+    fn default_values_match_constants() {
+        assert_eq!(default_token_budget_value(), DEFAULT_TOKEN_BUDGET);
+        assert_eq!(default_candidate_limit_value(), DEFAULT_CANDIDATE_LIMIT);
+        assert_eq!(default_replay_limit_value(), DEFAULT_REPLAY_LIMIT);
+    }
+
+    #[test]
+    fn snapshot_tool_captures_state() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "snap-agent",
+                "agent_type": "test",
+                "namespace": "snap-ns",
+                "task_id": "snap-task",
+                "session_id": "s1",
+                "objective": "Test snapshot"
+            }),
+        )
+        .unwrap();
+        let context_id = bootstrap["context"]["id"].as_str().unwrap();
+        let snapshot = dispatch_tool(
+            &engine,
+            "continuity_snapshot",
+            json!({
+                "context_id": context_id,
+                "objective": "capture state"
+            }),
+        )
+        .unwrap();
+        assert!(snapshot["id"].as_str().is_some());
+    }
+
+    #[test]
+    fn resume_tool_resumes_from_context() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "resume-agent",
+                "agent_type": "test",
+                "namespace": "resume-ns",
+                "task_id": "resume-task",
+                "session_id": "s1",
+                "objective": "Test resume"
+            }),
+        )
+        .unwrap();
+        let context_id = bootstrap["context"]["id"].as_str().unwrap();
+        let resume = dispatch_tool(
+            &engine,
+            "continuity_resume",
+            json!({
+                "context_id": context_id,
+                "objective": "resume work"
+            }),
+        )
+        .unwrap();
+        assert!(
+            resume["context"].is_object()
+                || resume["snapshot"].is_object()
+                || resume["pack"].is_object()
+        );
+    }
+
+    #[test]
+    fn handoff_tool_creates_handoff_record() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "from-agent",
+                "agent_type": "test",
+                "namespace": "handoff-ns",
+                "task_id": "handoff-task",
+                "session_id": "s1",
+                "objective": "Test handoff"
+            }),
+        )
+        .unwrap();
+        let context_id = bootstrap["context"]["id"].as_str().unwrap();
+        let handoff = dispatch_tool(
+            &engine,
+            "continuity_handoff",
+            json!({
+                "context_id": context_id,
+                "from_agent_id": "from-agent",
+                "to_agent_id": "to-agent",
+                "objective": "hand off work",
+                "reason": "shift change"
+            }),
+        )
+        .unwrap();
+        assert!(
+            handoff["handoff"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("handoff:")
+        );
+    }
+
+    #[test]
+    fn replay_tool_returns_rows() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "replay-agent",
+                "agent_type": "test",
+                "namespace": "replay-ns",
+                "task_id": "replay-task",
+                "session_id": "s1",
+                "objective": "Test replay"
+            }),
+        )
+        .unwrap();
+        dispatch_tool(
+            &engine,
+            "continuity_write_event",
+            json!({
+                "context_id": bootstrap["context"]["id"].as_str().unwrap(),
+                "kind": "note",
+                "agent_id": "replay-agent",
+                "session_id": "s1",
+                "source": "test",
+                "content": "replay me"
+            }),
+        )
+        .unwrap();
+        let result = dispatch_tool(
+            &engine,
+            "continuity_replay",
+            json!({
+                "selector": {"namespace": "replay-ns"},
+                "limit": 10
+            }),
+        )
+        .unwrap();
+        assert!(result.as_array().map_or(false, |a| !a.is_empty()));
+    }
+
+    #[test]
+    fn publish_signal_tool_creates_signal() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "signal-agent",
+                "agent_type": "test",
+                "namespace": "signal-ns",
+                "task_id": "signal-task",
+                "session_id": "s1",
+                "objective": "Test signal"
+            }),
+        )
+        .unwrap();
+        let context_id = bootstrap["context"]["id"].as_str().unwrap();
+        let signal = dispatch_tool(
+            &engine,
+            "continuity_publish_signal",
+            json!({
+                "context_id": context_id,
+                "agent_id": "signal-agent",
+                "title": "Test signal",
+                "body": "Signal body"
+            }),
+        )
+        .unwrap();
+        assert!(signal["kind"].as_str() == Some("signal"));
+    }
 }
