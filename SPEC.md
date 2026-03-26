@@ -107,8 +107,26 @@ The benchmark suite defines correctness. A conforming implementation MUST pass a
 ### Benchmark Classes
 `AgentSwapSurvival`, `StrongToSmallContinuation`, `SmallToSmallRelay`, `InterruptionStress`, `OperationalScar`, `CrossAgentCollaborative`, `CrashRecovery`, `MemoryPollution`, `ContextBudgetCompression`, `BaselineIsolation`.
 
-### Survival Analysis (Phase 1 metacognitive)
-Every benchmark run produces a `SurvivalReport` classifying each ground truth item as SURVIVED or LOST with extracted features (keyword density, file path presence, framing analysis). This data feeds future phases of self-improving extraction.
+### Survival Analysis (metacognitive)
+
+The benchmark suite doesn't just measure — it learns from its own forgetting patterns.
+
+#### Phase 1: Survival Analytics
+Every benchmark run produces a `SurvivalReport` classifying each ground truth item as SURVIVED or LOST with extracted features (keyword density, file path presence, framing analysis).
+
+#### Phase 2: Meta-Lesson Generation
+After a suite completes, the system performs automated pattern extraction:
+
+1. Collect all `SurvivalRecord`s across classes and baselines
+2. For each (category, feature) pair, run a chi-squared proportion test (2×2 contingency table)
+3. If p < 0.05 AND sample size ≥ 10, emit a `MetaLesson` with statistical evidence
+4. Write lessons as `ContinuityKind::Lesson` items with `Scope::Global`
+
+Output: `MetaLessonReport` serialized to `meta-lessons.json` alongside the suite report.
+
+**Kill criterion:** If after 5 cycles no survival metric improves by > 5% absolute, the patterns are noise.
+
+**Prior art:** Reflexion (Shinn et al., 2023) reflects on task failures; Meta-Policy Reflexion (arXiv 2509.03990) extracts corrective action rules; MemMA (arXiv 2603.18718) does backward error propagation through memory. None analyse memory forgetting patterns to mutate extraction behaviour.
 
 ## CLI
 

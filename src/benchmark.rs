@@ -181,6 +181,8 @@ pub struct BenchmarkSuiteReport {
     pub config: ContinuityBenchConfig,
     pub classes: Vec<BenchmarkClassReport>,
     pub summary: BenchmarkSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_lessons: Option<MetaLessonReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -739,12 +741,21 @@ pub fn run_continuity_suite(config: ContinuityBenchConfig) -> Result<BenchmarkSu
         classes.push(run_class(class, &config)?);
     }
     let summary = summarize(&classes);
-    let report = BenchmarkSuiteReport {
+    let mut report = BenchmarkSuiteReport {
         generated_at: started.to_rfc3339(),
         config: config.clone(),
         classes,
         summary,
+        meta_lessons: None,
     };
+
+    let meta = generate_meta_lessons(&[report.clone()], 0.05);
+    if !meta.lessons.is_empty() {
+        let meta_path = config.output_dir.join("meta-lessons.json");
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
+    }
+    report.meta_lessons = Some(meta);
+
     let suite_report_path = config.output_dir.join("suite-report.json");
     std::fs::write(&suite_report_path, serde_json::to_vec_pretty(&report)?)?;
     let summary_path = config.output_dir.join("summary.md");
@@ -2793,6 +2804,47 @@ pub struct SurvivalReport {
     pub total_envelope_tokens: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Meta-lesson types (Phase 2 metacognitive)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LessonDirection {
+    SurvivedMore,
+    LostMore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLessonEvidence {
+    pub survived_with_feature: usize,
+    pub lost_with_feature: usize,
+    pub survived_without_feature: usize,
+    pub lost_without_feature: usize,
+    pub rate_with_feature: f64,
+    pub rate_without_feature: f64,
+    pub chi_squared: f64,
+    pub p_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLesson {
+    pub pattern: String,
+    pub feature_name: String,
+    pub category: TruthCategory,
+    pub direction: LessonDirection,
+    pub evidence: MetaLessonEvidence,
+    pub confidence: f64,
+    pub support_runs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLessonReport {
+    pub generated_at: String,
+    pub total_records: usize,
+    pub lessons: Vec<MetaLesson>,
+}
+
 /// Run survival analysis comparing model output against ground truth.
 fn benchmark_survival_analysis(
     output: &AgentContinuationOutput,
@@ -2997,6 +3049,246 @@ fn category_stats(records: &[SurvivalRecord], category: TruthCategory) -> Catego
         prohibition_rate_survived: framing_rate(&survived, |f| f.prohibition_framing),
         aspiration_rate_survived: framing_rate(&survived, |f| f.aspiration_framing),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Meta-lesson generation (Phase 2 metacognitive)
+// ---------------------------------------------------------------------------
+
+fn erfc_approx(x: f64) -> f64 {
+    if x < 0.0 {
+        return 2.0 - erfc_approx(-x);
+    }
+    let p = 0.3275911;
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let t = 1.0 / (1.0 + p * x);
+    let poly = t * (a1 + t * (a2 + t * (a3 + t * (a4 + t * a5))));
+    poly * (-x * x).exp()
+}
+
+fn chi_squared_2x2(a: usize, b: usize, c: usize, d: usize) -> (f64, f64) {
+    let n = (a + b + c + d) as f64;
+    if n == 0.0 {
+        return (0.0, 1.0);
+    }
+    let row1 = (a + b) as f64;
+    let row2 = (c + d) as f64;
+    let col1 = (a + c) as f64;
+    let col2 = (b + d) as f64;
+    if row1 == 0.0 || row2 == 0.0 || col1 == 0.0 || col2 == 0.0 {
+        return (0.0, 1.0);
+    }
+    let numerator =
+        n * ((a as f64 * d as f64 - b as f64 * c as f64).abs() - n / 2.0).max(0.0).powi(2);
+    let chi2 = numerator / (row1 * row2 * col1 * col2);
+    let p = erfc_approx((chi2 / 2.0).sqrt());
+    (chi2, p)
+}
+
+struct FeatureExtractor {
+    name: &'static str,
+    extract: fn(&SurvivalRecord) -> Option<bool>,
+    pattern_template: &'static str,
+}
+
+const FEATURE_EXTRACTORS: &[FeatureExtractor] = &[
+    FeatureExtractor {
+        name: "file_path",
+        extract: |r| Some(r.features.contains_file_path),
+        pattern_template:
+            "Items with file paths survive at {with}% vs {without}% without",
+    },
+    FeatureExtractor {
+        name: "numeric_ref",
+        extract: |r| Some(r.features.contains_numeric_ref),
+        pattern_template:
+            "Items with numeric references survive at {with}% vs {without}% without",
+    },
+    FeatureExtractor {
+        name: "prohibition_framing",
+        extract: |r| r.features.prohibition_framing,
+        pattern_template:
+            "Prohibition-framed items survive at {with}% vs {without}% for others",
+    },
+    FeatureExtractor {
+        name: "aspiration_framing",
+        extract: |r| r.features.aspiration_framing,
+        pattern_template:
+            "Aspiration-framed items survive at {with}% vs {without}% for others",
+    },
+];
+
+fn compare_feature_distributions(
+    records: &[SurvivalRecord],
+    significance_threshold: f64,
+) -> Vec<MetaLesson> {
+    let mut lessons = Vec::new();
+    let categories = [
+        TruthCategory::CriticalFact,
+        TruthCategory::Constraint,
+        TruthCategory::Decision,
+        TruthCategory::OperationalScar,
+    ];
+
+    for &category in &categories {
+        let cat_records: Vec<_> = records.iter().filter(|r| r.category == category).collect();
+        if cat_records.len() < 10 {
+            continue;
+        }
+
+        for extractor in FEATURE_EXTRACTORS {
+            let mut survived_with = 0usize;
+            let mut lost_with = 0usize;
+            let mut survived_without = 0usize;
+            let mut lost_without = 0usize;
+
+            for record in &cat_records {
+                let has_feature = match (extractor.extract)(record) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let survived = record.outcome == SurvivalOutcome::Survived;
+                match (has_feature, survived) {
+                    (true, true) => survived_with += 1,
+                    (true, false) => lost_with += 1,
+                    (false, true) => survived_without += 1,
+                    (false, false) => lost_without += 1,
+                }
+            }
+
+            let total_with = survived_with + lost_with;
+            let total_without = survived_without + lost_without;
+            if total_with == 0 || total_without == 0 {
+                continue;
+            }
+
+            let (chi2, p) =
+                chi_squared_2x2(survived_with, lost_with, survived_without, lost_without);
+            if p >= significance_threshold {
+                continue;
+            }
+
+            let rate_with = survived_with as f64 / total_with as f64 * 100.0;
+            let rate_without = survived_without as f64 / total_without as f64 * 100.0;
+            let direction = if rate_with > rate_without {
+                LessonDirection::SurvivedMore
+            } else {
+                LessonDirection::LostMore
+            };
+
+            let pattern = extractor
+                .pattern_template
+                .replace("{with}", &format!("{rate_with:.0}"))
+                .replace("{without}", &format!("{rate_without:.0}"));
+
+            lessons.push(MetaLesson {
+                pattern,
+                feature_name: extractor.name.to_string(),
+                category,
+                direction,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: survived_with,
+                    lost_with_feature: lost_with,
+                    survived_without_feature: survived_without,
+                    lost_without_feature: lost_without,
+                    rate_with_feature: rate_with / 100.0,
+                    rate_without_feature: rate_without / 100.0,
+                    chi_squared: chi2,
+                    p_value: p,
+                },
+                confidence: (1.0 - p).min(0.99),
+                support_runs: cat_records.len(),
+            });
+        }
+    }
+
+    lessons
+}
+
+pub fn generate_meta_lessons(
+    reports: &[BenchmarkSuiteReport],
+    significance_threshold: f64,
+) -> MetaLessonReport {
+    let mut all_records = Vec::new();
+    for report in reports {
+        for class_report in &report.classes {
+            if let Some(ref survival) = class_report.continuity.survival {
+                all_records.extend(survival.records.clone());
+            }
+            for baseline_report in &class_report.baselines {
+                if let Some(ref survival) = baseline_report.survival {
+                    all_records.extend(survival.records.clone());
+                }
+            }
+        }
+    }
+    let total_records = all_records.len();
+    let lessons = compare_feature_distributions(&all_records, significance_threshold);
+    MetaLessonReport {
+        generated_at: Utc::now().to_rfc3339(),
+        total_records,
+        lessons,
+    }
+}
+
+pub fn write_meta_lessons_to_kernel(
+    kernel: &SharedContinuityKernel,
+    context_id: &str,
+    report: &MetaLessonReport,
+) -> Result<Vec<crate::continuity::ContinuityItemRecord>> {
+    use crate::continuity::{ContinuityItemInput, ContinuityKind, ContinuityStatus};
+    use crate::model::{MemoryLayer, Scope};
+
+    let inputs: Vec<ContinuityItemInput> = report
+        .lessons
+        .iter()
+        .map(|lesson| ContinuityItemInput {
+            context_id: context_id.to_string(),
+            author_agent_id: "metacognitive-analyser".to_string(),
+            kind: ContinuityKind::Lesson,
+            title: format!(
+                "meta-lesson: {} ({:?})",
+                lesson.feature_name, lesson.category
+            ),
+            body: format!(
+                "{}\n\nStatistical evidence: chi²={:.2}, p={:.4}, n={}\n\
+                 Survival rate with feature: {:.1}%, without: {:.1}%",
+                lesson.pattern,
+                lesson.evidence.chi_squared,
+                lesson.evidence.p_value,
+                lesson.support_runs,
+                lesson.evidence.rate_with_feature * 100.0,
+                lesson.evidence.rate_without_feature * 100.0,
+            ),
+            scope: Scope::Global,
+            status: Some(ContinuityStatus::Active),
+            importance: Some((lesson.confidence * 0.9).min(0.95)),
+            confidence: Some(lesson.confidence),
+            salience: Some(0.85),
+            layer: Some(MemoryLayer::Semantic),
+            supports: Vec::new(),
+            dimensions: vec![crate::model::DimensionValue {
+                key: "metacognitive_phase".into(),
+                value: "2".into(),
+                weight: 100,
+            }],
+            extra: serde_json::json!({
+                "feature_name": lesson.feature_name,
+                "category": lesson.category,
+                "direction": lesson.direction,
+                "evidence": lesson.evidence,
+            }),
+        })
+        .collect();
+
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    kernel.write_derivations(inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -4515,8 +4807,10 @@ mod tests {
         MarketHeadChallengeEvaluationReport, MarketHeadChallengeSummary,
         MarketHeadJudgeCaseEvaluation, MarketHeadJudgeComparisonEntry,
         MarketHeadJudgeEvaluationReport, MarketHeadJudgeSamePackComparisonReport,
-        MarketHeadJudgeSummary, ResourceEnvelope, SurfacedItem, SurvivalOutcome, TruthCategory,
+        MarketHeadJudgeSummary, MetaLesson, MetaLessonEvidence, MetaLessonReport,
+        LessonDirection, ResourceEnvelope, SurfacedItem, SurvivalOutcome, TruthCategory,
         TruthItem, benchmark_survival_analysis, build_context_envelope,
+        chi_squared_2x2, compare_feature_distributions, erfc_approx, generate_meta_lessons,
         compare_market_head_judge_calibration, compare_market_head_judge_disagreement,
         compare_market_head_judge_pack, compare_market_head_same_pack,
         evaluate_market_head_challenge, evaluate_market_head_judge_challenge,
@@ -5565,6 +5859,7 @@ mod tests {
                 artifacts: Vec::new(),
             }],
             summary: BenchmarkSummary::default(),
+            meta_lessons: None,
         };
 
         let markdown = render_suite_markdown(&report);
@@ -5609,6 +5904,7 @@ mod tests {
                 artifacts: Vec::new(),
             }],
             summary: BenchmarkSummary::default(),
+            meta_lessons: None,
         };
 
         let markdown = render_suite_markdown(&report);
@@ -6131,5 +6427,269 @@ mod tests {
         // The survived fact has a file path keyword, the lost one doesn't
         assert_eq!(report.facts.file_path_rate_survived, 1.0);
         assert_eq!(report.facts.file_path_rate_lost, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Meta-lesson tests (Phase 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chi_squared_2x2_known_values() {
+        let (chi2, p) = chi_squared_2x2(30, 10, 10, 30);
+        assert!(chi2 > 15.0, "chi2={chi2} should be > 15 for strong association");
+        assert!(p < 0.001, "p={p} should be highly significant");
+    }
+
+    #[test]
+    fn chi_squared_2x2_zero_marginals() {
+        let (chi2, p) = chi_squared_2x2(0, 0, 0, 0);
+        assert_eq!(chi2, 0.0);
+        assert_eq!(p, 1.0);
+
+        let (chi2, p) = chi_squared_2x2(10, 0, 0, 10);
+        assert!(chi2 > 0.0);
+        assert!(p < 0.05);
+    }
+
+    #[test]
+    fn chi_squared_no_association() {
+        let (chi2, p) = chi_squared_2x2(25, 25, 25, 25);
+        assert!(chi2 < 0.1, "chi2={chi2} should be ~0 for no association");
+        assert!(p > 0.5, "p={p} should be non-significant");
+    }
+
+    #[test]
+    fn erfc_approximation_accuracy() {
+        assert!((erfc_approx(0.0) - 1.0).abs() < 0.001);
+        assert!((erfc_approx(1.0) - 0.1573).abs() < 0.01);
+        assert!((erfc_approx(2.0) - 0.00468).abs() < 0.001);
+        assert!((erfc_approx(-1.0) - 1.8427).abs() < 0.01);
+    }
+
+    #[test]
+    fn compare_feature_distributions_finds_signal() {
+        use super::{ItemFeatures, SurvivalRecord};
+        let mut records = Vec::new();
+        for i in 0..20 {
+            let has_fp = i < 10;
+            let survived = if has_fp { i < 9 } else { i >= 18 };
+            records.push(SurvivalRecord {
+                category: TruthCategory::CriticalFact,
+                outcome: if survived {
+                    SurvivalOutcome::Survived
+                } else {
+                    SurvivalOutcome::Lost
+                },
+                keywords: vec!["test".into()],
+                features: ItemFeatures {
+                    keyword_count: 1,
+                    keyword_char_length: 4,
+                    contains_file_path: has_fp,
+                    contains_numeric_ref: false,
+                    matched_note_text: if survived {
+                        Some("matched".into())
+                    } else {
+                        None
+                    },
+                    matched_note_tokens: if survived { Some(1) } else { None },
+                    prohibition_framing: None,
+                    aspiration_framing: None,
+                    evidence_count: None,
+                },
+            });
+        }
+        let lessons = compare_feature_distributions(&records, 0.05);
+        let fp_lesson = lessons.iter().find(|l| l.feature_name == "file_path");
+        assert!(fp_lesson.is_some(), "should detect file_path signal");
+        assert_eq!(fp_lesson.unwrap().direction, LessonDirection::SurvivedMore);
+    }
+
+    #[test]
+    fn compare_feature_distributions_ignores_small_samples() {
+        use super::{ItemFeatures, SurvivalRecord};
+        let records: Vec<SurvivalRecord> = (0..5)
+            .map(|i| SurvivalRecord {
+                category: TruthCategory::Constraint,
+                outcome: if i % 2 == 0 {
+                    SurvivalOutcome::Survived
+                } else {
+                    SurvivalOutcome::Lost
+                },
+                keywords: vec!["test".into()],
+                features: ItemFeatures {
+                    keyword_count: 1,
+                    keyword_char_length: 4,
+                    contains_file_path: i < 3,
+                    contains_numeric_ref: false,
+                    matched_note_text: None,
+                    matched_note_tokens: None,
+                    prohibition_framing: None,
+                    aspiration_framing: None,
+                    evidence_count: None,
+                },
+            })
+            .collect();
+        let lessons = compare_feature_distributions(&records, 0.05);
+        assert!(lessons.is_empty(), "should skip categories with < 10 records");
+    }
+
+    #[test]
+    fn generate_meta_lessons_empty_input() {
+        let report = generate_meta_lessons(&[], 0.05);
+        assert_eq!(report.total_records, 0);
+        assert!(report.lessons.is_empty());
+    }
+
+    #[test]
+    fn meta_lesson_report_serialization_roundtrip() {
+        let report = MetaLessonReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            total_records: 100,
+            lessons: vec![MetaLesson {
+                pattern: "File paths survive 3x better".into(),
+                feature_name: "file_path".into(),
+                category: TruthCategory::CriticalFact,
+                direction: LessonDirection::SurvivedMore,
+                evidence: MetaLessonEvidence {
+                    survived_with_feature: 9,
+                    lost_with_feature: 1,
+                    survived_without_feature: 1,
+                    lost_without_feature: 9,
+                    rate_with_feature: 0.9,
+                    rate_without_feature: 0.1,
+                    chi_squared: 12.8,
+                    p_value: 0.0003,
+                },
+                confidence: 0.9997,
+                support_runs: 20,
+            }],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: MetaLessonReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.lessons.len(), 1);
+        assert_eq!(parsed.lessons[0].feature_name, "file_path");
+    }
+
+    #[test]
+    fn meta_lesson_end_to_end_with_real_kernel() {
+        let dir = tempdir().unwrap();
+        let kernel = SharedContinuityKernel::open(dir.path()).unwrap();
+        let scenario = scenario_for(BenchmarkClass::AgentSwapSurvival);
+
+        let attach = kernel
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner-strong".into(),
+                agent_type: "ollama".into(),
+                capabilities: vec!["plan".into()],
+                namespace: scenario.namespace.clone(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({}),
+            })
+            .unwrap();
+        let context = kernel
+            .open_context(OpenContextInput {
+                namespace: scenario.namespace.clone(),
+                task_id: scenario.task_id.clone(),
+                session_id: "meta-lesson-e2e".into(),
+                objective: scenario.objective.clone(),
+                selector: None,
+                agent_id: Some("planner-strong".into()),
+                attachment_id: Some(attach.id),
+            })
+            .unwrap();
+        populate_scenario(&kernel, &context.id, &scenario).unwrap();
+
+        let (envelope, _) = build_context_envelope(
+            &kernel,
+            BenchmarkClass::AgentSwapSurvival,
+            BaselineKind::SharedContinuity,
+            &context.id,
+            &scenario,
+            "relay-a",
+            512,
+            24,
+            8,
+        )
+        .unwrap();
+
+        assert!(!envelope.surfaced.is_empty(), "real kernel must produce surfaced items");
+
+        // Partial output: some items survive, some lost
+        let output = AgentContinuationOutput {
+            summary: "Agent swap resume".into(),
+            critical_facts: vec![EvidenceNote {
+                text: "selector_missing in src/query.rs caused failure".into(),
+                evidence: envelope
+                    .surfaced
+                    .iter()
+                    .filter(|s| s.label.starts_with('f'))
+                    .map(|s| s.label.clone())
+                    .take(1)
+                    .collect(),
+            }],
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            open_hypotheses: Vec::new(),
+            operational_scars: vec![EvidenceNote {
+                text: "naive probe approach failed".into(),
+                evidence: envelope
+                    .surfaced
+                    .iter()
+                    .filter(|s| s.label.starts_with('s'))
+                    .map(|s| s.label.clone())
+                    .take(1)
+                    .collect(),
+            }],
+            avoid_repeating: Vec::new(),
+            next_step: crate::adapters::ActionNote {
+                text: "run benchmark adapter next".into(),
+                evidence: Vec::new(),
+            },
+        };
+
+        let survival = benchmark_survival_analysis(&output, &scenario.truth, &envelope);
+        assert!(!survival.records.is_empty());
+
+        let survived = survival.records.iter().filter(|r| r.outcome == SurvivalOutcome::Survived).count();
+        let lost = survival.records.iter().filter(|r| r.outcome == SurvivalOutcome::Lost).count();
+        assert!(survived > 0, "some items must survive");
+        assert!(lost > 0, "some items must be lost (constraints omitted)");
+
+        let suite = BenchmarkSuiteReport {
+            generated_at: "2026-03-26T00:00:00Z".into(),
+            config: config_with_classes(vec![BenchmarkClass::AgentSwapSurvival]),
+            classes: vec![BenchmarkClassReport {
+                class: BenchmarkClass::AgentSwapSurvival,
+                scenario_id: scenario.id.clone(),
+                continuity: BaselineRunReport {
+                    baseline: BaselineKind::SharedContinuity,
+                    status: BaselineStatus::Ok,
+                    model: "test".into(),
+                    retrieval_ms: envelope.retrieval_ms,
+                    model_metrics: ModelCallMetrics::default(),
+                    envelope_tokens: envelope.token_estimate,
+                    evaluation: Evaluation::default(),
+                    survival: Some(survival),
+                    failure: None,
+                    artifacts: Vec::new(),
+                    continuity_path: None,
+                },
+                baselines: Vec::new(),
+                metrics: BenchmarkMetrics::default(),
+                resource: ResourceEnvelope::default(),
+                artifacts: Vec::new(),
+            }],
+            summary: BenchmarkSummary::default(),
+            meta_lessons: None,
+        };
+
+        let meta = generate_meta_lessons(&[suite], 0.05);
+        assert!(meta.total_records > 0, "must see survival records");
+
+        let written = super::write_meta_lessons_to_kernel(&kernel, &context.id, &meta);
+        assert!(written.is_ok(), "kernel write must succeed: {:?}", written.err());
+
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        assert!(json.contains("total_records"));
     }
 }
