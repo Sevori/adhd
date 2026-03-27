@@ -344,33 +344,14 @@ mod tests {
     use super::super::runner::{build_context_envelope, populate_scenario, scenario_for};
     use super::*;
     use crate::adapters::AgentContinuationOutput;
-    use crate::adapters::{EvidenceNote, ModelCallMetrics, SurvivalHypothesis};
+    use crate::adapters::{EvidenceNote, SurvivalHypothesis};
     use crate::benchmark::meta_analysis::{MetaLesson, MetaLessonEvidence, MetaLessonReport};
     use crate::benchmark::survival::CategoryStats;
-    use crate::benchmark::{BaselineKind, BenchmarkClass, ContinuityBenchConfig};
+    use crate::benchmark::{BaselineKind, BenchmarkClass};
     use crate::continuity::{
         AttachAgentInput, OpenContextInput, SharedContinuityKernel, UnifiedContinuityInterface,
     };
-    use std::path::PathBuf;
     use tempfile::tempdir;
-
-    fn config_with_classes(classes: Vec<BenchmarkClass>) -> ContinuityBenchConfig {
-        ContinuityBenchConfig {
-            output_dir: PathBuf::from("/tmp/bench"),
-            ollama_endpoint: "http://127.0.0.1:11434".into(),
-            strong_model: "glm-4.7-flash:latest".into(),
-            small_model: "qwen2.5:0.5b".into(),
-            embedding_backend: "hash:128".into(),
-            retrieval_protocol: "uci+compiler+vector://hash:128?budget=160&candidates=24&recent=8"
-                .into(),
-            classes,
-            token_budget: 160,
-            candidate_limit: 24,
-            recent_window: 8,
-            timeout_secs: 120,
-            num_predict: 192,
-        }
-    }
 
     #[test]
     fn extract_eligible_hypotheses_filters_sparse_and_high_p() {

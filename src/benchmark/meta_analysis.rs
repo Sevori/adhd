@@ -412,7 +412,7 @@ mod tests {
     use super::super::survival::{ItemFeatures, category_stats};
     use super::*;
     use crate::adapters::AgentContinuationOutput;
-    use crate::adapters::EvidenceNote;
+    use crate::adapters::{EvidenceNote, ModelCallMetrics};
     use crate::benchmark::{
         BaselineKind, BaselineRunReport, BaselineStatus, BenchmarkClass, BenchmarkClassReport,
         BenchmarkMetrics, BenchmarkSuiteReport, BenchmarkSummary, ContinuityBenchConfig,
