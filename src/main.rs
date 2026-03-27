@@ -38,6 +38,10 @@ use ice::dispatch::{
     DispatchWorkerUpsertInput, PublishDispatchSignalInput,
 };
 use ice::dogfood::{OrganismChorusConfig, run_organism_choir};
+use ice::goose_install::{
+    DEFAULT_GOOSE_SERVER_NAME, GooseInstallRequest, GooseStatusRequest, GooseUninstallRequest,
+    goose_status, install_goose, uninstall_goose,
+};
 use ice::http::serve;
 use ice::market_head::{
     MarketHeadChallengeConfig, MarketHeadChallengeManifest, compare_market_head_judge_calibration,
@@ -52,6 +56,14 @@ use ice::mcp::serve_stdio;
 use ice::model::{
     DimensionValue, EventInput, EventKind, HandoffInput, MemoryLayer, QueryInput, Scope, Selector,
     SnapshotResolution, SubscriptionInput, ViewInput, ViewOp,
+};
+use ice::opencode_install::{
+    DEFAULT_OPENCODE_SERVER_NAME, OpenCodeInstallRequest, OpenCodeStatusRequest,
+    OpenCodeUninstallRequest, install_opencode, opencode_status, uninstall_opencode,
+};
+use ice::openhands_install::{
+    DEFAULT_OPENHANDS_SERVER_NAME, OpenHandsInstallRequest, OpenHandsStatusRequest,
+    OpenHandsUninstallRequest, install_openhands, openhands_status, uninstall_openhands,
 };
 use ice::telemetry::EngineTelemetry;
 
@@ -89,6 +101,9 @@ enum Command {
     Dispatch(DispatchArgs),
     Codex(CodexArgs),
     Claude(ClaudeArgs),
+    Openhands(OpenHandsArgs),
+    Opencode(OpenCodeArgs),
+    Goose(GooseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -583,6 +598,24 @@ struct ClaudeArgs {
     command: ClaudeCommand,
 }
 
+#[derive(Debug, Args)]
+struct OpenHandsArgs {
+    #[command(subcommand)]
+    command: OpenHandsCommand,
+}
+
+#[derive(Debug, Args)]
+struct OpenCodeArgs {
+    #[command(subcommand)]
+    command: OpenCodeCommand,
+}
+
+#[derive(Debug, Args)]
+struct GooseArgs {
+    #[command(subcommand)]
+    command: GooseCommand,
+}
+
 #[derive(Debug, Subcommand)]
 enum DogfoodCommand {
     SyncRepo(RepoSyncArgs),
@@ -613,6 +646,27 @@ enum ClaudeCommand {
     Uninstall(ClaudeUninstallArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum OpenHandsCommand {
+    InstallGlobal(OpenHandsInstallGlobalArgs),
+    Status(OpenHandsStatusArgs),
+    Uninstall(OpenHandsUninstallArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum OpenCodeCommand {
+    InstallGlobal(OpenCodeInstallGlobalArgs),
+    Status(OpenCodeStatusArgs),
+    Uninstall(OpenCodeUninstallArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum GooseCommand {
+    InstallGlobal(GooseInstallGlobalArgs),
+    Status(GooseStatusArgs),
+    Uninstall(GooseUninstallArgs),
+}
+
 #[derive(Debug, Args, Clone)]
 struct ClaudeInstallGlobalArgs {
     #[arg(long)]
@@ -639,6 +693,90 @@ struct ClaudeUninstallArgs {
     server_name: String,
     #[arg(long, hide = true)]
     code_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct OpenHandsInstallGlobalArgs {
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_OPENHANDS_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    mcp_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct OpenHandsStatusArgs {
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_OPENHANDS_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    mcp_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct OpenHandsUninstallArgs {
+    #[arg(long, default_value = DEFAULT_OPENHANDS_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    mcp_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct OpenCodeInstallGlobalArgs {
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_OPENCODE_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct OpenCodeStatusArgs {
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_OPENCODE_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct OpenCodeUninstallArgs {
+    #[arg(long, default_value = DEFAULT_OPENCODE_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct GooseInstallGlobalArgs {
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_GOOSE_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct GooseStatusArgs {
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_GOOSE_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct GooseUninstallArgs {
+    #[arg(long, default_value = DEFAULT_GOOSE_SERVER_NAME)]
+    server_name: String,
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1381,6 +1519,81 @@ fn main() -> Result<()> {
                 let result = uninstall_claude_code(ClaudeCodeUninstallRequest {
                     server_name: args.server_name,
                     code_config_path: args.code_config,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        },
+        Command::Openhands(args) => match args.command {
+            OpenHandsCommand::InstallGlobal(args) => {
+                let result = install_openhands(OpenHandsInstallRequest {
+                    organism_root: args.root,
+                    server_name: args.server_name,
+                    mcp_config_path: args.mcp_config,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            OpenHandsCommand::Status(args) => {
+                let result = openhands_status(OpenHandsStatusRequest {
+                    server_name: args.server_name,
+                    mcp_config_path: args.mcp_config,
+                    organism_root: args.root,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            OpenHandsCommand::Uninstall(args) => {
+                let result = uninstall_openhands(OpenHandsUninstallRequest {
+                    server_name: args.server_name,
+                    mcp_config_path: args.mcp_config,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        },
+        Command::Opencode(args) => match args.command {
+            OpenCodeCommand::InstallGlobal(args) => {
+                let result = install_opencode(OpenCodeInstallRequest {
+                    organism_root: args.root,
+                    server_name: args.server_name,
+                    config_path: args.config,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            OpenCodeCommand::Status(args) => {
+                let result = opencode_status(OpenCodeStatusRequest {
+                    server_name: args.server_name,
+                    config_path: args.config,
+                    organism_root: args.root,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            OpenCodeCommand::Uninstall(args) => {
+                let result = uninstall_opencode(OpenCodeUninstallRequest {
+                    server_name: args.server_name,
+                    config_path: args.config,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        },
+        Command::Goose(args) => match args.command {
+            GooseCommand::InstallGlobal(args) => {
+                let result = install_goose(GooseInstallRequest {
+                    organism_root: args.root,
+                    server_name: args.server_name,
+                    config_path: args.config,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            GooseCommand::Status(args) => {
+                let result = goose_status(GooseStatusRequest {
+                    server_name: args.server_name,
+                    config_path: args.config,
+                    organism_root: args.root,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            GooseCommand::Uninstall(args) => {
+                let result = uninstall_goose(GooseUninstallRequest {
+                    server_name: args.server_name,
+                    config_path: args.config,
                 })?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }

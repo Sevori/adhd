@@ -180,6 +180,66 @@ ice handoff           # Generate handoff proof
 ice explain           # Explain context state
 ```
 
+### Managed Client Integration
+
+ICE may install managed MCP entries for external agent clients so they can mount the shared continuity kernel without manual JSON or YAML editing.
+
+**OpenHands integration:**
+
+```
+ice openhands install-global   # Write managed MCP entry to ~/.openhands/mcp.json
+ice openhands status           # Report binary/config/root status for the managed entry
+ice openhands uninstall        # Remove only the managed entry
+```
+
+Behavior:
+
+- Default OpenHands config path: `~/.openhands/mcp.json`
+- Default OpenHands organism root: `~/.openhands/organisms/ice`
+- Install writes a stdio MCP server entry that executes the current `ice` binary as `ice --root <organism-root> mcp`
+- The entry MUST be marked as ICE-managed so uninstall removes only ICE-owned entries
+- Install MUST refuse to overwrite an unmanaged same-name entry
+- Install MUST be idempotent when the managed entry already matches the desired command and args
+- Status MUST report whether the binary exists, whether the organism root exists, whether the config file exists, and whether the named entry is present
+
+**OpenCode integration:**
+
+```
+ice opencode install-global    # Write managed MCP entry to ~/.config/opencode/opencode.json
+ice opencode status            # Report binary/config/root status for the managed entry
+ice opencode uninstall         # Remove only the managed entry
+```
+
+Behavior:
+
+- Default OpenCode config path: `~/.config/opencode/opencode.json`
+- Default OpenCode organism root: `~/.config/opencode/organisms/ice`
+- Install writes a local MCP server entry under `mcp.<server-name>` that executes the current `ice` binary as `ice --root <organism-root> mcp`
+- The local MCP command MUST be represented in OpenCode's array form: `["/path/to/ice", "--root", "...", "mcp"]`
+- The entry MUST be marked as ICE-managed so uninstall removes only ICE-owned entries
+- Install MUST refuse to overwrite an unmanaged same-name entry
+- Install MUST be idempotent when the managed entry already matches the desired command and args
+- Status MUST report whether the binary exists, whether the organism root exists, whether the config file exists, and whether the named entry is present
+
+**Goose integration:**
+
+```
+ice goose install-global       # Write managed stdio extension into ~/.config/goose/config.yaml
+ice goose status               # Report binary/config/root status for the managed entry
+ice goose uninstall            # Remove only the managed entry
+```
+
+Behavior:
+
+- Default Goose config path: `~/.config/goose/config.yaml`
+- Default Goose organism root: `~/.config/goose/organisms/ice`
+- Install writes a managed stdio extension under `extensions.<server-name>` that executes the current `ice` binary as `ice --root <organism-root> mcp`
+- The extension MUST set Goose `type: stdio`, `cmd`, `args`, `enabled`, and empty `envs`
+- The entry MUST be marked as ICE-managed so uninstall removes only ICE-owned entries
+- Install MUST refuse to overwrite an unmanaged same-name entry
+- Install MUST be idempotent when the managed entry already matches the desired command and args
+- Status MUST report whether the binary exists, whether the organism root exists, whether the config file exists, and whether the named entry is present
+
 ## Validation
 
 ```bash

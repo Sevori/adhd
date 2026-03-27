@@ -22,6 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.39", features = ["bundled-full", "chrono", "serde_json", "trace", "uuid"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 sysinfo = "0.33"
 thiserror = "2.0"
 tokio = { version = "1.50", features = ["macros", "process", "rt-multi-thread", "signal"] }
@@ -30,5 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 tempfile = "3.27"
 uuid = { version = "1.22", features = ["serde", "v7"] }
 zstd = "0.13"
+json5 = "0.4"
 
 [dev-dependencies]

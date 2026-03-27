@@ -65,6 +65,93 @@ ice claude uninstall
 
 Restart Claude Code after installation so it reloads MCP servers.
 
+## Open Source Agents
+
+ICE can now install managed continuity entries for three open-source agent clients: OpenHands, OpenCode, and Goose.
+
+### OpenHands
+
+Install the managed MCP entry:
+
+```bash
+ice openhands install-global
+ice openhands status
+ice openhands uninstall
+```
+
+What this does:
+
+- writes a managed MCP entry into `~/.openhands/mcp.json`
+- points it at `ice --root ~/.openhands/organisms/ice mcp`
+- refuses to overwrite an unmanaged same-name entry
+
+### OpenCode
+
+Install the managed MCP entry:
+
+```bash
+ice opencode install-global
+ice opencode status
+ice opencode uninstall
+```
+
+What this does:
+
+- writes a managed local MCP entry into `~/.config/opencode/opencode.json`
+- points it at `ice --root ~/.config/opencode/organisms/ice mcp`
+- refuses to overwrite an unmanaged same-name entry
+
+### Goose
+
+Install the managed MCP entry:
+
+```bash
+ice goose install-global
+ice goose status
+ice goose uninstall
+```
+
+What this does:
+
+- writes a managed stdio extension into `~/.config/goose/config.yaml`
+- points it at `ice --root ~/.config/goose/organisms/ice mcp`
+- refuses to overwrite an unmanaged same-name entry
+
+Restart the client after installation so it reloads MCP servers.
+
+## Local Models on M2 Max 64GB
+
+For local open-source models on an M2 Max with 64 GB RAM, the safe default is:
+
+- main model: `qwen2.5:14b`
+- small/helper model: `qwen2.5:3b` or `qwen2.5:1.5b`
+- slower/stronger option: `qwen2.5:32b`
+
+OpenCode example with a local Ollama-compatible endpoint:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen2.5:14b": { "name": "Qwen 2.5 14B" },
+        "qwen2.5:3b": { "name": "Qwen 2.5 3B" }
+      }
+    }
+  },
+  "model": "ollama/qwen2.5:14b",
+  "small_model": "ollama/qwen2.5:3b"
+}
+```
+
+Goose: run `goose configure`, choose `Ollama`, keep `localhost:11434` unless your daemon is elsewhere, and select a tool-calling model such as `qwen2.5:14b`.
+
 ## Quick Start
 
 ### The idea
