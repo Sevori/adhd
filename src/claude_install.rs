@@ -434,4 +434,165 @@ mod tests {
         assert!(skipped);
         assert_eq!(fs::read_to_string(&config).unwrap(), "not-json");
     }
+
+    #[test]
+    fn validate_server_name_rejects_empty() {
+        assert!(validate_server_name("").is_err());
+    }
+
+    #[test]
+    fn validate_server_name_rejects_special_chars() {
+        assert!(validate_server_name("name with spaces").is_err());
+        assert!(validate_server_name("name/slash").is_err());
+        assert!(validate_server_name("name.dot").is_err());
+    }
+
+    #[test]
+    fn validate_server_name_accepts_valid() {
+        assert!(validate_server_name("ice-shared-continuity-kernel").is_ok());
+        assert!(validate_server_name("my_server_123").is_ok());
+        assert!(validate_server_name("ABC").is_ok());
+    }
+
+    #[test]
+    fn remove_managed_entry_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("does-not-exist.json");
+        let (changed, skipped) = remove_managed_entry(&config, DEFAULT_CLAUDE_SERVER_NAME).unwrap();
+        assert!(!changed);
+        assert!(!skipped);
+    }
+
+    #[test]
+    fn remove_managed_entry_no_mcp_servers_key() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        fs::write(&config, r#"{"other": "data"}"#).unwrap();
+        let (changed, skipped) = remove_managed_entry(&config, DEFAULT_CLAUDE_SERVER_NAME).unwrap();
+        assert!(!changed);
+        assert!(!skipped);
+    }
+
+    #[test]
+    fn remove_unmanaged_entry_is_not_removed() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        let initial = json!({
+            "mcpServers": {
+                "ice-shared-continuity-kernel": {
+                    "command": "other",
+                    "args": []
+                }
+            }
+        });
+        fs::write(&config, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+        let (changed, skipped) = remove_managed_entry(&config, DEFAULT_CLAUDE_SERVER_NAME).unwrap();
+        assert!(!changed);
+        assert!(!skipped);
+    }
+
+    #[test]
+    fn has_ice_entry_returns_true_when_present() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        upsert_code_entry(&config, DEFAULT_CLAUDE_SERVER_NAME, &test_entry()).unwrap();
+        assert!(has_ice_entry(&config, DEFAULT_CLAUDE_SERVER_NAME));
+    }
+
+    #[test]
+    fn has_ice_entry_returns_false_when_absent() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
+        assert!(!has_ice_entry(&config, DEFAULT_CLAUDE_SERVER_NAME));
+    }
+
+    #[test]
+    fn has_ice_entry_returns_false_for_malformed_config() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        fs::write(&config, "not json at all").unwrap();
+        assert!(!has_ice_entry(&config, DEFAULT_CLAUDE_SERVER_NAME));
+    }
+
+    #[test]
+    fn has_ice_entry_returns_false_for_missing_file() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("nonexistent.json");
+        assert!(!has_ice_entry(&config, DEFAULT_CLAUDE_SERVER_NAME));
+    }
+
+    #[test]
+    fn build_server_entry_contains_expected_fields() {
+        let entry = build_server_entry(
+            &PathBuf::from("/usr/bin/ice"),
+            &["--root".into(), "/data".into(), "mcp".into()],
+        );
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["command"], "/usr/bin/ice");
+        assert_eq!(entry["args"][0], "--root");
+        assert_eq!(entry["_ice_managed"], true);
+        assert!(entry["_ice_version"].as_str().is_some());
+    }
+
+    #[test]
+    fn read_config_returns_empty_for_nonexistent_file() {
+        let (config, malformed) = read_config(Path::new("/nonexistent/path/.claude.json"));
+        assert_eq!(config, json!({}));
+        assert!(!malformed);
+    }
+
+    #[test]
+    fn read_config_returns_malformed_for_non_object_json() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("array.json");
+        fs::write(&config, "[1, 2, 3]").unwrap();
+        let (_, malformed) = read_config(&config);
+        assert!(malformed);
+    }
+
+    #[test]
+    fn resolve_absolute_handles_absolute_path() {
+        let result = resolve_absolute("/absolute/path").unwrap();
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn upsert_updates_managed_entry_when_different() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+
+        let entry1 = build_server_entry(
+            &PathBuf::from("/tmp/ice-v1"),
+            &["--root".into(), "/tmp/organism".into(), "mcp".into()],
+        );
+        let entry2 = build_server_entry(
+            &PathBuf::from("/tmp/ice-v2"),
+            &["--root".into(), "/tmp/organism".into(), "mcp".into()],
+        );
+
+        let (changed1, _) =
+            upsert_code_entry(&config, DEFAULT_CLAUDE_SERVER_NAME, &entry1).unwrap();
+        assert!(changed1);
+
+        let (changed2, _) =
+            upsert_code_entry(&config, DEFAULT_CLAUDE_SERVER_NAME, &entry2).unwrap();
+        assert!(changed2);
+
+        let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            written["mcpServers"][DEFAULT_CLAUDE_SERVER_NAME]["command"],
+            "/tmp/ice-v2"
+        );
+    }
+
+    #[test]
+    fn remove_malformed_config_skips() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        fs::write(&config, "not-json").unwrap();
+        let (changed, skipped) = remove_managed_entry(&config, DEFAULT_CLAUDE_SERVER_NAME).unwrap();
+        assert!(!changed);
+        assert!(skipped);
+    }
 }

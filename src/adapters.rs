@@ -1324,4 +1324,211 @@ mod tests {
         assert_eq!(output.decisions[0].text, "only one");
         assert_eq!(output.decisions[0].rationale, "reason");
     }
+
+    #[test]
+    fn render_structured_resume_prompt_includes_role_objective_context() {
+        let prompt = render_structured_resume_prompt("debugger", "find the bug", "log lines here");
+        assert!(prompt.contains("debugger"));
+        assert!(prompt.contains("find the bug"));
+        assert!(prompt.contains("log lines here"));
+        assert!(prompt.contains("JSON only"));
+        assert!(prompt.contains("critical_facts"));
+    }
+
+    #[test]
+    fn render_structured_resume_prompt_no_hints_when_empty() {
+        let prompt = render_structured_resume_prompt("agent", "obj", "ctx");
+        assert!(!prompt.contains("[SURVIVAL HINTS]"));
+    }
+
+    #[test]
+    fn parse_structured_output_non_object_json_returns_error() {
+        let err = parse_structured_output(r#"["array", "not", "object"]"#).unwrap_err();
+        assert!(
+            err.to_string().contains("not an object")
+                || err.to_string().contains("did not contain json object")
+        );
+    }
+
+    #[test]
+    fn parse_note_list_handles_bool_false() {
+        let output =
+            parse_structured_output(r#"{"summary":"test","operational_scars":false}"#).unwrap();
+        assert!(output.operational_scars.is_empty());
+    }
+
+    #[test]
+    fn string_field_returns_empty_for_null() {
+        let result = string_field(Some(&serde_json::json!(null)));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn string_field_returns_empty_for_empty_string() {
+        let result = string_field(Some(&serde_json::json!("")));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn value_to_text_returns_none_for_array() {
+        let result = value_to_text(&serde_json::json!([1, 2, 3]));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn value_to_text_object_with_summary_key() {
+        let result = value_to_text(&serde_json::json!({"summary": "from summary"}));
+        assert_eq!(result.unwrap(), "from summary");
+    }
+
+    #[test]
+    fn value_to_text_object_text_key_preferred_over_summary() {
+        let result =
+            value_to_text(&serde_json::json!({"text": "from text", "summary": "from summary"}));
+        assert_eq!(result.unwrap(), "from text");
+    }
+
+    #[test]
+    fn is_empty_placeholder_non_empty_number_is_not_placeholder() {
+        assert!(!is_empty_placeholder(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn is_empty_placeholder_true_bool_is_not_placeholder() {
+        assert!(!is_empty_placeholder(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn parse_evidence_text_with_single_pipe_separator() {
+        let note = parse_evidence_text("fact text || e1,e2");
+        assert_eq!(note.text, "fact text");
+        assert_eq!(note.evidence, vec!["e1", "e2"]);
+    }
+
+    #[test]
+    fn parse_decision_text_four_fields_last_is_evidence() {
+        let note = parse_decision_text("dec || rat1 || rat2 || d1");
+        assert_eq!(note.text, "dec");
+        assert_eq!(note.rationale, "rat1 || rat2");
+        assert_eq!(note.evidence, vec!["d1"]);
+    }
+
+    #[test]
+    fn json_str_returns_default_when_key_missing() {
+        let extra = serde_json::json!({});
+        assert_eq!(json_str(&extra, "missing", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn json_str_returns_value_when_present() {
+        let extra = serde_json::json!({"key": "value"});
+        assert_eq!(json_str(&extra, "key", "fallback"), "value");
+    }
+
+    #[test]
+    fn string_array_schema_structure() {
+        let schema = string_array_schema(64);
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["items"]["type"], "string");
+        assert_eq!(schema["items"]["maxLength"], 64);
+        assert_eq!(schema["maxItems"], 2);
+    }
+
+    #[test]
+    fn ollama_adapter_config_access() {
+        let config = AgentAdapterConfig {
+            agent_id: "test".into(),
+            agent_type: "ollama".into(),
+            model: "llama3".into(),
+            endpoint: "http://localhost:11434".into(),
+            namespace: "ns".into(),
+            role: "coder".into(),
+            timeout_secs: 60,
+            num_predict: 1024,
+        };
+        let adapter = OllamaAdapter::new(config.clone()).unwrap();
+        assert_eq!(adapter.config().agent_id, "test");
+        assert_eq!(adapter.config().model, "llama3");
+    }
+
+    #[test]
+    fn ollama_adapter_prompt_generation() {
+        let config = AgentAdapterConfig {
+            agent_id: "test".into(),
+            agent_type: "ollama".into(),
+            model: "llama3".into(),
+            endpoint: "http://localhost:11434".into(),
+            namespace: "ns".into(),
+            role: "tester".into(),
+            timeout_secs: 60,
+            num_predict: 1024,
+        };
+        let adapter = OllamaAdapter::new(config).unwrap();
+        let prompt = adapter.prompt("find bugs", "context text");
+        assert!(prompt.contains("tester"));
+        assert!(prompt.contains("find bugs"));
+        assert!(prompt.contains("context text"));
+    }
+
+    #[test]
+    fn ollama_adapter_prompt_with_hypotheses() {
+        let config = AgentAdapterConfig {
+            agent_id: "test".into(),
+            agent_type: "ollama".into(),
+            model: "llama3".into(),
+            endpoint: "http://localhost:11434".into(),
+            namespace: "ns".into(),
+            role: "tester".into(),
+            timeout_secs: 60,
+            num_predict: 1024,
+        };
+        let adapter = OllamaAdapter::new(config).unwrap();
+        let hypotheses = vec![SurvivalHypothesis {
+            feature_name: "file_path".into(),
+            category: "CriticalFact".into(),
+            direction: "survived_more".into(),
+            hint: "Include file paths".into(),
+        }];
+        let prompt = adapter.prompt_with_hypotheses("obj", "ctx", &hypotheses);
+        assert!(prompt.contains("[SURVIVAL HINTS]"));
+        assert!(prompt.contains("Include file paths"));
+    }
+
+    #[test]
+    fn ollama_adapter_connection_refused_returns_error() {
+        let config = AgentAdapterConfig {
+            agent_id: "test".into(),
+            agent_type: "ollama".into(),
+            model: "fake".into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            namespace: "ns".into(),
+            role: "tester".into(),
+            timeout_secs: 30,
+            num_predict: 1024,
+        };
+        let adapter = OllamaAdapter::new(config).unwrap();
+        let err = adapter.analyze("obj", "ctx").unwrap_err();
+        assert!(
+            err.to_string().contains("connecting to Ollama")
+                || err.to_string().contains("Connection refused")
+        );
+    }
+
+    #[test]
+    fn model_call_metrics_defaults() {
+        let m = ModelCallMetrics::default();
+        assert_eq!(m.total_ms, 0);
+        assert_eq!(m.load_ms, 0);
+        assert_eq!(m.eval_count, 0);
+        assert_eq!(m.prompt_eval_count, 0);
+    }
+
+    #[test]
+    fn agent_continuation_output_defaults() {
+        let output = AgentContinuationOutput::default();
+        assert!(output.summary.is_empty());
+        assert!(output.critical_facts.is_empty());
+        assert!(output.decisions.is_empty());
+        assert!(output.next_step.text.is_empty());
+    }
 }

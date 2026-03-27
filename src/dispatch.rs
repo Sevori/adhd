@@ -3503,4 +3503,1010 @@ mod tests {
         assert!(override_val.discipline.is_none());
         assert!(override_val.habit.is_none());
     }
+
+    // ---- dispatch_worker_presence transformation ----
+
+    #[test]
+    fn dispatch_worker_presence_copies_core_fields() {
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Medium, 2, 4);
+        let presence = super::dispatch_worker_presence(worker.clone(), None);
+        assert_eq!(presence.worker_id, "w1");
+        assert_eq!(presence.role, "coder");
+        assert_eq!(presence.tier, DispatchWorkerTier::Medium);
+        assert_eq!(presence.active_assignment_count, 2);
+        assert_eq!(presence.projected_lane.projection_id, "dispatch:worker:w1");
+        assert_eq!(presence.projected_lane.projection_kind, "dispatch_worker");
+    }
+
+    #[test]
+    fn dispatch_worker_presence_fills_namespace_from_filter_when_none() {
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Small, 0, 1);
+        let presence = super::dispatch_worker_presence(worker, Some("ns-filter"));
+        assert_eq!(presence.namespace.as_deref(), Some("ns-filter"));
+    }
+
+    #[test]
+    fn dispatch_worker_presence_preserves_worker_namespace() {
+        let mut worker = make_worker("w1", "coder", DispatchWorkerTier::Small, 0, 1);
+        worker.namespace = Some("worker-ns".to_string());
+        let presence = super::dispatch_worker_presence(worker, Some("ns-filter"));
+        assert_eq!(presence.namespace.as_deref(), Some("worker-ns"));
+    }
+
+    #[test]
+    fn dispatch_worker_presence_with_attached_lane_in_metadata() {
+        let mut worker = make_worker("w1", "coder", DispatchWorkerTier::Small, 0, 1);
+        worker.metadata = serde_json::json!({
+            "attached_lane": {
+                "projection_id": "branch:feat/x",
+                "projection_kind": "branch",
+                "label": "feat/x",
+            },
+            "attached_lane_source": "explicit_cli",
+        });
+        worker.task_id = Some("task-99".to_string());
+        let presence = super::dispatch_worker_presence(worker, None);
+        let lane = presence.attached_projected_lane.unwrap();
+        assert_eq!(lane.projection_id, "branch:feat/x");
+        assert_eq!(lane.task_id.as_deref(), Some("task-99"));
+        assert_eq!(
+            presence.attached_projected_lane_source,
+            Some(DispatchAttachedLaneSource::ExplicitCli)
+        );
+    }
+
+    #[test]
+    fn dispatch_worker_presence_no_attached_lane() {
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Small, 0, 1);
+        let presence = super::dispatch_worker_presence(worker, None);
+        assert!(presence.attached_projected_lane.is_none());
+        assert!(presence.attached_projected_lane_source.is_none());
+    }
+
+    // ---- dispatch_assignment_presence transformation ----
+
+    fn make_assignment_record() -> super::DispatchAssignmentRecord {
+        super::DispatchAssignmentRecord {
+            id: "assign-1".to_string(),
+            signal_id: "signal-1".to_string(),
+            worker_id: "w1".to_string(),
+            machine_id: "machine-1".to_string(),
+            namespace: "ns".to_string(),
+            task_id: "task-1".to_string(),
+            context_id: "ctx-1".to_string(),
+            snapshot_id: Some("snap-1".to_string()),
+            objective: "do stuff".to_string(),
+            worker_role: "coder".to_string(),
+            worker_tier: DispatchWorkerTier::Medium,
+            status: DispatchStatus::Assigned,
+            pressure: DispatchPressureProfile {
+                anxiety: 0.5,
+                fear: 0.2,
+                confidence: 0.7,
+                discipline: 0.6,
+                habit: 0.4,
+            },
+            envelope: super::DispatchAssignmentEnvelope {
+                machine: super::super::continuity::MachineProfile {
+                    machine_id: "machine-1".to_string(),
+                    label: "test-machine".to_string(),
+                    namespace: "ns".to_string(),
+                    default_task_id: "task-1".to_string(),
+                    host_name: "localhost".to_string(),
+                    os_name: "linux".to_string(),
+                    kernel_version: None,
+                    storage_root: "/tmp/test".to_string(),
+                },
+                signal_id: "signal-1".to_string(),
+                worker_id: "w1".to_string(),
+                worker_display_name: "Worker 1".to_string(),
+                worker_role: "coder".to_string(),
+                worker_tier: DispatchWorkerTier::Medium,
+                objective: "do stuff".to_string(),
+                start_summary: "start here".to_string(),
+                resume: super::DispatchResumeHandle {
+                    context_id: "ctx-1".to_string(),
+                    snapshot_id: Some("snap-1".to_string()),
+                    namespace: "ns".to_string(),
+                    task_id: "task-1".to_string(),
+                    objective: "do stuff".to_string(),
+                    token_budget: 224,
+                    candidate_limit: 24,
+                },
+                context_preview: super::DispatchContextPreview {
+                    pack_id: "pack-1".to_string(),
+                    latest_snapshot_id: Some("snap-1".to_string()),
+                    pack_used_tokens: 100,
+                    hot_memory: vec!["memory-1".to_string()],
+                    decisions: vec!["decision-1".to_string()],
+                    constraints: vec!["constraint-1".to_string()],
+                    operational_scars: vec!["scar-1".to_string()],
+                    open_threads: vec!["thread-1".to_string()],
+                },
+                pressure: DispatchPressureProfile {
+                    anxiety: 0.5,
+                    fear: 0.2,
+                    confidence: 0.7,
+                    discipline: 0.6,
+                    habit: 0.4,
+                },
+                attached_projected_lane: None,
+                attached_projected_lane_source: None,
+            },
+            created_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn dispatch_assignment_presence_copies_fields() {
+        let assignment = make_assignment_record();
+        let presence = super::dispatch_assignment_presence(assignment);
+        assert_eq!(presence.assignment_id, "assign-1");
+        assert_eq!(presence.signal_id, "signal-1");
+        assert_eq!(presence.worker_id, "w1");
+        assert_eq!(presence.worker_role, "coder");
+        assert_eq!(presence.worker_tier, DispatchWorkerTier::Medium);
+        assert_eq!(presence.namespace, "ns");
+        assert_eq!(presence.task_id, "task-1");
+        assert_eq!(presence.context_id, "ctx-1");
+        assert_eq!(presence.objective, "do stuff");
+        assert_eq!(presence.status, DispatchStatus::Assigned);
+        assert!(
+            (presence.pressure.anxiety - 0.5).abs() < f64::EPSILON,
+            "pressure should be copied"
+        );
+        assert_eq!(presence.projected_lane.projection_id, "dispatch:worker:w1");
+        assert_eq!(presence.projected_lane.task_id.as_deref(), Some("task-1"));
+    }
+
+    #[test]
+    fn dispatch_assignment_presence_with_attached_lane() {
+        let mut assignment = make_assignment_record();
+        assignment.envelope.attached_projected_lane = Some(CoordinationProjectedLane {
+            projection_id: "branch:feat/y".to_string(),
+            projection_kind: "branch".to_string(),
+            label: "feat/y".to_string(),
+            resource: None,
+            repo_root: None,
+            branch: Some("feat/y".to_string()),
+            task_id: None,
+        });
+        assignment.envelope.attached_projected_lane_source =
+            Some(DispatchAttachedLaneSource::LiveBadgeOptIn);
+        let presence = super::dispatch_assignment_presence(assignment);
+        let lane = presence.attached_projected_lane.unwrap();
+        assert_eq!(lane.projection_id, "branch:feat/y");
+        assert_eq!(
+            presence.attached_projected_lane_source,
+            Some(DispatchAttachedLaneSource::LiveBadgeOptIn)
+        );
+    }
+
+    // ---- DispatchProjectionMetricState::new ----
+
+    #[test]
+    fn projection_metric_state_new_defaults() {
+        let lane = CoordinationProjectedLane {
+            projection_id: "proj:test".to_string(),
+            projection_kind: "test".to_string(),
+            label: "test".to_string(),
+            resource: Some("res/path".to_string()),
+            repo_root: Some("/repo".to_string()),
+            branch: Some("main".to_string()),
+            task_id: Some("task-1".to_string()),
+        };
+        let state = DispatchProjectionMetricState::new(&lane, Some("ns"), Some("fallback"));
+        assert_eq!(state.projection_id, "proj:test");
+        assert_eq!(state.projection_kind, "test");
+        assert_eq!(state.label, "test");
+        assert_eq!(state.resource.as_deref(), Some("res/path"));
+        assert_eq!(state.repo_root.as_deref(), Some("/repo"));
+        assert_eq!(state.branch.as_deref(), Some("main"));
+        assert_eq!(state.task_id.as_deref(), Some("task-1"));
+        assert_eq!(state.namespace, "ns");
+        assert_eq!(state.worker_count, 0);
+        assert_eq!(state.assignment_count, 0);
+        assert!(state.assignment_anxiety_max.abs() < f64::EPSILON);
+        assert_eq!(state.assignment_explicit_cli_count, 0);
+        assert_eq!(state.assignment_live_badge_opt_in_count, 0);
+    }
+
+    #[test]
+    fn projection_metric_state_new_uses_task_id_fallback() {
+        let lane = CoordinationProjectedLane {
+            projection_id: "proj:test".to_string(),
+            projection_kind: "test".to_string(),
+            label: "test".to_string(),
+            resource: None,
+            repo_root: None,
+            branch: None,
+            task_id: None,
+        };
+        let state = DispatchProjectionMetricState::new(&lane, None, Some("fallback-task"));
+        assert_eq!(state.task_id.as_deref(), Some("fallback-task"));
+        assert_eq!(state.namespace, "");
+    }
+
+    #[test]
+    fn projection_metric_state_new_lane_task_id_wins_over_fallback() {
+        let lane = CoordinationProjectedLane {
+            projection_id: "proj:test".to_string(),
+            projection_kind: "test".to_string(),
+            label: "test".to_string(),
+            resource: None,
+            repo_root: None,
+            branch: None,
+            task_id: Some("lane-task".to_string()),
+        };
+        let state = DispatchProjectionMetricState::new(&lane, None, Some("fallback"));
+        assert_eq!(state.task_id.as_deref(), Some("lane-task"));
+    }
+
+    // ---- comprehensive serde round-trips for struct coverage ----
+
+    #[test]
+    fn dispatch_config_serde_with_defaults() {
+        let json = r#"{"database_url":"postgres://localhost/test"}"#;
+        let config: DispatchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.notify_channel, "ice_dispatch_signal");
+        assert_eq!(config.worker_stale_secs, 120);
+    }
+
+    #[test]
+    fn dispatch_worker_tier_serde_round_trip() {
+        for tier in [
+            DispatchWorkerTier::Small,
+            DispatchWorkerTier::Medium,
+            DispatchWorkerTier::Large,
+            DispatchWorkerTier::Script,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: DispatchWorkerTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    #[test]
+    fn dispatch_signal_kind_serde_round_trip() {
+        for kind in [
+            DispatchSignalKind::TaskComplete,
+            DispatchSignalKind::HandoffReady,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let parsed: DispatchSignalKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, kind);
+        }
+    }
+
+    #[test]
+    fn dispatch_status_serde_round_trip() {
+        for status in [
+            DispatchStatus::Queued,
+            DispatchStatus::Assigned,
+            DispatchStatus::Completed,
+            DispatchStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: DispatchStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn dispatch_attached_lane_source_serde_round_trip() {
+        for source in [
+            DispatchAttachedLaneSource::ExplicitCli,
+            DispatchAttachedLaneSource::LiveBadgeOptIn,
+        ] {
+            let json = serde_json::to_string(&source).unwrap();
+            let parsed: DispatchAttachedLaneSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, source);
+        }
+    }
+
+    #[test]
+    fn dispatch_worker_upsert_input_serde_with_defaults() {
+        let json = serde_json::json!({
+            "worker_id": "w1",
+            "display_name": "Worker 1",
+            "role": "coder",
+            "agent_type": "claude",
+            "tier": "small",
+            "model": "sonnet",
+        });
+        let input: super::DispatchWorkerUpsertInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.worker_id, "w1");
+        assert_eq!(input.max_parallelism, 1);
+        assert_eq!(input.status, "idle");
+        assert!(input.capabilities.is_empty());
+        assert_eq!(input.focus, "");
+        assert!(input.namespace.is_none());
+        assert!(input.task_id.is_none());
+        assert!(input.metadata.is_null() || input.metadata == serde_json::json!({}));
+    }
+
+    #[test]
+    fn dispatch_worker_upsert_input_serde_with_all_fields() {
+        let json = serde_json::json!({
+            "worker_id": "w1",
+            "display_name": "Worker 1",
+            "role": "coder",
+            "agent_type": "claude",
+            "tier": "large",
+            "model": "opus",
+            "capabilities": ["code", "review"],
+            "max_parallelism": 4,
+            "focus": "fixing bugs",
+            "namespace": "ns",
+            "task_id": "task-1",
+            "status": "busy",
+            "metadata": {"key": "value"},
+        });
+        let input: super::DispatchWorkerUpsertInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.tier, DispatchWorkerTier::Large);
+        assert_eq!(input.max_parallelism, 4);
+        assert_eq!(input.capabilities, vec!["code", "review"]);
+        assert_eq!(input.status, "busy");
+        assert_eq!(input.namespace.as_deref(), Some("ns"));
+    }
+
+    #[test]
+    fn dispatch_signal_record_serde_round_trip() {
+        let record = make_signal(Some("coder"), Some(DispatchWorkerTier::Small));
+        let json = serde_json::to_value(&record).unwrap();
+        let parsed: DispatchSignalRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.id, record.id);
+        assert_eq!(parsed.kind, record.kind);
+        assert_eq!(parsed.status, record.status);
+        assert_eq!(parsed.target_role.as_deref(), Some("coder"));
+        assert_eq!(parsed.preferred_tier, Some(DispatchWorkerTier::Small));
+    }
+
+    #[test]
+    fn dispatch_worker_record_serde_round_trip() {
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Medium, 2, 4);
+        let json = serde_json::to_value(&worker).unwrap();
+        let parsed: DispatchWorkerRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.worker_id, "w1");
+        assert_eq!(parsed.role, "coder");
+        assert_eq!(parsed.tier, DispatchWorkerTier::Medium);
+        assert_eq!(parsed.active_assignment_count, 2);
+        assert_eq!(parsed.max_parallelism, 4);
+    }
+
+    #[test]
+    fn dispatch_complete_input_serde_with_defaults() {
+        let json = serde_json::json!({
+            "kind": "task_complete",
+            "agent_id": "agent-1",
+            "title": "Fixed the bug",
+            "result": "All tests pass",
+            "quality": 0.95,
+            "target_tier": "medium",
+        });
+        let input: super::DispatchCompleteInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.kind, DispatchSignalKind::TaskComplete);
+        assert_eq!(input.agent_id, "agent-1");
+        assert!((input.quality - 0.95).abs() < f64::EPSILON);
+        assert!(input.failures.is_empty());
+        assert!(input.context_id.is_none());
+        assert!(input.namespace.is_none());
+        assert!(input.task_id.is_none());
+        assert_eq!(input.token_budget, 224);
+        assert_eq!(input.candidate_limit, 24);
+    }
+
+    #[test]
+    fn dispatch_claim_input_serde_with_defaults() {
+        let json = serde_json::json!({
+            "worker": {
+                "worker_id": "w1",
+                "display_name": "Worker 1",
+                "role": "coder",
+                "agent_type": "claude",
+                "tier": "small",
+                "model": "sonnet",
+            },
+            "lease_seconds": 300,
+        });
+        let input: super::DispatchClaimInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.lease_seconds, 300);
+        assert_eq!(input.token_budget, 224);
+        assert_eq!(input.candidate_limit, 24);
+        assert_eq!(input.worker.worker_id, "w1");
+    }
+
+    #[test]
+    fn dispatch_resume_handle_serde_round_trip() {
+        let handle = super::DispatchResumeHandle {
+            context_id: "ctx-1".to_string(),
+            snapshot_id: Some("snap-1".to_string()),
+            namespace: "ns".to_string(),
+            task_id: "task-1".to_string(),
+            objective: "do stuff".to_string(),
+            token_budget: 224,
+            candidate_limit: 24,
+        };
+        let json = serde_json::to_value(&handle).unwrap();
+        let parsed: super::DispatchResumeHandle = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.context_id, "ctx-1");
+        assert_eq!(parsed.snapshot_id.as_deref(), Some("snap-1"));
+        assert_eq!(parsed.token_budget, 224);
+    }
+
+    #[test]
+    fn dispatch_context_preview_serde_round_trip() {
+        let preview = super::DispatchContextPreview {
+            pack_id: "pack-1".to_string(),
+            latest_snapshot_id: Some("snap-1".to_string()),
+            pack_used_tokens: 100,
+            hot_memory: vec!["m1".to_string(), "m2".to_string()],
+            decisions: vec!["d1".to_string()],
+            constraints: vec!["c1".to_string()],
+            operational_scars: vec!["s1".to_string()],
+            open_threads: vec!["t1".to_string()],
+        };
+        let json = serde_json::to_value(&preview).unwrap();
+        let parsed: super::DispatchContextPreview = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.pack_id, "pack-1");
+        assert_eq!(parsed.hot_memory.len(), 2);
+        assert_eq!(parsed.pack_used_tokens, 100);
+    }
+
+    #[test]
+    fn dispatch_publish_signal_input_serde() {
+        let json = serde_json::json!({
+            "kind": "handoff_ready",
+            "from_agent_id": "agent-1",
+            "context_id": "ctx-1",
+            "namespace": "ns",
+            "task_id": "task-1",
+            "objective": "continue work",
+        });
+        let input: super::PublishDispatchSignalInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.kind, DispatchSignalKind::HandoffReady);
+        assert!(input.snapshot_id.is_none());
+        assert!(input.target_role.is_none());
+        assert!(input.preferred_tier.is_none());
+        assert!(input.reason.is_none());
+    }
+
+    #[test]
+    fn dispatch_organism_snapshot_serde_round_trip() {
+        let snap = DispatchOrganismSnapshot::unconfigured();
+        let json = serde_json::to_value(&snap).unwrap();
+        let parsed: DispatchOrganismSnapshot = serde_json::from_value(json).unwrap();
+        assert!(!parsed.configured);
+        assert!(!parsed.reachable);
+        assert!(parsed.workers.is_empty());
+        assert!(parsed.assignments.is_empty());
+    }
+
+    #[test]
+    fn route_dispatch_input_serde_with_defaults() {
+        let json = serde_json::json!({
+            "router_id": "router-1",
+        });
+        let input: super::RouteDispatchInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.router_id, "router-1");
+        assert_eq!(input.token_budget, 224);
+        assert_eq!(input.candidate_limit, 24);
+    }
+
+    #[test]
+    fn wait_dispatch_input_serde() {
+        let json = serde_json::json!({
+            "router_id": "router-1",
+            "timeout_secs": 60,
+        });
+        let input: super::WaitDispatchInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.route.router_id, "router-1");
+        assert_eq!(input.timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn complete_assignment_input_serde() {
+        let json = serde_json::json!({
+            "assignment_id": "assign-1",
+        });
+        let input: super::CompleteAssignmentInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.assignment_id, "assign-1");
+        assert!(input.worker_id.is_none());
+        assert!(!input.failed);
+    }
+
+    #[test]
+    fn complete_assignment_input_serde_with_failed() {
+        let json = serde_json::json!({
+            "assignment_id": "assign-1",
+            "worker_id": "w1",
+            "failed": true,
+        });
+        let input: super::CompleteAssignmentInput = serde_json::from_value(json).unwrap();
+        assert_eq!(input.worker_id.as_deref(), Some("w1"));
+        assert!(input.failed);
+    }
+
+    #[test]
+    fn dispatch_assignment_record_serde_round_trip() {
+        let assignment = make_assignment_record();
+        let json = serde_json::to_value(&assignment).unwrap();
+        let parsed: super::DispatchAssignmentRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.id, "assign-1");
+        assert_eq!(parsed.signal_id, "signal-1");
+        assert_eq!(parsed.worker_id, "w1");
+        assert_eq!(parsed.worker_tier, DispatchWorkerTier::Medium);
+        assert_eq!(parsed.status, DispatchStatus::Assigned);
+        assert!((parsed.pressure.anxiety - 0.5).abs() < f64::EPSILON);
+        assert_eq!(parsed.envelope.worker_display_name, "Worker 1");
+    }
+
+    #[test]
+    fn dispatch_assignment_envelope_serde_round_trip() {
+        let assignment = make_assignment_record();
+        let json = serde_json::to_value(&assignment.envelope).unwrap();
+        let parsed: super::DispatchAssignmentEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.signal_id, "signal-1");
+        assert_eq!(parsed.worker_id, "w1");
+        assert_eq!(parsed.start_summary, "start here");
+        assert_eq!(parsed.resume.context_id, "ctx-1");
+        assert_eq!(parsed.context_preview.pack_id, "pack-1");
+        assert_eq!(parsed.machine.host_name, "localhost");
+    }
+
+    // ---- worker_worker_presence serde ----
+
+    #[test]
+    fn dispatch_worker_presence_serde_round_trip() {
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Medium, 0, 1);
+        let presence = super::dispatch_worker_presence(worker, None);
+        let json = serde_json::to_value(&presence).unwrap();
+        let parsed: super::DispatchWorkerPresence = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.worker_id, "w1");
+        assert_eq!(parsed.tier, DispatchWorkerTier::Medium);
+    }
+
+    #[test]
+    fn dispatch_assignment_presence_serde_round_trip() {
+        let assignment = make_assignment_record();
+        let presence = super::dispatch_assignment_presence(assignment);
+        let json = serde_json::to_value(&presence).unwrap();
+        let parsed: super::DispatchAssignmentPresence = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.assignment_id, "assign-1");
+        assert_eq!(parsed.worker_tier, DispatchWorkerTier::Medium);
+    }
+
+    // ---- more worker_score edge cases ----
+
+    #[test]
+    fn worker_score_no_target_role_still_gets_role_bonus() {
+        let signal = make_signal(None, None);
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Medium, 0, 1);
+        let score = worker_score(&signal, &worker);
+        assert!(
+            score >= 50.0,
+            "no target_role means any role matches for +50"
+        );
+    }
+
+    #[test]
+    fn worker_score_tier_bonus_ordering() {
+        let signal = make_signal(None, None);
+        let small = worker_score(
+            &signal,
+            &make_worker("w1", "coder", DispatchWorkerTier::Small, 0, 1),
+        );
+        let medium = worker_score(
+            &signal,
+            &make_worker("w2", "coder", DispatchWorkerTier::Medium, 0, 1),
+        );
+        let large = worker_score(
+            &signal,
+            &make_worker("w3", "coder", DispatchWorkerTier::Large, 0, 1),
+        );
+        let script = worker_score(
+            &signal,
+            &make_worker("w4", "coder", DispatchWorkerTier::Script, 0, 1),
+        );
+        assert!(large > medium, "large tier should score higher than medium");
+        assert!(medium > small, "medium tier should score higher than small");
+        assert!(
+            small > script,
+            "small tier should score higher than script (script gets -25 penalty)"
+        );
+    }
+
+    #[test]
+    fn worker_score_heavily_loaded_worker_scores_lower() {
+        let signal = make_signal(None, None);
+        let fresh = make_worker("w1", "coder", DispatchWorkerTier::Medium, 0, 8);
+        let loaded = make_worker("w2", "coder", DispatchWorkerTier::Medium, 7, 8);
+        assert!(worker_score(&signal, &fresh) > worker_score(&signal, &loaded));
+    }
+
+    // ---- select_best_worker more scenarios ----
+
+    #[test]
+    fn select_best_worker_prefers_lower_load() {
+        let signal = make_signal(None, None);
+        let busy = make_worker("w1", "coder", DispatchWorkerTier::Medium, 3, 4);
+        let free = make_worker("w2", "coder", DispatchWorkerTier::Medium, 0, 4);
+        let selected = select_best_worker(&signal, &[busy, free]).unwrap();
+        assert_eq!(selected.worker_id, "w2");
+    }
+
+    #[test]
+    fn select_best_worker_many_workers() {
+        let signal = make_signal(Some("coder"), Some(DispatchWorkerTier::Small));
+        let workers = vec![
+            make_worker("w1", "debugger", DispatchWorkerTier::Large, 0, 1),
+            make_worker("w2", "coder", DispatchWorkerTier::Large, 0, 1),
+            make_worker("w3", "coder", DispatchWorkerTier::Small, 0, 1),
+            make_worker("w4", "coder", DispatchWorkerTier::Medium, 0, 1),
+        ];
+        let selected = select_best_worker(&signal, &workers).unwrap();
+        assert_eq!(
+            selected.worker_id, "w3",
+            "should pick worker matching both role and preferred tier"
+        );
+    }
+
+    // ---- worker_can_take_signal more edge cases ----
+
+    #[test]
+    fn worker_can_take_signal_offline_case_insensitive() {
+        let mut worker = make_worker("w1", "coder", DispatchWorkerTier::Small, 0, 1);
+        worker.status = "OFFLINE".into();
+        let signal = make_signal(None, None);
+        assert!(!worker_can_take_signal(&worker, &signal));
+    }
+
+    #[test]
+    fn worker_can_take_signal_script_no_preferred_rejects() {
+        let worker = make_worker("w1", "runner", DispatchWorkerTier::Script, 0, 1);
+        let signal = make_signal(None, None);
+        assert!(
+            !worker_can_take_signal(&worker, &signal),
+            "script worker should reject signals without preferred_tier=script"
+        );
+    }
+
+    #[test]
+    fn worker_can_take_signal_matching_role_accepted() {
+        let worker = make_worker("w1", "coder", DispatchWorkerTier::Medium, 0, 2);
+        let signal = make_signal(Some("coder"), None);
+        assert!(worker_can_take_signal(&worker, &signal));
+    }
+
+    // ---- apply_affect_override full field coverage ----
+
+    #[test]
+    fn apply_affect_override_all_fields() {
+        let profile = DispatchPressureProfile {
+            anxiety: 0.5,
+            fear: 0.5,
+            confidence: 0.5,
+            discipline: 0.5,
+            habit: 0.5,
+        };
+        let override_val = serde_json::json!({
+            "anxiety": 0.1,
+            "fear": 0.2,
+            "confidence": 0.3,
+            "discipline": 0.4,
+            "habit": 0.9,
+        });
+        let result = apply_affect_override(profile, Some(&override_val));
+        assert!((result.anxiety - 0.1).abs() < f64::EPSILON);
+        assert!((result.fear - 0.2).abs() < f64::EPSILON);
+        assert!((result.confidence - 0.3).abs() < f64::EPSILON);
+        assert!((result.discipline - 0.4).abs() < f64::EPSILON);
+        assert!((result.habit - 0.9).abs() < f64::EPSILON);
+    }
+
+    // ---- attached_projected_lane_from_metadata edge cases ----
+
+    #[test]
+    fn attached_lane_from_metadata_invalid_json_returns_none() {
+        let metadata = serde_json::json!({"attached_lane": "not an object"});
+        assert!(attached_projected_lane_from_metadata(&metadata, None).is_none());
+    }
+
+    #[test]
+    fn attached_lane_from_metadata_blank_task_id_uses_fallback() {
+        let metadata = serde_json::json!({
+            "attached_lane": {
+                "projection_id": "proj:1",
+                "projection_kind": "branch",
+                "label": "my branch",
+                "task_id": "  ",
+            }
+        });
+        let lane = attached_projected_lane_from_metadata(&metadata, Some("fallback")).unwrap();
+        assert_eq!(lane.task_id.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn attached_lane_from_metadata_blank_fallback_leaves_none() {
+        let metadata = serde_json::json!({
+            "attached_lane": {
+                "projection_id": "proj:1",
+                "projection_kind": "branch",
+                "label": "my branch",
+            }
+        });
+        let lane = attached_projected_lane_from_metadata(&metadata, Some("  ")).unwrap();
+        assert!(lane.task_id.is_none());
+    }
+
+    #[test]
+    fn attached_lane_from_metadata_partial_empty_fields_returns_none() {
+        let metadata = serde_json::json!({
+            "attached_lane": {
+                "projection_id": "proj:1",
+                "projection_kind": "  ",
+                "label": "my branch",
+            }
+        });
+        assert!(attached_projected_lane_from_metadata(&metadata, None).is_none());
+    }
+
+    #[test]
+    fn attached_lane_source_from_metadata_live_badge() {
+        let metadata = serde_json::json!({"attached_lane_source": "live_badge_opt_in"});
+        let source = attached_projected_lane_source_from_metadata(&metadata).unwrap();
+        assert_eq!(source, DispatchAttachedLaneSource::LiveBadgeOptIn);
+    }
+
+    #[test]
+    fn attached_lane_source_from_metadata_invalid_returns_none() {
+        let metadata = serde_json::json!({"attached_lane_source": "unknown_source"});
+        assert!(attached_projected_lane_source_from_metadata(&metadata).is_none());
+    }
+
+    // ---- dispatch_worker_projected_lane more ----
+
+    #[test]
+    fn dispatch_worker_projected_lane_no_task_id() {
+        let lane = dispatch_worker_projected_lane("w-abc", None);
+        assert_eq!(lane.projection_id, "dispatch:worker:w-abc");
+        assert!(lane.task_id.is_none());
+        assert!(lane.repo_root.is_none());
+        assert!(lane.branch.is_none());
+        assert_eq!(lane.resource.as_deref(), Some("dispatch/worker/w-abc"));
+    }
+
+    // ---- compact_line and compact_metric_label edge cases ----
+
+    #[test]
+    fn compact_line_single_char_max() {
+        let result = compact_line("abcdef", 1);
+        assert_eq!(result.chars().count(), 1);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn compact_line_exact_length() {
+        let result = compact_line("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn compact_line_all_blank_lines_returns_empty() {
+        let result = compact_line("\n\n\n", 10);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn compact_metric_label_exact_length() {
+        let result = compact_metric_label("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    // ---- prometheus_label_value edge cases ----
+
+    #[test]
+    fn prometheus_label_value_multiple_special_chars() {
+        let result = prometheus_label_value("a\\b\nc\"d");
+        assert_eq!(result, "a\\\\b\\nc\\\"d");
+    }
+
+    #[test]
+    fn prometheus_label_value_empty_string() {
+        assert_eq!(prometheus_label_value(""), "");
+    }
+
+    // ---- is_valid_pg_identifier edge cases ----
+
+    #[test]
+    fn pg_identifier_single_char_valid() {
+        assert!(is_valid_pg_identifier("a"));
+        assert!(is_valid_pg_identifier("_"));
+    }
+
+    #[test]
+    fn pg_identifier_numeric_chars_in_body_valid() {
+        assert!(is_valid_pg_identifier("a123"));
+    }
+
+    #[test]
+    fn pg_identifier_special_chars_invalid() {
+        assert!(!is_valid_pg_identifier("a.b"));
+        assert!(!is_valid_pg_identifier("a;b"));
+        assert!(!is_valid_pg_identifier("a'b"));
+    }
+
+    // ---- dispatch_down_metrics edge cases ----
+
+    #[test]
+    fn dispatch_down_metrics_escapes_special_chars_in_error() {
+        let text = dispatch_down_metrics("error with \"quotes\" and\nnewlines");
+        assert!(text.contains("ice_dispatch_up 0"));
+        assert!(text.contains("ice_dispatch_status"));
+        assert!(!text.contains('\n') || text.matches('\n').count() >= 2);
+    }
+
+    #[test]
+    fn dispatch_down_metrics_long_error_gets_truncated() {
+        let long_error = "a".repeat(200);
+        let text = dispatch_down_metrics(&long_error);
+        assert!(text.contains("ice_dispatch_up 0"));
+        assert!(
+            text.contains('…'),
+            "long error should be truncated with ellipsis"
+        );
+    }
+
+    // ---- projection_metric_labels edge cases ----
+
+    #[test]
+    fn projection_metric_labels_with_none_fields() {
+        let state = DispatchProjectionMetricState {
+            projection_id: "proj:1".to_string(),
+            projection_kind: "test".to_string(),
+            label: "test".to_string(),
+            resource: None,
+            repo_root: None,
+            branch: None,
+            task_id: None,
+            namespace: "".to_string(),
+            worker_count: 0,
+            assignment_count: 0,
+            assignment_anxiety_max: 0.0,
+            assignment_explicit_cli_count: 0,
+            assignment_live_badge_opt_in_count: 0,
+        };
+        let labels = projection_metric_labels(&state);
+        assert!(labels.contains("namespace=\"\""));
+        assert!(labels.contains("resource=\"\""));
+        assert!(labels.contains("repo_root=\"\""));
+        assert!(labels.contains("branch=\"\""));
+        assert!(labels.contains("task_id=\"\""));
+    }
+
+    // ---- record_dispatch_projection_assignment edge cases ----
+
+    #[test]
+    fn record_dispatch_projection_assignment_creates_new_entry() {
+        let mut projections = BTreeMap::new();
+        let lane = CoordinationProjectedLane {
+            projection_id: "proj:new".to_string(),
+            projection_kind: "test".to_string(),
+            label: "new lane".to_string(),
+            resource: None,
+            repo_root: None,
+            branch: None,
+            task_id: None,
+        };
+        record_dispatch_projection_assignment(
+            &mut projections,
+            &lane,
+            Some("ns"),
+            None,
+            0.7,
+            Some(DispatchAttachedLaneSource::LiveBadgeOptIn),
+        );
+        let state = projections.get("proj:new").unwrap();
+        assert_eq!(state.assignment_count, 1);
+        assert!((state.assignment_anxiety_max - 0.7).abs() < f64::EPSILON);
+        assert_eq!(state.assignment_live_badge_opt_in_count, 1);
+        assert_eq!(state.assignment_explicit_cli_count, 0);
+    }
+
+    #[test]
+    fn record_dispatch_projection_assignment_no_source() {
+        let mut projections = BTreeMap::new();
+        let lane = CoordinationProjectedLane {
+            projection_id: "proj:x".to_string(),
+            projection_kind: "test".to_string(),
+            label: "x".to_string(),
+            resource: None,
+            repo_root: None,
+            branch: None,
+            task_id: None,
+        };
+        record_dispatch_projection_assignment(&mut projections, &lane, None, None, 0.3, None);
+        let state = projections.get("proj:x").unwrap();
+        assert_eq!(state.assignment_explicit_cli_count, 0);
+        assert_eq!(state.assignment_live_badge_opt_in_count, 0);
+    }
+
+    // ---- DispatchConfig::load from file ----
+
+    #[test]
+    fn dispatch_config_load_invalid_json_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("dispatch-config.json"), "not json").unwrap();
+        assert!(DispatchConfig::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn dispatch_config_load_file_with_bad_channel_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let json = serde_json::json!({
+            "database_url": "postgres://localhost/test",
+            "notify_channel": "bad-channel",
+        });
+        std::fs::write(
+            data_dir.join("dispatch-config.json"),
+            serde_json::to_string(&json).unwrap(),
+        )
+        .unwrap();
+        assert!(DispatchConfig::load(dir.path()).is_err());
+    }
+
+    // ---- DispatchAffectOverride serde ----
+
+    #[test]
+    fn affect_override_serde_round_trip() {
+        let override_val = DispatchAffectOverride {
+            anxiety: Some(0.1),
+            confidence: Some(0.9),
+            fear: None,
+            discipline: Some(0.5),
+            habit: None,
+        };
+        let json = serde_json::to_value(&override_val).unwrap();
+        let parsed: DispatchAffectOverride = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.anxiety, Some(0.1));
+        assert_eq!(parsed.confidence, Some(0.9));
+        assert!(parsed.fear.is_none());
+        assert_eq!(parsed.discipline, Some(0.5));
+        assert!(parsed.habit.is_none());
+    }
+
+    // ---- DispatchConfig::save validation ----
+
+    #[test]
+    fn dispatch_config_save_validates_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_config = DispatchConfig {
+            database_url: "  ".to_string(),
+            notify_channel: "ice_dispatch_signal".to_string(),
+            worker_stale_secs: 120,
+        };
+        assert!(bad_config.save(dir.path()).is_err());
+    }
+
+    // ---- organism_snapshot with config but no postgres ----
+
+    #[test]
+    fn organism_snapshot_with_config_but_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DispatchConfig {
+            database_url: "postgres://localhost:59999/nonexistent".to_string(),
+            notify_channel: "ice_dispatch_signal".to_string(),
+            worker_stale_secs: 120,
+        };
+        config.save(dir.path()).unwrap();
+        let snap = super::organism_snapshot(dir.path(), None);
+        assert!(snap.configured);
+        assert!(!snap.reachable);
+        assert!(snap.error.is_some());
+    }
 }
