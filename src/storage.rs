@@ -1416,6 +1416,24 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn event_by_id(&self, id: &str) -> Result<Option<EventRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, ts, kind, scope, agent_id, agent_role, session_id, task_id, project_id,
+                   goal_id, run_id, namespace, environment, source, tags_json, dimensions_json,
+                   attributes_json, content, content_hash, byte_size, token_estimate, importance,
+                   segment_seq, segment_line
+            FROM events
+            WHERE id = ?1
+            "#,
+        )?;
+        stmt.query_row(params![id], |row| {
+            read_event_row(row).map_err(to_sqlite_anyhow)
+        })
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn relations_for_item(&self, item_id: &str) -> Result<Vec<RelationRecord>> {
         let mut stmt = self.conn.prepare(
             r#"

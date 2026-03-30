@@ -277,6 +277,7 @@ ICE now ships a native `LongMemEval` runner for generating benchmark predictions
 - replays each LongMemEval history into a fresh ICE root
 - preserves the original dataset timestamps during ingest
 - retrieves a bounded continuity pack for the benchmark question
+- can run a question-conditioned reading-notes pass over each retrieved session before the final answer
 - asks a reader model for the final answer
 - writes `jsonl` predictions in the official `{"question_id","hypothesis"}` shape
 
@@ -325,6 +326,7 @@ Useful controls:
 - `--question-type temporal-reasoning,multi-session` to focus on one family
 - `--work-dir /tmp/ice-longmemeval-work` to store per-case replay roots elsewhere
 - `--reader-provider ollama|openai-compatible` to switch the answer generator
+- `--reader-method con-separate|direct` to choose between the default two-stage reader and single-pass answering
 - `--reader-api-key-env OPENAI_API_KEY` to source a bearer token for compatible hosted endpoints
 - `--reader-max-retries 4` and `--reader-retry-backoff-secs 2` to survive transient 429/5xx failures on hosted readers
 
@@ -332,7 +334,7 @@ The command writes:
 
 - the official predictions file you can submit to the evaluator
 - a JSON report next to it
-- a debug directory with one prompt, one response, and one serialized context pack per case
+- a debug directory with one prompt, one response, one serialized context pack, and optional reading notes per case
 
 ### Run the official evaluator
 

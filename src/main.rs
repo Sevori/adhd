@@ -44,8 +44,8 @@ use ice::goose_install::{
 };
 use ice::http::serve;
 use ice::longmemeval::{
-    LongMemEvalEvaluateConfig, LongMemEvalReaderProvider, LongMemEvalRunConfig,
-    evaluate_longmemeval, run_longmemeval,
+    LongMemEvalEvaluateConfig, LongMemEvalReaderMethod, LongMemEvalReaderProvider,
+    LongMemEvalRunConfig, evaluate_longmemeval, run_longmemeval,
 };
 use ice::market_head::{
     MarketHeadChallengeConfig, MarketHeadChallengeManifest, compare_market_head_judge_calibration,
@@ -409,6 +409,8 @@ struct LongMemEvalRunArgs {
     namespace_prefix: String,
     #[arg(long, value_enum, default_value_t = LongMemEvalReaderProviderArg::Ollama)]
     reader_provider: LongMemEvalReaderProviderArg,
+    #[arg(long, value_enum, default_value_t = LongMemEvalReaderMethodArg::ConSeparate)]
+    reader_method: LongMemEvalReaderMethodArg,
     #[arg(long)]
     reader_endpoint: Option<String>,
     #[arg(long, default_value = "qwen2.5:14b")]
@@ -457,11 +459,26 @@ enum LongMemEvalReaderProviderArg {
     OpenaiCompatible,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LongMemEvalReaderMethodArg {
+    Direct,
+    ConSeparate,
+}
+
 impl From<LongMemEvalReaderProviderArg> for LongMemEvalReaderProvider {
     fn from(value: LongMemEvalReaderProviderArg) -> Self {
         match value {
             LongMemEvalReaderProviderArg::Ollama => Self::Ollama,
             LongMemEvalReaderProviderArg::OpenaiCompatible => Self::OpenAiCompatible,
+        }
+    }
+}
+
+impl From<LongMemEvalReaderMethodArg> for LongMemEvalReaderMethod {
+    fn from(value: LongMemEvalReaderMethodArg) -> Self {
+        match value {
+            LongMemEvalReaderMethodArg::Direct => Self::Direct,
+            LongMemEvalReaderMethodArg::ConSeparate => Self::ConSeparate,
         }
     }
 }
@@ -1313,6 +1330,7 @@ fn main() -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| root.join("longmemeval").join("work"));
                 let reader_provider: LongMemEvalReaderProvider = args.reader_provider.into();
+                let reader_method: LongMemEvalReaderMethod = args.reader_method.into();
                 let reader_endpoint = args.reader_endpoint.clone().unwrap_or_else(|| {
                     default_longmemeval_reader_endpoint(args.reader_provider).to_string()
                 });
@@ -1322,6 +1340,7 @@ fn main() -> Result<()> {
                     work_dir,
                     namespace_prefix: args.namespace_prefix,
                     reader_provider,
+                    reader_method,
                     reader_endpoint,
                     reader_model: args.reader_model,
                     reader_api_key_env: args.reader_api_key_env.or_else(|| {
