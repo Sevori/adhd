@@ -1543,6 +1543,15 @@ fn main() -> Result<()> {
                     title: args.title,
                     result: args.result.clone(),
                     quality: args.quality.clamp(0.0, 1.0),
+                    pack_id: Some(context.pack.id.clone()),
+                    used_memory_ids: context
+                        .pack
+                        .items
+                        .iter()
+                        .map(|item| item.memory_id.clone())
+                        .collect(),
+                    confirmed_memory_ids: Vec::new(),
+                    contradicted_memory_ids: Vec::new(),
                     failures: args.failures.clone(),
                     dimensions: Vec::new(),
                     extra: serde_json::json!({

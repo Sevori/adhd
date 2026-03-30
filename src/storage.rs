@@ -18,14 +18,15 @@ use crate::config::{EngineConfig, EnginePaths};
 use crate::continuity::{
     AgentAttachmentRecord, AgentBadgeRecord, AttachAgentInput, ClaimWorkInput, ContextRecord,
     ContextStatus, ContinuityCompiledChunkRecord, ContinuityCompilerStateRecord,
-    ContinuityItemInput, ContinuityItemRecord, ContinuityKind, ContinuityRecall,
-    ContinuityRecallCompiler, ContinuityRecallItem, ContinuityRetentionState, ContinuityStatus,
-    CoordinationLane, CoordinationSeverity, DEFAULT_MACHINE_TASK_ID, HeartbeatInput,
-    LaneProjectionRecord, MACHINE_NAMESPACE_ALIAS, MachineProfile, OpenContextInput,
-    ResolveOrSupersedeInput, SnapshotManifest, SnapshotRecord, SupportRef, UpsertAgentBadgeInput,
-    WorkClaimConflict, WorkClaimCoordination, coordination_signal,
-    default_work_claim_lease_seconds, merge_work_claim_extra, normalize_work_claim_resources,
-    work_claim_coordination, work_claim_is_live, work_claim_key, work_claims_conflict,
+    ContinuityItemInput, ContinuityItemRecord, ContinuityKind, ContinuityPlasticityState,
+    ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem, ContinuityRetentionState,
+    ContinuityStatus, CoordinationLane, CoordinationSeverity, DEFAULT_MACHINE_TASK_ID,
+    HeartbeatInput, LaneProjectionRecord, MACHINE_NAMESPACE_ALIAS, MachineProfile,
+    OpenContextInput, OutcomeInput, ResolveOrSupersedeInput, SnapshotManifest, SnapshotRecord,
+    SupportRef, UpsertAgentBadgeInput, WorkClaimConflict, WorkClaimCoordination,
+    coordination_signal, default_work_claim_lease_seconds, merge_work_claim_extra,
+    normalize_work_claim_resources, work_claim_coordination, work_claim_is_live, work_claim_key,
+    work_claims_conflict,
 };
 use crate::embedding::{EmbeddingRuntime, l2_norm};
 use crate::model::{
@@ -421,6 +422,27 @@ impl Storage {
               PRIMARY KEY(pack_id, memory_id)
             );
 
+            CREATE TABLE IF NOT EXISTS continuity_plasticity (
+              continuity_id TEXT PRIMARY KEY,
+              belief_key TEXT,
+              source_role TEXT,
+              activation_count INTEGER NOT NULL,
+              successful_use_count INTEGER NOT NULL,
+              confirmation_count INTEGER NOT NULL,
+              contradiction_count INTEGER NOT NULL,
+              independent_source_count INTEGER NOT NULL,
+              last_reactivated_at TEXT,
+              last_confirmed_at TEXT,
+              last_contradicted_at TEXT,
+              stability_score REAL NOT NULL,
+              prediction_error REAL NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_continuity_plasticity_belief_key
+              ON continuity_plasticity(belief_key);
+
             CREATE TABLE IF NOT EXISTS item_dimensions (
               item_id TEXT NOT NULL,
               item_type TEXT NOT NULL,
@@ -609,7 +631,7 @@ impl Storage {
               support_id TEXT NOT NULL,
               reason TEXT,
               weight REAL NOT NULL,
-              PRIMARY KEY(continuity_id, support_type, support_id)
+              PRIMARY KEY(continuity_id, support_type, support_id, reason)
             );
 
             CREATE INDEX IF NOT EXISTS idx_continuity_support_continuity
@@ -672,6 +694,50 @@ impl Storage {
             "tick_count",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        self.ensure_continuity_support_reason_identity()?;
+        Ok(())
+    }
+
+    fn ensure_continuity_support_reason_identity(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(continuity_support)")?;
+        let mut rows = stmt.query([])?;
+        let mut has_reason_in_primary_key = false;
+        while let Some(row) = rows.next()? {
+            let column_name = row.get::<_, String>(1)?;
+            let pk_ordinal = row.get::<_, i64>(5)?;
+            if column_name == "reason" && pk_ordinal > 0 {
+                has_reason_in_primary_key = true;
+                break;
+            }
+        }
+        if has_reason_in_primary_key {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            r#"
+            ALTER TABLE continuity_support RENAME TO continuity_support_legacy;
+
+            CREATE TABLE continuity_support (
+              continuity_id TEXT NOT NULL,
+              support_type TEXT NOT NULL,
+              support_id TEXT NOT NULL,
+              reason TEXT,
+              weight REAL NOT NULL,
+              PRIMARY KEY(continuity_id, support_type, support_id, reason)
+            );
+
+            INSERT INTO continuity_support(continuity_id, support_type, support_id, reason, weight)
+            SELECT continuity_id, support_type, support_id, reason, weight
+            FROM continuity_support_legacy;
+
+            DROP TABLE continuity_support_legacy;
+
+            CREATE INDEX IF NOT EXISTS idx_continuity_support_continuity
+              ON continuity_support(continuity_id, weight DESC);
+            "#,
+        )?;
+
         Ok(())
     }
 
@@ -1379,6 +1445,426 @@ impl Storage {
             "persisted bounded context pack"
         );
         Ok(())
+    }
+
+    fn selected_memory_ids_for_pack(&self, pack_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT memory_id
+            FROM context_pack_items
+            WHERE pack_id = ?1 AND included = 1
+            ORDER BY rank ASC, final_score DESC, memory_id ASC
+            "#,
+        )?;
+        let mut rows = stmt.query(params![pack_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
+    fn continuity_ids_for_memory_ids(
+        &self,
+        memory_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        if memory_ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in memory_ids.chunks(200) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"
+                SELECT memory_id, id
+                FROM continuity_items
+                WHERE memory_id IN ({placeholders})
+                "#
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(
+                chunk.iter().map(|id| id.as_str()),
+            ))?;
+            while let Some(row) = rows.next()? {
+                out.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn plasticity_for_continuity_many(
+        &self,
+        continuity_ids: &[String],
+    ) -> Result<HashMap<String, StoredContinuityPlasticity>> {
+        let mut out = HashMap::new();
+        if continuity_ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in continuity_ids.chunks(200) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"
+                SELECT continuity_id, belief_key, source_role, activation_count, successful_use_count,
+                       confirmation_count, contradiction_count, independent_source_count,
+                       stability_score, prediction_error, last_reactivated_at, last_confirmed_at,
+                       last_contradicted_at
+                FROM continuity_plasticity
+                WHERE continuity_id IN ({placeholders})
+                "#
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(
+                chunk.iter().map(|id| id.as_str()),
+            ))?;
+            while let Some(row) = rows.next()? {
+                let last_reactivated_at = row
+                    .get::<_, Option<String>>(10)?
+                    .map(|value| DateTime::parse_from_rfc3339(&value))
+                    .transpose()?
+                    .map(|ts| ts.with_timezone(&Utc));
+                let last_confirmed_at = row
+                    .get::<_, Option<String>>(11)?
+                    .map(|value| DateTime::parse_from_rfc3339(&value))
+                    .transpose()?
+                    .map(|ts| ts.with_timezone(&Utc));
+                let last_contradicted_at = row
+                    .get::<_, Option<String>>(12)?
+                    .map(|value| DateTime::parse_from_rfc3339(&value))
+                    .transpose()?
+                    .map(|ts| ts.with_timezone(&Utc));
+                out.insert(
+                    row.get::<_, String>(0)?,
+                    StoredContinuityPlasticity {
+                        belief_key: row.get(1)?,
+                        source_role: row.get(2)?,
+                        state: ContinuityPlasticityState {
+                            activation_count: row.get::<_, i64>(3)? as usize,
+                            successful_use_count: row.get::<_, i64>(4)? as usize,
+                            confirmation_count: row.get::<_, i64>(5)? as usize,
+                            contradiction_count: row.get::<_, i64>(6)? as usize,
+                            independent_source_count: row.get::<_, i64>(7)? as usize,
+                            stability_score: row.get(8)?,
+                            prediction_error: row.get(9)?,
+                            last_reactivated_at,
+                            last_confirmed_at,
+                            last_contradicted_at,
+                        },
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    fn sync_belief_cluster_independent_sources(
+        &self,
+        belief_key: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT source_role
+            FROM continuity_plasticity
+            WHERE belief_key = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![belief_key])?;
+        let mut explicit_roles = BTreeSet::new();
+        let mut row_count = 0usize;
+        while let Some(row) = rows.next()? {
+            row_count += 1;
+            if let Some(role) = row.get::<_, Option<String>>(0)? {
+                let trimmed = role.trim();
+                if !trimmed.is_empty() {
+                    explicit_roles.insert(trimmed.to_string());
+                }
+            }
+        }
+        let independent_source_count = if explicit_roles.is_empty() {
+            row_count.max(1)
+        } else {
+            explicit_roles.len()
+        };
+        self.conn.execute(
+            r#"
+            UPDATE continuity_plasticity
+            SET independent_source_count = ?2,
+                updated_at = ?3
+            WHERE belief_key = ?1
+            "#,
+            params![
+                belief_key,
+                independent_source_count as i64,
+                updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_continuity_plasticity(
+        &self,
+        continuity_id: &str,
+        extra: &serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> Result<StoredContinuityPlasticity> {
+        let belief_key = continuity_belief_key(extra);
+        let source_role = continuity_source_role(extra);
+        self.conn.execute(
+            r#"
+            INSERT OR IGNORE INTO continuity_plasticity(
+              continuity_id, belief_key, source_role, activation_count, successful_use_count,
+              confirmation_count, contradiction_count, independent_source_count, stability_score,
+              prediction_error, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, 0, 0, 0, 0, 1, 0.0, 0.0, ?4, ?4)
+            "#,
+            params![
+                continuity_id,
+                belief_key,
+                source_role,
+                updated_at.to_rfc3339(),
+            ],
+        )?;
+        self.conn.execute(
+            r#"
+            UPDATE continuity_plasticity
+            SET belief_key = COALESCE(?2, belief_key),
+                source_role = COALESCE(?3, source_role),
+                updated_at = ?4
+            WHERE continuity_id = ?1
+            "#,
+            params![
+                continuity_id,
+                belief_key,
+                source_role,
+                updated_at.to_rfc3339(),
+            ],
+        )?;
+        if let Some(belief_key) = continuity_belief_key(extra) {
+            self.sync_belief_cluster_independent_sources(&belief_key, updated_at)?;
+        }
+        Ok(self
+            .plasticity_for_continuity_many(&[continuity_id.to_string()])?
+            .remove(continuity_id)
+            .unwrap_or_default())
+    }
+
+    fn bump_continuity_plasticity(
+        &self,
+        continuity_id: &str,
+        updated_at: DateTime<Utc>,
+        activated: bool,
+        successful: bool,
+        confirmed: bool,
+        contradicted: bool,
+    ) -> Result<()> {
+        let current = self
+            .plasticity_for_continuity_many(&[continuity_id.to_string()])?
+            .remove(continuity_id)
+            .unwrap_or_default();
+        let mut state = current.state;
+        if activated {
+            state.activation_count += 1;
+            state.last_reactivated_at = Some(updated_at);
+        }
+        if successful {
+            state.successful_use_count += 1;
+        }
+        if confirmed {
+            state.confirmation_count += 1;
+            state.last_confirmed_at = Some(updated_at);
+        }
+        if contradicted {
+            state.contradiction_count += 1;
+            state.last_contradicted_at = Some(updated_at);
+        }
+        state.prediction_error = if state.confirmation_count + state.contradiction_count == 0 {
+            0.0
+        } else {
+            state.contradiction_count as f64
+                / (state.confirmation_count + state.contradiction_count) as f64
+        };
+        state.stability_score = (state.activation_count as f64 + 1.0).ln()
+            + 1.2 * (state.successful_use_count as f64 + 1.0).ln()
+            + 1.4 * (state.confirmation_count as f64 + 1.0).ln()
+            + 0.6 * (state.independent_source_count as f64 + 1.0).ln()
+            - 1.8 * state.contradiction_count as f64;
+        self.conn.execute(
+            r#"
+            INSERT INTO continuity_plasticity(
+              continuity_id, belief_key, source_role, activation_count, successful_use_count,
+              confirmation_count, contradiction_count, independent_source_count, stability_score,
+              prediction_error, last_reactivated_at, last_confirmed_at, last_contradicted_at,
+              created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+            ON CONFLICT(continuity_id) DO UPDATE SET
+              activation_count = excluded.activation_count,
+              successful_use_count = excluded.successful_use_count,
+              confirmation_count = excluded.confirmation_count,
+              contradiction_count = excluded.contradiction_count,
+              independent_source_count = excluded.independent_source_count,
+              stability_score = excluded.stability_score,
+              prediction_error = excluded.prediction_error,
+              last_reactivated_at = excluded.last_reactivated_at,
+              last_confirmed_at = excluded.last_confirmed_at,
+              last_contradicted_at = excluded.last_contradicted_at,
+              updated_at = excluded.updated_at
+            "#,
+            params![
+                continuity_id,
+                current.belief_key,
+                current.source_role,
+                state.activation_count as i64,
+                state.successful_use_count as i64,
+                state.confirmation_count as i64,
+                state.contradiction_count as i64,
+                state.independent_source_count as i64,
+                state.stability_score,
+                state.prediction_error,
+                state
+                    .last_reactivated_at
+                    .map(|ts: DateTime<Utc>| ts.to_rfc3339()),
+                state
+                    .last_confirmed_at
+                    .map(|ts: DateTime<Utc>| ts.to_rfc3339()),
+                state
+                    .last_contradicted_at
+                    .map(|ts: DateTime<Utc>| ts.to_rfc3339()),
+                updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_outcome(&self, input: OutcomeInput) -> Result<ContinuityItemRecord> {
+        let outcome_ts = Utc::now();
+        let mut activated_memory_ids = BTreeSet::<String>::new();
+        if let Some(pack_id) = &input.pack_id {
+            activated_memory_ids.extend(self.selected_memory_ids_for_pack(pack_id)?);
+        }
+        activated_memory_ids.extend(input.used_memory_ids.iter().cloned());
+        activated_memory_ids.extend(input.confirmed_memory_ids.iter().cloned());
+        activated_memory_ids.extend(input.contradicted_memory_ids.iter().cloned());
+
+        let continuity_by_memory = self.continuity_ids_for_memory_ids(
+            &activated_memory_ids.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let used_set = input
+            .used_memory_ids
+            .iter()
+            .filter_map(|memory_id| continuity_by_memory.get(memory_id).cloned())
+            .collect::<BTreeSet<_>>();
+        let confirmed_set = input
+            .confirmed_memory_ids
+            .iter()
+            .filter_map(|memory_id| continuity_by_memory.get(memory_id).cloned())
+            .collect::<BTreeSet<_>>();
+        let contradicted_set = input
+            .contradicted_memory_ids
+            .iter()
+            .filter_map(|memory_id| continuity_by_memory.get(memory_id).cloned())
+            .collect::<BTreeSet<_>>();
+        let activated_set = activated_memory_ids
+            .iter()
+            .filter_map(|memory_id| continuity_by_memory.get(memory_id).cloned())
+            .collect::<BTreeSet<_>>();
+
+        for continuity_id in &activated_set {
+            self.bump_continuity_plasticity(
+                continuity_id,
+                outcome_ts,
+                true,
+                input.quality >= 0.65 && used_set.contains(continuity_id),
+                confirmed_set.contains(continuity_id),
+                contradicted_set.contains(continuity_id),
+            )?;
+        }
+
+        let mut support_refs = Vec::<SupportRef>::new();
+        for memory_id in &input.used_memory_ids {
+            if let Some(continuity_id) = continuity_by_memory.get(memory_id) {
+                support_refs.push(SupportRef {
+                    support_type: "continuity".to_string(),
+                    support_id: continuity_id.clone(),
+                    reason: Some("outcome_used".to_string()),
+                    weight: 1.0,
+                });
+            } else {
+                support_refs.push(SupportRef {
+                    support_type: "memory".to_string(),
+                    support_id: memory_id.clone(),
+                    reason: Some("outcome_used".to_string()),
+                    weight: 1.0,
+                });
+            }
+        }
+        for memory_id in &input.confirmed_memory_ids {
+            if let Some(continuity_id) = continuity_by_memory.get(memory_id) {
+                support_refs.push(SupportRef {
+                    support_type: "continuity".to_string(),
+                    support_id: continuity_id.clone(),
+                    reason: Some("outcome_confirmed".to_string()),
+                    weight: 1.2,
+                });
+            }
+        }
+        for memory_id in &input.contradicted_memory_ids {
+            if let Some(continuity_id) = continuity_by_memory.get(memory_id) {
+                support_refs.push(SupportRef {
+                    support_type: "continuity".to_string(),
+                    support_id: continuity_id.clone(),
+                    reason: Some("outcome_contradicted".to_string()),
+                    weight: 1.2,
+                });
+            }
+        }
+        support_refs.sort_by(|a, b| {
+            a.support_type
+                .cmp(&b.support_type)
+                .then_with(|| a.support_id.cmp(&b.support_id))
+                .then_with(|| a.reason.cmp(&b.reason))
+        });
+        support_refs.dedup_by(|left, right| {
+            left.support_type == right.support_type
+                && left.support_id == right.support_id
+                && left.reason == right.reason
+        });
+
+        let mut dimensions = input.dimensions;
+        dimensions.push(DimensionValue {
+            key: "outcome_quality".to_string(),
+            value: format!("{:.2}", input.quality),
+            weight: 100,
+        });
+
+        self.persist_continuity_item(ContinuityItemInput {
+            context_id: input.context_id,
+            author_agent_id: input.agent_id,
+            kind: ContinuityKind::Outcome,
+            title: input.title,
+            body: input.result,
+            scope: Scope::Project,
+            status: Some(ContinuityStatus::Resolved),
+            importance: Some(input.quality.clamp(0.0, 1.0)),
+            confidence: Some(0.9),
+            salience: Some(input.quality.clamp(0.0, 1.0)),
+            layer: Some(MemoryLayer::Episodic),
+            supports: support_refs,
+            dimensions,
+            extra: serde_json::json!({
+                "pack_id": input.pack_id,
+                "used_memory_ids": input.used_memory_ids,
+                "confirmed_memory_ids": input.confirmed_memory_ids,
+                "contradicted_memory_ids": input.contradicted_memory_ids,
+                "failures": input.failures,
+                "extra": input.extra,
+            }),
+        })
     }
 
     pub fn explain_context_pack(&self, id: &str) -> Result<ContextPackManifest> {
@@ -2391,6 +2877,7 @@ impl Storage {
             Some(context.namespace.as_str()),
             Some(context.id.as_str()),
         )?;
+        self.ensure_continuity_plasticity(&id, &extra_json, created_at)?;
         self.mark_continuity_context_dirty(&context.id)?;
         let record = self
             .list_continuity_items(&context.id, true)?
@@ -2527,6 +3014,9 @@ impl Storage {
             raw.push(read_continuity_row(row)?);
         }
         let now = Utc::now();
+        let plasticity_map = self.plasticity_for_continuity_many(
+            &raw.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+        )?;
         let support_map = self.supports_for_continuity_many(
             &raw.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
         )?;
@@ -2537,6 +3027,7 @@ impl Storage {
                 build_continuity_record(
                     item,
                     support_map.get(&item_id).cloned().unwrap_or_default(),
+                    plasticity_map.get(&item_id).cloned(),
                     now,
                 )
             })
@@ -2817,12 +3308,16 @@ impl Storage {
         let support_map = self.supports_for_continuity_many(
             &raw.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
         )?;
+        let plasticity_map = self.plasticity_for_continuity_many(
+            &raw.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+        )?;
         raw.into_iter()
             .map(|item| {
                 let item_id = item.id.clone();
                 build_continuity_record(
                     item,
                     support_map.get(&item_id).cloned().unwrap_or_default(),
+                    plasticity_map.get(&item_id).cloned(),
                     Utc::now(),
                 )
             })
@@ -2893,6 +3388,7 @@ impl Storage {
         }
 
         let support_map = self.supports_for_continuity_many(&support_ids)?;
+        let plasticity_map = self.plasticity_for_continuity_many(&support_ids)?;
         let support_rows = self
             .raw_continuity_rows_by_ids(&support_ids)?
             .into_iter()
@@ -2901,6 +3397,7 @@ impl Storage {
                 build_continuity_record(
                     row,
                     support_map.get(&item_id).cloned().unwrap_or_default(),
+                    plasticity_map.get(&item_id).cloned(),
                     now,
                 )
             })
@@ -3075,6 +3572,8 @@ impl Storage {
 
         let support_map =
             self.supports_for_continuity_many(&seeds.keys().cloned().collect::<Vec<_>>())?;
+        let plasticity_map =
+            self.plasticity_for_continuity_many(&seeds.keys().cloned().collect::<Vec<_>>())?;
         let seed_ids = seeds.keys().cloned().collect::<HashSet<_>>();
         let (anchor_support_scores, support_backlink_scores) =
             continuity_recall_support_scores(&support_map, &seed_ids);
@@ -3098,6 +3597,7 @@ impl Storage {
                 let item = build_continuity_record(
                     raw,
                     support_map.get(&raw_id).cloned().unwrap_or_default(),
+                    plasticity_map.get(&raw_id).cloned(),
                     now,
                 )?;
                 let lexical_score = rank_score(seed.lexical_rank, lexical_len);
@@ -3122,7 +3622,10 @@ impl Storage {
                     + support_backlink_scores
                         .get(&item.id)
                         .copied()
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                    + plasticity_recall_adjustment(
+                        plasticity_map.get(&item.id).map(|value| &value.state),
+                    );
                 let mut why = Vec::new();
                 if seed.lexical_rank.is_some() {
                     why.push("lexical".to_string());
@@ -3317,6 +3820,39 @@ impl Storage {
                 weight: 1.0,
                 attributes: serde_json::json!({}),
             })?;
+            if let Some(target_extra_json) = self
+                .conn
+                .query_row(
+                    "SELECT extra_json FROM continuity_items WHERE id = ?1",
+                    params![supersedes_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                let target_extra = serde_json::from_str::<serde_json::Value>(&target_extra_json)?;
+                if continuity_belief_key(&extra).is_some()
+                    && continuity_belief_key(&extra) == continuity_belief_key(&target_extra)
+                {
+                    self.ensure_continuity_plasticity(&input.continuity_id, &extra, updated_at)?;
+                    self.ensure_continuity_plasticity(supersedes_id, &target_extra, updated_at)?;
+                    self.bump_continuity_plasticity(
+                        &input.continuity_id,
+                        updated_at,
+                        false,
+                        false,
+                        false,
+                        true,
+                    )?;
+                    self.bump_continuity_plasticity(
+                        supersedes_id,
+                        updated_at,
+                        true,
+                        false,
+                        true,
+                        false,
+                    )?;
+                }
+            }
         }
         self.mark_continuity_context_dirty(&existing_context.0)?;
         self.list_continuity_items(&existing_context.0, true)?
@@ -6294,7 +6830,7 @@ impl Storage {
                 SELECT continuity_id, support_type, support_id, reason, weight
                 FROM continuity_support
                 WHERE continuity_id IN ({placeholders})
-                ORDER BY continuity_id ASC, weight DESC, support_type ASC, support_id ASC
+                ORDER BY continuity_id ASC, weight DESC, support_type ASC, support_id ASC, reason ASC
                 "#
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -6510,6 +7046,29 @@ fn parse_continuity_status(value: &str) -> Result<ContinuityStatus> {
     })
 }
 
+fn continuity_metadata_str(extra: &serde_json::Value, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            extra
+                .get("user")
+                .and_then(|user| user.get(key))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn continuity_belief_key(extra: &serde_json::Value) -> Option<String> {
+    continuity_metadata_str(extra, "belief_key")
+}
+
+fn continuity_source_role(extra: &serde_json::Value) -> Option<String> {
+    continuity_metadata_str(extra, "source_role")
+}
+
 fn continuity_dimensions(
     context: &ContextRecord,
     input: &ContinuityItemInput,
@@ -6552,6 +7111,20 @@ fn continuity_dimensions(
             key: "scar".to_string(),
             value: "true".to_string(),
             weight: 100,
+        });
+    }
+    if let Some(belief_key) = continuity_belief_key(&input.extra) {
+        dimensions.push(DimensionValue {
+            key: "belief_key".to_string(),
+            value: belief_key,
+            weight: 100,
+        });
+    }
+    if let Some(source_role) = continuity_source_role(&input.extra) {
+        dimensions.push(DimensionValue {
+            key: "source_role".to_string(),
+            value: source_role,
+            weight: 90,
         });
     }
     dimensions.extend(input.dimensions.clone());
@@ -6754,16 +7327,19 @@ fn recency_score(now: chrono::DateTime<Utc>, ts: chrono::DateTime<Utc>) -> f64 {
     1.0 / (1.0 + age_hours / 6.0)
 }
 
-fn continuity_retention_state(
+struct ContinuityRetentionInput<'a> {
     kind: ContinuityKind,
     status: ContinuityStatus,
     salience: f64,
     importance: f64,
     confidence: f64,
     updated_at: chrono::DateTime<Utc>,
+    plasticity: Option<&'a ContinuityPlasticityState>,
     now: chrono::DateTime<Utc>,
-) -> ContinuityRetentionState {
-    let (base_class, base_half_life_hours, base_floor) = match kind {
+}
+
+fn continuity_retention_state(input: ContinuityRetentionInput<'_>) -> ContinuityRetentionState {
+    let (base_class, base_half_life_hours, base_floor) = match input.kind {
         ContinuityKind::WorkingState => ("working", 18.0, 0.02),
         ContinuityKind::WorkClaim => ("work_claim", 8.0, 0.02),
         ContinuityKind::Signal => ("signal", 12.0, 0.01),
@@ -6778,18 +7354,21 @@ fn continuity_retention_state(
         ContinuityKind::Incident => ("incident", 432.0, 0.20),
         ContinuityKind::OperationalScar => ("operational_scar", 720.0, 0.36),
     };
-    let importance_boost = 0.8 + importance.clamp(0.0, 1.0) * 0.8;
-    let confidence_boost = 0.8 + confidence.clamp(0.0, 1.0) * 0.4;
+    let importance_boost = 0.8 + input.importance.clamp(0.0, 1.0) * 0.8;
+    let confidence_boost = 0.8 + input.confidence.clamp(0.0, 1.0) * 0.4;
     let mut half_life_hours = base_half_life_hours * importance_boost * confidence_boost;
     let mut floor = base_floor;
-    let class = if status.is_open() {
+    let class = if input.status.is_open() {
         if matches!(
-            kind,
+            input.kind,
             ContinuityKind::OperationalScar | ContinuityKind::Incident
         ) {
             half_life_hours *= 1.15;
         }
-        if matches!(kind, ContinuityKind::Constraint | ContinuityKind::Decision) {
+        if matches!(
+            input.kind,
+            ContinuityKind::Constraint | ContinuityKind::Decision
+        ) {
             half_life_hours *= 1.05;
         }
         base_class.to_string()
@@ -6798,9 +7377,41 @@ fn continuity_retention_state(
         floor *= 0.2;
         format!("treated_{base_class}")
     };
-    let age_hours = (now - updated_at).num_seconds().max(0) as f64 / 3600.0;
+    if let Some(plasticity) = input.plasticity {
+        let reinforcement = 0.06 * (plasticity.activation_count as f64 + 1.0).ln()
+            + 0.12 * (plasticity.successful_use_count as f64 + 1.0).ln()
+            + 0.16 * (plasticity.confirmation_count as f64 + 1.0).ln()
+            + 0.05 * (plasticity.independent_source_count as f64 + 1.0).ln();
+        let contradiction_penalty = 0.22 * plasticity.contradiction_count as f64;
+        let half_life_multiplier =
+            (1.0_f64 + reinforcement - contradiction_penalty).clamp(0.35_f64, 3.5_f64);
+        half_life_hours *= half_life_multiplier;
+        if plasticity.prediction_error > 0.5 {
+            floor *= (1.0_f64 - (plasticity.prediction_error - 0.5_f64).min(0.4_f64))
+                .clamp(0.5_f64, 1.0_f64);
+        } else if plasticity.confirmation_count > 0 {
+            floor = (floor
+                + 0.02_f64 * (plasticity.confirmation_count as f64 + 1.0_f64).ln()
+                + 0.01_f64 * (plasticity.successful_use_count as f64 + 1.0_f64).ln())
+            .min(0.95_f64);
+        }
+    }
+    let age_hours = (input.now - input.updated_at).num_seconds().max(0) as f64 / 3600.0;
     let decay_multiplier = 0.5_f64.powf(age_hours / half_life_hours.max(1.0));
-    let effective_salience = salience.clamp(0.0, 1.0).mul_add(decay_multiplier, 0.0);
+    let plasticity_salience_bonus = input
+        .plasticity
+        .map(|plasticity| {
+            (0.03 * (plasticity.successful_use_count as f64 + 1.0).ln()
+                + 0.05 * (plasticity.confirmation_count as f64 + 1.0).ln()
+                - 0.12 * plasticity.prediction_error
+                - 0.04 * plasticity.contradiction_count as f64)
+                .clamp(-0.35_f64, 0.25_f64)
+        })
+        .unwrap_or(0.0);
+    let effective_salience = input
+        .salience
+        .clamp(0.0, 1.0)
+        .mul_add(decay_multiplier, plasticity_salience_bonus);
     ContinuityRetentionState {
         class,
         age_hours,
@@ -6919,6 +7530,13 @@ struct CompiledContinuityChunk {
     item_count: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StoredContinuityPlasticity {
+    belief_key: Option<String>,
+    source_role: Option<String>,
+    state: ContinuityPlasticityState,
+}
+
 fn read_continuity_row(row: &rusqlite::Row<'_>) -> Result<RawContinuityRow> {
     Ok(RawContinuityRow {
         id: row.get(0)?,
@@ -6950,17 +7568,29 @@ fn read_continuity_row(row: &rusqlite::Row<'_>) -> Result<RawContinuityRow> {
 fn build_continuity_record(
     raw: RawContinuityRow,
     supports: Vec<SupportRef>,
+    plasticity: Option<StoredContinuityPlasticity>,
     now: DateTime<Utc>,
 ) -> Result<ContinuityItemRecord> {
-    let retention = continuity_retention_state(
-        raw.kind,
-        raw.status,
-        raw.salience,
-        raw.importance,
-        raw.confidence,
-        raw.updated_at,
+    let mut extra = raw.extra;
+    if let Some(ref plasticity) = plasticity {
+        extra["plasticity"] = serde_json::to_value(&plasticity.state)?;
+        if let Some(belief_key) = &plasticity.belief_key {
+            extra["belief_key"] = serde_json::json!(belief_key);
+        }
+        if let Some(source_role) = &plasticity.source_role {
+            extra["source_role"] = serde_json::json!(source_role);
+        }
+    }
+    let retention = continuity_retention_state(ContinuityRetentionInput {
+        kind: raw.kind,
+        status: raw.status,
+        salience: raw.salience,
+        importance: raw.importance,
+        confidence: raw.confidence,
+        updated_at: raw.updated_at,
+        plasticity: plasticity.as_ref().map(|value| &value.state),
         now,
-    );
+    });
     Ok(ContinuityItemRecord {
         id: raw.id,
         memory_id: raw.memory_id,
@@ -6982,7 +7612,7 @@ fn build_continuity_record(
         supersedes_id: raw.supersedes_id,
         resolved_at: raw.resolved_at,
         supports,
-        extra: raw.extra,
+        extra,
     })
 }
 
@@ -7029,6 +7659,19 @@ fn continuity_retention_adjustment(item: &ContinuityItemRecord) -> f64 {
         score -= 0.12;
     }
     score
+}
+
+fn plasticity_recall_adjustment(plasticity: Option<&ContinuityPlasticityState>) -> f64 {
+    plasticity
+        .map(|plasticity| {
+            (0.04 * (plasticity.activation_count as f64 + 1.0).ln()
+                + 0.08 * (plasticity.successful_use_count as f64 + 1.0).ln()
+                + 0.12 * (plasticity.confirmation_count as f64 + 1.0).ln()
+                - 0.18 * plasticity.prediction_error
+                - 0.05 * plasticity.contradiction_count as f64)
+                .clamp(-0.45_f64, 0.35_f64)
+        })
+        .unwrap_or(0.0)
 }
 
 fn rank_score(rank: Option<usize>, len: usize) -> f64 {
@@ -7654,7 +8297,7 @@ mod tests {
         merge_coordination_signal_extra,
     };
     use crate::embedding::EmbeddingBackendConfig;
-    use crate::model::{EventInput, EventKind, Scope};
+    use crate::model::{EventInput, EventKind, QueryInput, Scope};
     use crate::telemetry::EngineTelemetry;
 
     #[test]
@@ -9612,5 +10255,276 @@ mod tests {
         let memories = storage.vector_memories().unwrap();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].0.id, "memory:active");
+    }
+
+    #[test]
+    fn record_outcome_reinforces_confirmed_continuity_items() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-plasticity-confirm".into(),
+                session_id: "session-confirm".into(),
+                objective: "track reinforced continuity".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let decision = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Use Neovim".into(),
+                body: "The user prefers Neovim for repo work.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.75),
+                confidence: Some(0.8),
+                salience: Some(0.75),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.preference.editor",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+        let before = storage
+            .list_continuity_items(&context.id, true)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == decision.id)
+            .unwrap();
+        let pack = crate::query::build_context_pack(
+            &storage,
+            QueryInput {
+                agent_id: Some("agent-a".into()),
+                session_id: Some(context.session_id.clone()),
+                task_id: Some(context.task_id.clone()),
+                namespace: Some(context.namespace.clone()),
+                objective: Some("resume editor preference".into()),
+                selector: None,
+                view_id: None,
+                query_text: "editor preference".into(),
+                budget_tokens: 192,
+                candidate_limit: 8,
+            },
+        )
+        .unwrap();
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == decision.memory_id)
+        );
+
+        let outcome = storage
+            .record_outcome(OutcomeInput {
+                context_id: context.id.clone(),
+                agent_id: "agent-a".into(),
+                title: "Applied editor preference".into(),
+                result: "Neovim was used successfully.".into(),
+                quality: 0.95,
+                pack_id: Some(pack.id),
+                used_memory_ids: vec![decision.memory_id.clone()],
+                confirmed_memory_ids: vec![decision.memory_id.clone()],
+                contradicted_memory_ids: Vec::new(),
+                failures: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        assert!(outcome.supports.iter().any(|support| {
+            support.support_type == "continuity"
+                && support.support_id == decision.id
+                && support.reason.as_deref() == Some("outcome_confirmed")
+        }));
+
+        let after = storage
+            .list_continuity_items(&context.id, true)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == decision.id)
+            .unwrap();
+        let plasticity = after.extra.get("plasticity").unwrap();
+        assert_eq!(plasticity["activation_count"], serde_json::json!(1));
+        assert_eq!(plasticity["successful_use_count"], serde_json::json!(1));
+        assert_eq!(plasticity["confirmation_count"], serde_json::json!(1));
+        assert_eq!(plasticity["contradiction_count"], serde_json::json!(0));
+        assert!(
+            after.retention.effective_salience > before.retention.effective_salience,
+            "expected confirmed continuity to gain effective salience"
+        );
+    }
+
+    #[test]
+    fn record_outcome_penalizes_contradicted_continuity_items() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-plasticity-contradict".into(),
+                session_id: "session-contradict".into(),
+                objective: "track contradicted continuity".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let fact = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in London".into(),
+                body: "Alice currently lives in London.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.8),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+        let before = storage
+            .list_continuity_items(&context.id, true)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == fact.id)
+            .unwrap();
+
+        let outcome = storage
+            .record_outcome(OutcomeInput {
+                context_id: context.id.clone(),
+                agent_id: "agent-a".into(),
+                title: "Location update invalidated".into(),
+                result: "The prior location memory was wrong.".into(),
+                quality: 0.2,
+                pack_id: None,
+                used_memory_ids: vec![fact.memory_id.clone()],
+                confirmed_memory_ids: Vec::new(),
+                contradicted_memory_ids: vec![fact.memory_id.clone()],
+                failures: vec!["stale-memory".into()],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        assert!(outcome.supports.iter().any(|support| {
+            support.support_type == "continuity"
+                && support.support_id == fact.id
+                && support.reason.as_deref() == Some("outcome_contradicted")
+        }));
+
+        let after = storage
+            .list_continuity_items(&context.id, true)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == fact.id)
+            .unwrap();
+        let plasticity = after.extra.get("plasticity").unwrap();
+        assert_eq!(plasticity["activation_count"], serde_json::json!(1));
+        assert_eq!(plasticity["successful_use_count"], serde_json::json!(0));
+        assert_eq!(plasticity["confirmation_count"], serde_json::json!(0));
+        assert_eq!(plasticity["contradiction_count"], serde_json::json!(1));
+        assert!(
+            after.retention.effective_salience < before.retention.effective_salience,
+            "expected contradicted continuity to lose effective salience"
+        );
+    }
+
+    #[test]
+    fn resolve_or_supersede_updates_belief_key_plasticity_on_both_items() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-plasticity-supersede".into(),
+                session_id: "session-supersede".into(),
+                objective: "track superseded belief continuity".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in London".into(),
+                body: "Alice currently lives in London.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.8),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+        let replacement = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in Berlin".into(),
+                body: "Alice currently lives in Berlin.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.82),
+                confidence: Some(0.82),
+                salience: Some(0.82),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+
+        storage
+            .resolve_continuity_item(ResolveOrSupersedeInput {
+                continuity_id: stale.id.clone(),
+                actor_agent_id: "agent-a".into(),
+                new_status: ContinuityStatus::Superseded,
+                supersedes_id: Some(replacement.id.clone()),
+                resolution_note: Some("The user moved.".into()),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let items = storage.list_continuity_items(&context.id, true).unwrap();
+        let stale_after = items.iter().find(|item| item.id == stale.id).unwrap();
+        let replacement_after = items.iter().find(|item| item.id == replacement.id).unwrap();
+        assert_eq!(stale_after.status, ContinuityStatus::Superseded);
+        assert_eq!(
+            stale_after.extra["plasticity"]["contradiction_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            replacement_after.extra["plasticity"]["confirmation_count"],
+            serde_json::json!(1)
+        );
     }
 }

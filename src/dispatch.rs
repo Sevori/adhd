@@ -1580,6 +1580,15 @@ pub async fn dispatch_complete(
         title: input.title.clone(),
         result: input.result.clone(),
         quality: input.quality,
+        pack_id: Some(context.pack.id.clone()),
+        used_memory_ids: context
+            .pack
+            .items
+            .iter()
+            .map(|item| item.memory_id.clone())
+            .collect(),
+        confirmed_memory_ids: Vec::new(),
+        contradicted_memory_ids: Vec::new(),
         failures: input.failures.clone(),
         dimensions: Vec::new(),
         extra: input.extra.clone(),

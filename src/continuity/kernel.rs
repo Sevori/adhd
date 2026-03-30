@@ -515,34 +515,7 @@ impl UnifiedContinuityInterface for Engine {
     }
 
     fn record_outcome(&self, input: OutcomeInput) -> Result<ContinuityItemRecord> {
-        self.with_storage(|storage, _| {
-            storage.persist_continuity_item(ContinuityItemInput {
-                context_id: input.context_id,
-                author_agent_id: input.agent_id,
-                kind: ContinuityKind::Outcome,
-                title: input.title,
-                body: input.result,
-                scope: Scope::Project,
-                status: Some(ContinuityStatus::Resolved),
-                importance: Some(input.quality.clamp(0.0, 1.0)),
-                confidence: Some(0.9),
-                salience: Some(input.quality.clamp(0.0, 1.0)),
-                layer: Some(MemoryLayer::Episodic),
-                supports: Vec::new(),
-                dimensions: augment_dimensions(
-                    input.dimensions,
-                    vec![DimensionValue {
-                        key: "outcome_quality".to_string(),
-                        value: format!("{:.2}", input.quality),
-                        weight: DEFAULT_DIMENSION_WEIGHT,
-                    }],
-                ),
-                extra: serde_json::json!({
-                    "failures": input.failures,
-                    "extra": input.extra,
-                }),
-            })
-        })
+        self.with_storage(|storage, _| storage.record_outcome(input))
     }
 
     fn mark_decision(&self, mut input: ContinuityItemInput) -> Result<ContinuityItemRecord> {
