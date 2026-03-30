@@ -1,6 +1,6 @@
 [package]
 name = "ice"
-version = "0.3.2-public-beta"
+version = "0.4.0-public-beta"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 description = "Infinite Context Engine prototype"
