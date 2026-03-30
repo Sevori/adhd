@@ -663,17 +663,18 @@ fn generate_openai_compatible_answer(
         );
     }
 
-    let mut request = client
-        .post(format!("{endpoint}/chat/completions"))
-        .json(&OpenAiChatCompletionRequest {
-            model: model.to_string(),
-            messages: vec![OpenAiChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-            temperature: 0.0,
-            max_tokens: num_predict,
-        });
+    let mut request =
+        client
+            .post(format!("{endpoint}/chat/completions"))
+            .json(&OpenAiChatCompletionRequest {
+                model: model.to_string(),
+                messages: vec![OpenAiChatMessage {
+                    role: "user".to_string(),
+                    content: prompt.to_string(),
+                }],
+                temperature: 0.0,
+                max_tokens: num_predict,
+            });
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
@@ -729,13 +730,7 @@ impl OpenAiMessageContent {
             Self::Text(text) => text,
             Self::Parts(parts) => parts
                 .into_iter()
-                .filter_map(|part| {
-                    if part.kind == "text" {
-                        part.text
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|part| if part.kind == "text" { part.text } else { None })
                 .collect::<Vec<_>>()
                 .join("\n"),
         }
@@ -765,11 +760,11 @@ fn is_retryable_reader_error(error: &anyhow::Error) -> bool {
         || text.contains(" 502")
         || text.contains(" 503")
         || text.contains(" 504")
-        || error
-            .chain()
-            .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(|err| {
-                err.is_timeout() || err.is_connect() || err.is_request()
-            }))
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|err| err.is_timeout() || err.is_connect() || err.is_request())
+        })
 }
 
 fn parse_longmemeval_datetime(raw: &str) -> Result<DateTime<Utc>> {
@@ -1026,9 +1021,8 @@ mod tests {
             ]))?,
         )?;
         let output_path = dir.path().join("predictions.jsonl");
-        let fake_endpoint = spawn_fake_openai_compatible(
-            r#"{"choices":[{"message":{"content":"almonds"}}]}"#,
-        );
+        let fake_endpoint =
+            spawn_fake_openai_compatible(r#"{"choices":[{"message":{"content":"almonds"}}]}"#);
 
         let report = run_longmemeval(LongMemEvalRunConfig {
             dataset_path,

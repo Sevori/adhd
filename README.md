@@ -381,4 +381,4 @@ The helper script:
 - runs `ice longmemeval evaluate`
 - writes a Markdown summary under `.artifacts/longmemeval/`
 
-GitHub Actions also ships a dedicated `LongMemEval Oracle` workflow for pull requests and manual dispatch. It runs the same script and uploads the resulting benchmark artifacts.
+GitHub Actions also ships a dedicated `LongMemEval Oracle` workflow for manual dispatch. It runs the same script and uploads the resulting benchmark artifacts.

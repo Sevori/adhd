@@ -1313,12 +1313,9 @@ fn main() -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| root.join("longmemeval").join("work"));
                 let reader_provider: LongMemEvalReaderProvider = args.reader_provider.into();
-                let reader_endpoint = args
-                    .reader_endpoint
-                    .clone()
-                    .unwrap_or_else(|| {
-                        default_longmemeval_reader_endpoint(args.reader_provider).to_string()
-                    });
+                let reader_endpoint = args.reader_endpoint.clone().unwrap_or_else(|| {
+                    default_longmemeval_reader_endpoint(args.reader_provider).to_string()
+                });
                 let report = run_longmemeval(LongMemEvalRunConfig {
                     dataset_path: args.dataset,
                     output_path: args.output,
