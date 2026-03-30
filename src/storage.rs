@@ -3600,6 +3600,11 @@ impl Storage {
                     plasticity_map.get(&raw_id).cloned(),
                     now,
                 )?;
+                let belief_key = continuity_belief_key(&item.extra);
+                let source_role = continuity_source_role(&item.extra);
+                let plasticity = plasticity_map
+                    .get(&item.id)
+                    .map(|value| value.state.clone());
                 let lexical_score = rank_score(seed.lexical_rank, lexical_len);
                 let priority_score = rank_score(seed.priority_rank, priority_len);
                 let compiled_score = rank_score(seed.compiled_rank, compiled_len);
@@ -3615,6 +3620,11 @@ impl Storage {
                     + continuity_kind_boost(item.kind)
                     + continuity_status_boost(item.status)
                     + continuity_retention_adjustment(&item)
+                    + continuity_source_role_adjustment(
+                        belief_key.as_deref(),
+                        source_role.as_deref(),
+                        item.kind,
+                    )
                     + anchor_support_scores
                         .get(&item.id)
                         .copied()
@@ -3623,9 +3633,7 @@ impl Storage {
                         .get(&item.id)
                         .copied()
                         .unwrap_or_default()
-                    + plasticity_recall_adjustment(
-                        plasticity_map.get(&item.id).map(|value| &value.state),
-                    );
+                    + plasticity_recall_adjustment(plasticity.as_ref());
                 let mut why = Vec::new();
                 if seed.lexical_rank.is_some() {
                     why.push("lexical".to_string());
@@ -3643,29 +3651,44 @@ impl Storage {
                     why.push("supports_anchor".to_string());
                 }
                 why.push(item.retention.class.clone());
-                Ok(ContinuityRecallItem {
-                    id: item.id.clone(),
-                    memory_id: item.memory_id.clone(),
-                    kind: item.kind,
-                    status: item.status,
-                    title: item.title.clone(),
-                    preview: continuity_preview(&item.body, 180),
-                    author_agent_id: item.author_agent_id.clone(),
-                    updated_at: item.updated_at,
-                    effective_salience: item.retention.effective_salience,
-                    support_count: item.supports.len(),
-                    score,
-                    why,
+                Ok(ScoredContinuityRecallItem {
+                    item: ContinuityRecallItem {
+                        id: item.id.clone(),
+                        memory_id: item.memory_id.clone(),
+                        kind: item.kind,
+                        status: item.status,
+                        title: item.title.clone(),
+                        preview: continuity_preview(&item.body, 180),
+                        author_agent_id: item.author_agent_id.clone(),
+                        updated_at: item.updated_at,
+                        effective_salience: item.retention.effective_salience,
+                        support_count: item.supports.len(),
+                        score,
+                        why,
+                    },
+                    belief_key,
+                    source_role,
+                    plasticity,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        apply_belief_key_competition(&mut recall_items);
         recall_items.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+            b.item
+                .score
+                .partial_cmp(&a.item.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| b.item.updated_at.cmp(&a.item.updated_at))
         });
         let total_candidates = recall_items.len();
+        let mut recall_items = recall_items
+            .into_iter()
+            .map(|mut item| {
+                let mut seen = HashSet::new();
+                item.item.why.retain(|why| seen.insert(why.clone()));
+                item.item
+            })
+            .collect::<Vec<_>>();
         recall_items.truncate(limit);
         let mut band_hit_counts = BTreeMap::<String, usize>::new();
         for item in &recall_items {
@@ -7537,6 +7560,14 @@ struct StoredContinuityPlasticity {
     state: ContinuityPlasticityState,
 }
 
+#[derive(Debug, Clone)]
+struct ScoredContinuityRecallItem {
+    item: ContinuityRecallItem,
+    belief_key: Option<String>,
+    source_role: Option<String>,
+    plasticity: Option<ContinuityPlasticityState>,
+}
+
 fn read_continuity_row(row: &rusqlite::Row<'_>) -> Result<RawContinuityRow> {
     Ok(RawContinuityRow {
         id: row.get(0)?,
@@ -7672,6 +7703,126 @@ fn plasticity_recall_adjustment(plasticity: Option<&ContinuityPlasticityState>) 
                 .clamp(-0.45_f64, 0.35_f64)
         })
         .unwrap_or(0.0)
+}
+
+fn continuity_source_role_adjustment(
+    belief_key: Option<&str>,
+    source_role: Option<&str>,
+    kind: ContinuityKind,
+) -> f64 {
+    let is_user_belief = belief_key
+        .map(|value| value.starts_with("user."))
+        .unwrap_or(false);
+    match source_role {
+        Some("user") => {
+            if is_user_belief {
+                0.2
+            } else {
+                0.08
+            }
+        }
+        Some("assistant") => {
+            if is_user_belief {
+                -0.18
+            } else if matches!(
+                kind,
+                ContinuityKind::Fact | ContinuityKind::Derivation | ContinuityKind::Lesson
+            ) {
+                -0.08
+            } else {
+                -0.03
+            }
+        }
+        Some("importer") | Some("system") | Some("tool") => {
+            if is_user_belief {
+                0.03
+            } else {
+                0.06
+            }
+        }
+        Some(_) | None => 0.0,
+    }
+}
+
+fn continuity_belief_competition_rank(item: &ScoredContinuityRecallItem) -> f64 {
+    let mut score = item.item.score
+        + continuity_source_role_adjustment(
+            item.belief_key.as_deref(),
+            item.source_role.as_deref(),
+            item.item.kind,
+        );
+    score += match item.item.status {
+        ContinuityStatus::Open => 0.08,
+        ContinuityStatus::Active => 0.06,
+        ContinuityStatus::Resolved => 0.0,
+        ContinuityStatus::Superseded => -0.22,
+        ContinuityStatus::Rejected => -0.28,
+    };
+    if let Some(plasticity) = item.plasticity.as_ref() {
+        score += 0.03 * (plasticity.confirmation_count as f64 + 1.0).ln();
+        score += 0.02 * (plasticity.successful_use_count as f64 + 1.0).ln();
+        score -= 0.05 * plasticity.contradiction_count as f64;
+        score -= 0.12 * plasticity.prediction_error;
+    }
+    score
+}
+
+fn apply_belief_key_competition(items: &mut [ScoredContinuityRecallItem]) {
+    let mut belief_groups = HashMap::<String, Vec<usize>>::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(belief_key) = item.belief_key.as_ref() else {
+            continue;
+        };
+        belief_groups
+            .entry(belief_key.clone())
+            .or_default()
+            .push(index);
+    }
+
+    for indices in belief_groups.into_values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let mut ordered = indices;
+        ordered.sort_by(|left, right| {
+            continuity_belief_competition_rank(&items[*right])
+                .partial_cmp(&continuity_belief_competition_rank(&items[*left]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    items[*right]
+                        .item
+                        .updated_at
+                        .cmp(&items[*left].item.updated_at)
+                })
+        });
+        let winner_index = ordered[0];
+        let winner_rank = continuity_belief_competition_rank(&items[winner_index]);
+        let runner_up_rank = ordered
+            .get(1)
+            .map(|index| continuity_belief_competition_rank(&items[*index]))
+            .unwrap_or(winner_rank);
+        let winner_bonus =
+            (0.08 + (winner_rank - runner_up_rank).max(0.0).min(0.12)).clamp(0.08, 0.2);
+        let winner_source_role = items[winner_index].source_role.clone();
+        let winner = &mut items[winner_index].item;
+        winner.score += winner_bonus;
+        winner.why.push("belief_key_winner".to_string());
+        if let Some(source_role) = winner_source_role.as_deref() {
+            winner.why.push(format!("source_role:{source_role}"));
+        }
+
+        for loser_index in ordered.into_iter().skip(1) {
+            let loser_rank = continuity_belief_competition_rank(&items[loser_index]);
+            let penalty = (0.1 + (winner_rank - loser_rank).max(0.0).min(0.18)).clamp(0.1, 0.28);
+            let loser_source_role = items[loser_index].source_role.clone();
+            let loser = &mut items[loser_index].item;
+            loser.score -= penalty;
+            loser.why.push("belief_key_competitor".to_string());
+            if let Some(source_role) = loser_source_role.as_deref() {
+                loser.why.push(format!("source_role:{source_role}"));
+            }
+        }
+    }
 }
 
 fn rank_score(rank: Option<usize>, len: usize) -> f64 {
@@ -10359,6 +10510,187 @@ mod tests {
             after.retention.effective_salience > before.retention.effective_salience,
             "expected confirmed continuity to gain effective salience"
         );
+    }
+
+    #[test]
+    fn recall_continuity_prefers_user_sourced_belief_over_assistant_competitor() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-belief-competition-recall".into(),
+                session_id: "session-belief-competition-recall".into(),
+                objective: "pick the current user preference".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let user_item = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "User prefers Neovim".into(),
+                body: "The user explicitly said they prefer Neovim for repo work.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.76),
+                confidence: Some(0.78),
+                salience: Some(0.76),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.preference.editor",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+        let assistant_item = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Assistant guessed Emacs".into(),
+                body: "The assistant speculated that the user probably prefers Emacs.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.76),
+                confidence: Some(0.78),
+                salience: Some(0.76),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.preference.editor",
+                    "source_role": "assistant",
+                }),
+            })
+            .unwrap();
+
+        let recall = storage
+            .recall_continuity(&context.id, "what editor does the user prefer", false, 8)
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(user_item.id.as_str())
+        );
+
+        let competitor = recall
+            .items
+            .iter()
+            .find(|item| item.id == assistant_item.id)
+            .unwrap();
+        assert!(
+            competitor
+                .why
+                .iter()
+                .any(|why| why == "belief_key_competitor")
+        );
+        assert!(
+            competitor
+                .why
+                .iter()
+                .any(|why| why == "source_role:assistant")
+        );
+    }
+
+    #[test]
+    fn build_context_pack_rejects_weaker_same_belief_continuity_item() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-belief-competition-pack".into(),
+                session_id: "session-belief-competition-pack".into(),
+                objective: "select the strongest editor preference".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let user_item = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "User prefers Neovim".into(),
+                body: "The user explicitly said they prefer Neovim for repo work.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.76),
+                confidence: Some(0.78),
+                salience: Some(0.76),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.preference.editor",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+        let assistant_item = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Assistant guessed Emacs".into(),
+                body: "The assistant speculated that the user probably prefers Emacs.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.76),
+                confidence: Some(0.78),
+                salience: Some(0.76),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.preference.editor",
+                    "source_role": "assistant",
+                }),
+            })
+            .unwrap();
+
+        let pack = crate::query::build_context_pack(
+            &storage,
+            QueryInput {
+                agent_id: Some("agent-a".into()),
+                session_id: Some(context.session_id.clone()),
+                task_id: Some(context.task_id.clone()),
+                namespace: Some(context.namespace.clone()),
+                objective: Some("resume the user's editor preference".into()),
+                selector: None,
+                view_id: None,
+                query_text: "user editor preference".into(),
+                budget_tokens: 192,
+                candidate_limit: 8,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == user_item.memory_id)
+        );
+        assert!(
+            !pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == assistant_item.memory_id)
+        );
+
+        let manifest = storage.explain_context_pack(&pack.id).unwrap();
+        assert!(manifest.rejected.iter().any(|candidate| {
+            candidate.memory_id == assistant_item.memory_id
+                && candidate.reason == "belief_key_competitor"
+        }));
     }
 
     #[test]

@@ -108,9 +108,16 @@ ICE SHOULD support belief-keyed reconsolidation for continuity items that repres
 Belief-keyed behavior:
 
 - Items sharing the same `belief_key` are treated as competing or reinforcing candidates for the same latent state.
+- Recall MUST apply winner-take-most competition inside each `belief_key` cluster. A strongly supported current item SHOULD receive a boost, while weaker competitors for the same latent state SHOULD be penalized.
+- `source_role` MUST affect recall for belief-keyed items. For `user.*` beliefs, user-authored evidence SHOULD outrank assistant-authored restatements or suggestions unless explicit confirmation data says otherwise.
 - Confirmation of one item SHOULD increase its stability.
 - Contradiction SHOULD increase prediction error and reduce effective salience.
 - Explicit supersession between items with the same `belief_key` SHOULD preserve lineage rather than overwriting history in place.
+
+Context-pack behavior for belief-keyed continuity:
+
+- When the pack compiler sees multiple continuity memories with the same `belief_key`, it SHOULD keep the strongest candidate and reject materially weaker competitors when the score gap is clear.
+- ICE MUST prefer preserving a single high-confidence current belief over spending budget on near-duplicate conflicting memories, unless the cluster is genuinely ambiguous.
 
 ### Consolidation Gate
 
