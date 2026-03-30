@@ -213,18 +213,48 @@ pub struct ContinuityRetentionState {
     pub effective_salience: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_plasticity_spacing_interval_hours() -> f64 {
+    6.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuityPlasticityState {
     pub activation_count: usize,
     pub successful_use_count: usize,
     pub confirmation_count: usize,
     pub contradiction_count: usize,
     pub independent_source_count: usize,
+    #[serde(default)]
+    pub spaced_reactivation_count: usize,
     pub stability_score: f64,
     pub prediction_error: f64,
+    #[serde(default = "default_plasticity_spacing_interval_hours")]
+    pub spacing_interval_hours: f64,
     pub last_reactivated_at: Option<DateTime<Utc>>,
     pub last_confirmed_at: Option<DateTime<Utc>>,
     pub last_contradicted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_strengthened_at: Option<DateTime<Utc>>,
+}
+
+impl Default for ContinuityPlasticityState {
+    fn default() -> Self {
+        Self {
+            activation_count: 0,
+            successful_use_count: 0,
+            confirmation_count: 0,
+            contradiction_count: 0,
+            independent_source_count: 0,
+            spaced_reactivation_count: 0,
+            stability_score: 0.0,
+            prediction_error: 0.0,
+            spacing_interval_hours: default_plasticity_spacing_interval_hours(),
+            last_reactivated_at: None,
+            last_confirmed_at: None,
+            last_contradicted_at: None,
+            last_strengthened_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

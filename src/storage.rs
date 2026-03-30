@@ -431,9 +431,12 @@ impl Storage {
               confirmation_count INTEGER NOT NULL,
               contradiction_count INTEGER NOT NULL,
               independent_source_count INTEGER NOT NULL,
+              spaced_reactivation_count INTEGER NOT NULL DEFAULT 0,
+              spacing_interval_hours REAL NOT NULL DEFAULT 6.0,
               last_reactivated_at TEXT,
               last_confirmed_at TEXT,
               last_contradicted_at TEXT,
+              last_strengthened_at TEXT,
               stability_score REAL NOT NULL,
               prediction_error REAL NOT NULL,
               created_at TEXT NOT NULL,
@@ -688,6 +691,17 @@ impl Storage {
         self.ensure_column("events", "namespace", "TEXT")?;
         self.ensure_column("events", "environment", "TEXT")?;
         self.ensure_column("events", "dimensions_json", "TEXT NOT NULL DEFAULT '[]'")?;
+        self.ensure_column(
+            "continuity_plasticity",
+            "spaced_reactivation_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "continuity_plasticity",
+            "spacing_interval_hours",
+            "REAL NOT NULL DEFAULT 6.0",
+        )?;
+        self.ensure_column("continuity_plasticity", "last_strengthened_at", "TEXT")?;
         self.ensure_column("agent_attachments", "last_seen_at", "TEXT")?;
         self.ensure_column(
             "agent_attachments",
@@ -1512,8 +1526,9 @@ impl Storage {
                 r#"
                 SELECT continuity_id, belief_key, source_role, activation_count, successful_use_count,
                        confirmation_count, contradiction_count, independent_source_count,
-                       stability_score, prediction_error, last_reactivated_at, last_confirmed_at,
-                       last_contradicted_at
+                       spaced_reactivation_count, spacing_interval_hours, stability_score,
+                       prediction_error, last_reactivated_at, last_confirmed_at,
+                       last_contradicted_at, last_strengthened_at
                 FROM continuity_plasticity
                 WHERE continuity_id IN ({placeholders})
                 "#
@@ -1524,17 +1539,22 @@ impl Storage {
             ))?;
             while let Some(row) = rows.next()? {
                 let last_reactivated_at = row
-                    .get::<_, Option<String>>(10)?
+                    .get::<_, Option<String>>(12)?
                     .map(|value| DateTime::parse_from_rfc3339(&value))
                     .transpose()?
                     .map(|ts| ts.with_timezone(&Utc));
                 let last_confirmed_at = row
-                    .get::<_, Option<String>>(11)?
+                    .get::<_, Option<String>>(13)?
                     .map(|value| DateTime::parse_from_rfc3339(&value))
                     .transpose()?
                     .map(|ts| ts.with_timezone(&Utc));
                 let last_contradicted_at = row
-                    .get::<_, Option<String>>(12)?
+                    .get::<_, Option<String>>(14)?
+                    .map(|value| DateTime::parse_from_rfc3339(&value))
+                    .transpose()?
+                    .map(|ts| ts.with_timezone(&Utc));
+                let last_strengthened_at = row
+                    .get::<_, Option<String>>(15)?
                     .map(|value| DateTime::parse_from_rfc3339(&value))
                     .transpose()?
                     .map(|ts| ts.with_timezone(&Utc));
@@ -1549,11 +1569,14 @@ impl Storage {
                             confirmation_count: row.get::<_, i64>(5)? as usize,
                             contradiction_count: row.get::<_, i64>(6)? as usize,
                             independent_source_count: row.get::<_, i64>(7)? as usize,
-                            stability_score: row.get(8)?,
-                            prediction_error: row.get(9)?,
+                            spaced_reactivation_count: row.get::<_, i64>(8)? as usize,
+                            spacing_interval_hours: row.get(9)?,
+                            stability_score: row.get(10)?,
+                            prediction_error: row.get(11)?,
                             last_reactivated_at,
                             last_confirmed_at,
                             last_contradicted_at,
+                            last_strengthened_at,
                         },
                     },
                 );
@@ -1619,9 +1642,10 @@ impl Storage {
             r#"
             INSERT OR IGNORE INTO continuity_plasticity(
               continuity_id, belief_key, source_role, activation_count, successful_use_count,
-              confirmation_count, contradiction_count, independent_source_count, stability_score,
+              confirmation_count, contradiction_count, independent_source_count,
+              spaced_reactivation_count, spacing_interval_hours, stability_score,
               prediction_error, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, 0, 0, 0, 0, 1, 0.0, 0.0, ?4, ?4)
+            ) VALUES (?1, ?2, ?3, 0, 0, 0, 0, 1, 0, 6.0, 0.0, 0.0, ?4, ?4)
             "#,
             params![
                 continuity_id,
@@ -1668,6 +1692,15 @@ impl Storage {
             .remove(continuity_id)
             .unwrap_or_default();
         let mut state = current.state;
+        state.spacing_interval_hours =
+            normalize_spacing_interval_hours(state.spacing_interval_hours);
+        let last_strength_signal_at = state
+            .last_strengthened_at
+            .or(state.last_confirmed_at)
+            .or(state.last_reactivated_at);
+        let spacing_ready = last_strength_signal_at
+            .map(|ts| spacing_elapsed_hours(ts, updated_at) >= state.spacing_interval_hours)
+            .unwrap_or(true);
         if activated {
             state.activation_count += 1;
             state.last_reactivated_at = Some(updated_at);
@@ -1682,6 +1715,19 @@ impl Storage {
         if contradicted {
             state.contradiction_count += 1;
             state.last_contradicted_at = Some(updated_at);
+            state.spacing_interval_hours =
+                (state.spacing_interval_hours * 0.5_f64).clamp(2.0_f64, 24.0_f64 * 21.0_f64);
+        }
+        if (activated || successful || confirmed) && spacing_ready {
+            state.spaced_reactivation_count += 1;
+            state.last_strengthened_at = Some(updated_at);
+            let growth = if confirmed || successful {
+                1.8_f64
+            } else {
+                1.25_f64
+            };
+            state.spacing_interval_hours =
+                normalize_spacing_interval_hours(state.spacing_interval_hours * growth);
         }
         state.prediction_error = if state.confirmation_count + state.contradiction_count == 0 {
             0.0
@@ -1689,30 +1735,36 @@ impl Storage {
             state.contradiction_count as f64
                 / (state.confirmation_count + state.contradiction_count) as f64
         };
-        state.stability_score = (state.activation_count as f64 + 1.0).ln()
-            + 1.2 * (state.successful_use_count as f64 + 1.0).ln()
-            + 1.4 * (state.confirmation_count as f64 + 1.0).ln()
+        state.stability_score = 0.35 * (state.activation_count as f64 + 1.0).ln()
+            + 1.1 * (state.successful_use_count as f64 + 1.0).ln()
+            + 1.3 * (state.confirmation_count as f64 + 1.0).ln()
+            + 1.6 * (state.spaced_reactivation_count as f64 + 1.0).ln()
+            + 0.2 * spacing_interval_signal(&state)
             + 0.6 * (state.independent_source_count as f64 + 1.0).ln()
             - 1.8 * state.contradiction_count as f64;
         self.conn.execute(
             r#"
             INSERT INTO continuity_plasticity(
               continuity_id, belief_key, source_role, activation_count, successful_use_count,
-              confirmation_count, contradiction_count, independent_source_count, stability_score,
+              confirmation_count, contradiction_count, independent_source_count,
+              spaced_reactivation_count, spacing_interval_hours, stability_score,
               prediction_error, last_reactivated_at, last_confirmed_at, last_contradicted_at,
-              created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+              last_strengthened_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
             ON CONFLICT(continuity_id) DO UPDATE SET
               activation_count = excluded.activation_count,
               successful_use_count = excluded.successful_use_count,
               confirmation_count = excluded.confirmation_count,
               contradiction_count = excluded.contradiction_count,
               independent_source_count = excluded.independent_source_count,
+              spaced_reactivation_count = excluded.spaced_reactivation_count,
+              spacing_interval_hours = excluded.spacing_interval_hours,
               stability_score = excluded.stability_score,
               prediction_error = excluded.prediction_error,
               last_reactivated_at = excluded.last_reactivated_at,
               last_confirmed_at = excluded.last_confirmed_at,
               last_contradicted_at = excluded.last_contradicted_at,
+              last_strengthened_at = excluded.last_strengthened_at,
               updated_at = excluded.updated_at
             "#,
             params![
@@ -1724,6 +1776,8 @@ impl Storage {
                 state.confirmation_count as i64,
                 state.contradiction_count as i64,
                 state.independent_source_count as i64,
+                state.spaced_reactivation_count as i64,
+                state.spacing_interval_hours,
                 state.stability_score,
                 state.prediction_error,
                 state
@@ -1734,6 +1788,9 @@ impl Storage {
                     .map(|ts: DateTime<Utc>| ts.to_rfc3339()),
                 state
                     .last_contradicted_at
+                    .map(|ts: DateTime<Utc>| ts.to_rfc3339()),
+                state
+                    .last_strengthened_at
                     .map(|ts: DateTime<Utc>| ts.to_rfc3339()),
                 updated_at.to_rfc3339(),
             ],
@@ -7404,6 +7461,8 @@ fn continuity_retention_state(input: ContinuityRetentionInput<'_>) -> Continuity
         let reinforcement = 0.06 * (plasticity.activation_count as f64 + 1.0).ln()
             + 0.12 * (plasticity.successful_use_count as f64 + 1.0).ln()
             + 0.16 * (plasticity.confirmation_count as f64 + 1.0).ln()
+            + 0.22 * (plasticity.spaced_reactivation_count as f64 + 1.0).ln()
+            + 0.04 * spacing_interval_signal(plasticity)
             + 0.05 * (plasticity.independent_source_count as f64 + 1.0).ln();
         let contradiction_penalty = 0.22 * plasticity.contradiction_count as f64;
         let half_life_multiplier =
@@ -7426,6 +7485,8 @@ fn continuity_retention_state(input: ContinuityRetentionInput<'_>) -> Continuity
         .map(|plasticity| {
             (0.03 * (plasticity.successful_use_count as f64 + 1.0).ln()
                 + 0.05 * (plasticity.confirmation_count as f64 + 1.0).ln()
+                + 0.07 * (plasticity.spaced_reactivation_count as f64 + 1.0).ln()
+                + 0.02 * spacing_interval_signal(plasticity)
                 - 0.12 * plasticity.prediction_error
                 - 0.04 * plasticity.contradiction_count as f64)
                 .clamp(-0.35_f64, 0.25_f64)
@@ -7692,12 +7753,32 @@ fn continuity_retention_adjustment(item: &ContinuityItemRecord) -> f64 {
     score
 }
 
+fn normalize_spacing_interval_hours(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(2.0, 24.0 * 21.0)
+    } else {
+        6.0
+    }
+}
+
+fn spacing_elapsed_hours(start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
+    (end - start).num_seconds().max(0) as f64 / 3600.0
+}
+
+fn spacing_interval_signal(plasticity: &ContinuityPlasticityState) -> f64 {
+    (normalize_spacing_interval_hours(plasticity.spacing_interval_hours) / 6.0)
+        .max(1.0)
+        .ln()
+}
+
 fn plasticity_recall_adjustment(plasticity: Option<&ContinuityPlasticityState>) -> f64 {
     plasticity
         .map(|plasticity| {
             (0.04 * (plasticity.activation_count as f64 + 1.0).ln()
                 + 0.08 * (plasticity.successful_use_count as f64 + 1.0).ln()
                 + 0.12 * (plasticity.confirmation_count as f64 + 1.0).ln()
+                + 0.16 * (plasticity.spaced_reactivation_count as f64 + 1.0).ln()
+                + 0.04 * spacing_interval_signal(plasticity)
                 - 0.18 * plasticity.prediction_error
                 - 0.05 * plasticity.contradiction_count as f64)
                 .clamp(-0.45_f64, 0.35_f64)
@@ -7761,6 +7842,8 @@ fn continuity_belief_competition_rank(item: &ScoredContinuityRecallItem) -> f64 
     if let Some(plasticity) = item.plasticity.as_ref() {
         score += 0.03 * (plasticity.confirmation_count as f64 + 1.0).ln();
         score += 0.02 * (plasticity.successful_use_count as f64 + 1.0).ln();
+        score += 0.06 * (plasticity.spaced_reactivation_count as f64 + 1.0).ln();
+        score += 0.02 * spacing_interval_signal(plasticity);
         score -= 0.05 * plasticity.contradiction_count as f64;
         score -= 0.12 * plasticity.prediction_error;
     }
@@ -8440,6 +8523,7 @@ fn storage_bytes_from_paths(sqlite_path: &Path, log_dir: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Duration;
     use tempfile::tempdir;
 
     use super::*;
@@ -10509,6 +10593,219 @@ mod tests {
         assert!(
             after.retention.effective_salience > before.retention.effective_salience,
             "expected confirmed continuity to gain effective salience"
+        );
+    }
+
+    #[test]
+    fn repeated_immediate_outcomes_do_not_count_as_extra_spaced_reactivation() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-plasticity-massed".into(),
+                session_id: "session-massed".into(),
+                objective: "avoid fake spacing gains".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let decision = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Guard latest learning".into(),
+                body: "Recent learning should show up before the full line.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.78),
+                confidence: Some(0.81),
+                salience: Some(0.79),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        for title in ["First success", "Second immediate success"] {
+            storage
+                .record_outcome(OutcomeInput {
+                    context_id: context.id.clone(),
+                    agent_id: "agent-a".into(),
+                    title: title.into(),
+                    result: "The latest learning was used correctly.".into(),
+                    quality: 0.95,
+                    pack_id: None,
+                    used_memory_ids: vec![decision.memory_id.clone()],
+                    confirmed_memory_ids: vec![decision.memory_id.clone()],
+                    contradicted_memory_ids: Vec::new(),
+                    failures: Vec::new(),
+                    dimensions: Vec::new(),
+                    extra: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+
+        let after = storage
+            .list_continuity_items(&context.id, true)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == decision.id)
+            .unwrap();
+        let plasticity = after.extra.get("plasticity").unwrap();
+        let spacing_interval_hours = plasticity["spacing_interval_hours"].as_f64().unwrap();
+
+        assert_eq!(plasticity["activation_count"], serde_json::json!(2));
+        assert_eq!(plasticity["successful_use_count"], serde_json::json!(2));
+        assert_eq!(plasticity["confirmation_count"], serde_json::json!(2));
+        assert_eq!(
+            plasticity["spaced_reactivation_count"],
+            serde_json::json!(1)
+        );
+        assert!(spacing_interval_hours > 6.0);
+    }
+
+    #[test]
+    fn spaced_reactivation_outgrows_massed_repetition() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-plasticity-spacing".into(),
+                session_id: "session-spacing".into(),
+                objective: "reward spaced reactivation".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let spaced = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Spaced learning path".into(),
+                body: "This item should only strengthen when it comes back after a useful gap."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.82),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let massed = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Massed learning path".into(),
+                body: "This item gets hammered twice in a row.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.82),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        for item in [&spaced, &massed] {
+            storage
+                .record_outcome(OutcomeInput {
+                    context_id: context.id.clone(),
+                    agent_id: "agent-a".into(),
+                    title: format!("Prime {}", item.title),
+                    result: "The memory was used and confirmed.".into(),
+                    quality: 0.94,
+                    pack_id: None,
+                    used_memory_ids: vec![item.memory_id.clone()],
+                    confirmed_memory_ids: vec![item.memory_id.clone()],
+                    contradicted_memory_ids: Vec::new(),
+                    failures: Vec::new(),
+                    dimensions: Vec::new(),
+                    extra: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+
+        let rewind = (Utc::now() - Duration::hours(12)).to_rfc3339();
+        storage
+            .conn
+            .execute(
+                r#"
+                UPDATE continuity_plasticity
+                SET last_reactivated_at = ?2,
+                    last_confirmed_at = ?2,
+                    last_strengthened_at = ?2,
+                    updated_at = ?2
+                WHERE continuity_id = ?1
+                "#,
+                params![spaced.id, rewind],
+            )
+            .unwrap();
+
+        storage
+            .record_outcome(OutcomeInput {
+                context_id: context.id.clone(),
+                agent_id: "agent-a".into(),
+                title: "Immediate massed repeat".into(),
+                result: "The same memory was used again right away.".into(),
+                quality: 0.94,
+                pack_id: None,
+                used_memory_ids: vec![massed.memory_id.clone()],
+                confirmed_memory_ids: vec![massed.memory_id.clone()],
+                contradicted_memory_ids: Vec::new(),
+                failures: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        storage
+            .record_outcome(OutcomeInput {
+                context_id: context.id.clone(),
+                agent_id: "agent-a".into(),
+                title: "Delayed spaced repeat".into(),
+                result: "The memory came back after enough time had passed.".into(),
+                quality: 0.94,
+                pack_id: None,
+                used_memory_ids: vec![spaced.memory_id.clone()],
+                confirmed_memory_ids: vec![spaced.memory_id.clone()],
+                contradicted_memory_ids: Vec::new(),
+                failures: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let items = storage.list_continuity_items(&context.id, true).unwrap();
+        let spaced_after = items.iter().find(|item| item.id == spaced.id).unwrap();
+        let massed_after = items.iter().find(|item| item.id == massed.id).unwrap();
+
+        assert_eq!(
+            spaced_after.extra["plasticity"]["spaced_reactivation_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            massed_after.extra["plasticity"]["spaced_reactivation_count"],
+            serde_json::json!(1)
+        );
+        assert!(spaced_after.retention.half_life_hours > massed_after.retention.half_life_hours);
+        assert!(
+            spaced_after.retention.effective_salience > massed_after.retention.effective_salience
         );
     }
 
