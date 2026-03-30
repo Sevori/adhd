@@ -1,4 +1,4 @@
-.PHONY: build run test mcp serve clean check lint fmt
+.PHONY: build run test mcp serve clean check lint fmt longmemeval-oracle
 
 build:
 	cargo build
@@ -26,3 +26,6 @@ lint: fmt
 
 clean:
 	cargo clean
+
+longmemeval-oracle:
+	bash scripts/run_longmemeval_oracle.sh

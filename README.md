@@ -326,6 +326,7 @@ Useful controls:
 - `--work-dir /tmp/ice-longmemeval-work` to store per-case replay roots elsewhere
 - `--reader-provider ollama|openai-compatible` to switch the answer generator
 - `--reader-api-key-env OPENAI_API_KEY` to source a bearer token for compatible hosted endpoints
+- `--reader-max-retries 4` and `--reader-retry-backoff-secs 2` to survive transient 429/5xx failures on hosted readers
 
 The command writes:
 
@@ -362,3 +363,22 @@ Notes:
 - the upstream evaluator stack is currently reliable on Python 3.12; Python 3.14 and `httpx 0.28+` break `openai==1.35.1`
 - the runner does not ingest benchmark-only supervision labels such as `answer_session_ids` or `has_answer`
 - `ice ingest` now accepts `--timestamp <RFC3339>` when you need to replay historical events with real time ordering
+
+### Repeatable Oracle Runs
+
+For a full reproducible `oracle` benchmark pass, use:
+
+```bash
+make longmemeval-oracle
+```
+
+The helper script:
+
+- downloads the requested LongMemEval split
+- clones the official evaluator repository
+- creates a Python 3.12 evaluator venv with the known-good dependency pins
+- runs `ice longmemeval run`
+- runs `ice longmemeval evaluate`
+- writes a Markdown summary under `.artifacts/longmemeval/`
+
+GitHub Actions also ships a dedicated `LongMemEval Oracle` workflow for pull requests and manual dispatch. It runs the same script and uploads the resulting benchmark artifacts.

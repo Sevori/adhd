@@ -25,6 +25,8 @@ pub struct LongMemEvalRunConfig {
     pub reader_api_key_env: Option<String>,
     pub reader_timeout_secs: u64,
     pub reader_num_predict: usize,
+    pub reader_max_retries: usize,
+    pub reader_retry_backoff_secs: u64,
     pub budget_tokens: usize,
     pub candidate_limit: usize,
     pub offset: usize,
@@ -60,6 +62,7 @@ pub struct LongMemEvalRunReport {
     pub reader_provider: String,
     pub reader_model: String,
     pub reader_endpoint: String,
+    pub reader_max_retries: usize,
     pub budget_tokens: usize,
     pub candidate_limit: usize,
     pub total_cases: usize,
@@ -261,6 +264,8 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
             &config.reader_model,
             config.reader_api_key_env.as_deref(),
             config.reader_num_predict,
+            config.reader_max_retries,
+            config.reader_retry_backoff_secs,
             &prompt,
         )
         .with_context(|| format!("running reader for {}", case.question_id))?;
@@ -312,6 +317,7 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
         reader_provider: reader_provider_label(config.reader_provider).to_string(),
         reader_model: config.reader_model,
         reader_endpoint: config.reader_endpoint,
+        reader_max_retries: config.reader_max_retries,
         budget_tokens: config.budget_tokens,
         candidate_limit: config.candidate_limit,
         total_cases,
@@ -565,47 +571,79 @@ fn generate_answer(
     model: &str,
     api_key_env: Option<&str>,
     num_predict: usize,
+    max_retries: usize,
+    retry_backoff_secs: u64,
     prompt: &str,
 ) -> Result<String> {
-    match provider {
-        LongMemEvalReaderProvider::Ollama => {
-            let response = client
-                .post(format!("{}/api/generate", endpoint.trim_end_matches('/')))
-                .json(&OllamaGenerateRequest {
-                    model: model.to_string(),
-                    prompt: prompt.to_string(),
-                    stream: false,
-                    options: OllamaGenerateOptions {
-                        temperature: 0.0,
-                        num_predict,
-                    },
-                })
-                .send()
-                .with_context(|| format!("requesting LongMemEval answer from {model}"))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .unwrap_or_else(|error| format!("unable to read ollama error body: {error}"));
-                return Err(anyhow!(
-                    "LongMemEval reader request failed for {} with {}: {}",
-                    model,
-                    status,
-                    body
-                ));
+    let attempts = max_retries.max(1);
+    let backoff = retry_backoff_secs.max(1);
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        let result = match provider {
+            LongMemEvalReaderProvider::Ollama => {
+                generate_ollama_answer(client, endpoint, model, num_predict, prompt)
             }
-            let payload: OllamaGenerateResponse = response.json()?;
-            Ok(normalize_hypothesis(&payload.response))
+            LongMemEvalReaderProvider::OpenAiCompatible => generate_openai_compatible_answer(
+                client,
+                endpoint,
+                model,
+                api_key_env,
+                num_predict,
+                prompt,
+            ),
+        };
+
+        match result {
+            Ok(answer) => return Ok(answer),
+            Err(error) => {
+                let retryable = is_retryable_reader_error(&error);
+                if attempt >= attempts || !retryable {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_secs(backoff.saturating_mul(attempt as u64)));
+            }
         }
-        LongMemEvalReaderProvider::OpenAiCompatible => generate_openai_compatible_answer(
-            client,
-            endpoint,
-            model,
-            api_key_env,
-            num_predict,
-            prompt,
-        ),
     }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("LongMemEval reader failed without an error payload")))
+}
+
+fn generate_ollama_answer(
+    client: &Client,
+    endpoint: &str,
+    model: &str,
+    num_predict: usize,
+    prompt: &str,
+) -> Result<String> {
+    let response = client
+        .post(format!("{}/api/generate", endpoint.trim_end_matches('/')))
+        .json(&OllamaGenerateRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            stream: false,
+            options: OllamaGenerateOptions {
+                temperature: 0.0,
+                num_predict,
+            },
+        })
+        .send()
+        .with_context(|| format!("requesting LongMemEval answer from {model}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|error| format!("unable to read ollama error body: {error}"));
+        return Err(anyhow!(
+            "LongMemEval reader request failed for {} with {}: {}",
+            model,
+            status,
+            body
+        ));
+    }
+    let payload: OllamaGenerateResponse = response.json()?;
+    Ok(normalize_hypothesis(&payload.response))
 }
 
 fn generate_openai_compatible_answer(
@@ -720,6 +758,20 @@ fn reader_provider_label(provider: LongMemEvalReaderProvider) -> &'static str {
     }
 }
 
+fn is_retryable_reader_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("429")
+        || text.contains(" 500")
+        || text.contains(" 502")
+        || text.contains(" 503")
+        || text.contains(" 504")
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(|err| {
+                err.is_timeout() || err.is_connect() || err.is_request()
+            }))
+}
+
 fn parse_longmemeval_datetime(raw: &str) -> Result<DateTime<Utc>> {
     if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
         return Ok(value.with_timezone(&Utc));
@@ -816,6 +868,10 @@ struct ReplaySession {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::thread;
 
     use tempfile::tempdir;
@@ -921,6 +977,8 @@ mod tests {
             reader_api_key_env: None,
             reader_timeout_secs: 30,
             reader_num_predict: 32,
+            reader_max_retries: 2,
+            reader_retry_backoff_secs: 1,
             budget_tokens: 256,
             candidate_limit: 12,
             offset: 0,
@@ -983,6 +1041,8 @@ mod tests {
             reader_api_key_env: None,
             reader_timeout_secs: 30,
             reader_num_predict: 32,
+            reader_max_retries: 2,
+            reader_retry_backoff_secs: 1,
             budget_tokens: 256,
             candidate_limit: 12,
             offset: 0,
@@ -995,6 +1055,82 @@ mod tests {
         assert!(predictions.contains("\"question_id\":\"sample_2\""));
         assert!(predictions.contains("\"hypothesis\":\"almonds\""));
         assert_eq!(report.reader_provider, "openai-compatible");
+        Ok(())
+    }
+
+    #[test]
+    fn run_longmemeval_retries_transient_openai_compatible_failures() -> Result<()> {
+        let dir = tempdir()?;
+        let dataset_path = dir.path().join("oracle.json");
+        fs::write(
+            &dataset_path,
+            serde_json::to_vec_pretty(&json!([
+                {
+                    "question_id": "sample_retry",
+                    "question_type": "single-session-user",
+                    "question": "What fruit did I buy?",
+                    "answer": "pear",
+                    "question_date": "2023/04/12 (Wed) 10:00",
+                    "haystack_dates": ["2023/04/11 (Tue) 08:30"],
+                    "haystack_session_ids": ["sess-retry"],
+                    "haystack_sessions": [[
+                        {"role": "user", "content": "I bought a pear at the market.", "has_answer": true}
+                    ]],
+                    "answer_session_ids": ["sess-retry"]
+                }
+            ]))?,
+        )?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let counter = attempts.clone();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept retry test request");
+                let mut request = vec![0_u8; 8192];
+                let read = stream.read(&mut request).expect("read retry test request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.contains("POST /v1/chat/completions"));
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let payload = if attempt == 0 {
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 17\r\n\r\n{\"error\":\"slow\"}".to_string()
+                } else {
+                    let body = r#"{"choices":[{"message":{"content":"pear"}}]}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                stream
+                    .write_all(payload.as_bytes())
+                    .expect("write retry test response");
+            }
+        });
+
+        let report = run_longmemeval(LongMemEvalRunConfig {
+            dataset_path,
+            output_path: dir.path().join("predictions.jsonl"),
+            work_dir: dir.path().join("work"),
+            namespace_prefix: "longmemeval".to_string(),
+            reader_provider: LongMemEvalReaderProvider::OpenAiCompatible,
+            reader_endpoint: format!("http://{address}/v1"),
+            reader_model: "fake-chat".to_string(),
+            reader_api_key_env: None,
+            reader_timeout_secs: 30,
+            reader_num_predict: 32,
+            reader_max_retries: 2,
+            reader_retry_backoff_secs: 1,
+            budget_tokens: 256,
+            candidate_limit: 12,
+            offset: 0,
+            max_cases: None,
+            question_ids: Vec::new(),
+            question_types: Vec::new(),
+        })?;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(report.case_reports[0].hypothesis, "pear");
         Ok(())
     }
 

@@ -419,6 +419,10 @@ struct LongMemEvalRunArgs {
     reader_timeout_secs: u64,
     #[arg(long, default_value_t = 128)]
     reader_num_predict: usize,
+    #[arg(long, default_value_t = 4)]
+    reader_max_retries: usize,
+    #[arg(long, default_value_t = 2)]
+    reader_retry_backoff_secs: u64,
     #[arg(long, default_value_t = 512)]
     budget_tokens: usize,
     #[arg(long, default_value_t = 24)]
@@ -1329,6 +1333,8 @@ fn main() -> Result<()> {
                     }),
                     reader_timeout_secs: args.reader_timeout_secs,
                     reader_num_predict: args.reader_num_predict,
+                    reader_max_retries: args.reader_max_retries,
+                    reader_retry_backoff_secs: args.reader_retry_backoff_secs,
                     budget_tokens: args.budget_tokens,
                     candidate_limit: args.candidate_limit,
                     offset: args.offset,
