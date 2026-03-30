@@ -769,6 +769,108 @@ mod tests {
     }
 
     #[test]
+    fn read_context_surfaces_derived_belief_update_lessons() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "belief-learning".into(),
+                session_id: "session-1".into(),
+                objective: "surface belief learning".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let stale = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in London".into(),
+                body: "Alice currently lives in London.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.8),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let replacement = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in Berlin".into(),
+                body: "Alice currently lives in Berlin.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.82),
+                confidence: Some(0.82),
+                salience: Some(0.82),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        engine
+            .resolve_or_supersede(ResolveOrSupersedeInput {
+                continuity_id: stale.id.clone(),
+                actor_agent_id: "observer".into(),
+                new_status: ContinuityStatus::Superseded,
+                supersedes_id: Some(replacement.id.clone()),
+                resolution_note: Some("The user moved.".into()),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "What did we learn recently?".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert!(read
+            .learning
+            .items
+            .iter()
+            .any(|item| item.title.starts_with("Belief update:")));
+        assert!(read.learning.summary.contains("Belief update:"));
+        assert!(read.lessons.iter().any(|item| {
+            item.extra["user"]["learning_trigger"]
+                == serde_json::json!("prediction_error_reconsolidation")
+        }));
+    }
+
+    #[test]
     fn read_context_recall_surfaces_trauma_before_stale_working_state() {
         let dir = tempdir().unwrap();
         let engine = Engine::open(dir.path()).unwrap();
