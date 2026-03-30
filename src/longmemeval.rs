@@ -600,11 +600,24 @@ fn render_context_pack_text(items: &[RenderedContextItem]) -> String {
     if items.is_empty() {
         return "No continuity items were retrieved.".to_string();
     }
+    let full_sessions = items
+        .iter()
+        .map(|item| format!("{}\n{}", item.header, item.session_text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if full_sessions.len() <= longmemeval_full_context_char_budget() {
+        return full_sessions;
+    }
+
     items
         .into_iter()
         .map(|item| item.rendered.clone())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn longmemeval_full_context_char_budget() -> usize {
+    160_000
 }
 
 fn render_answer_prompt(
@@ -617,6 +630,7 @@ fn render_answer_prompt(
 Use only the retrieved evidence below.\n\
 If the evidence does not support a specific answer, reply exactly: Final answer: I don't know\n\
 Resolve the answer from the retrieved sessions, not from generic world knowledge.\n\
+Treat the retrieved sessions as the primary source of truth. If the reading notes omit something or conflict with the sessions, trust the sessions.\n\
 Pay attention to who said each fact: `User:` lines describe the human, while `Assistant:` lines describe prior recommendations or prior answers.\n\
 For preference questions, infer what the human would likely want from their stated interests, goals, and prior choices.\n\
 For counting questions, count distinct items, events, purchases, visits, tasks, or sessions across all evidence before answering.\n\
@@ -631,11 +645,11 @@ If you need scratch work, keep it brief. Always end with a final line in exactly
         case.question_date, case.question
     ));
     if let Some(notes) = reading_notes {
-        prompt.push_str("Question-conditioned reading notes:\n");
+        prompt.push_str("Question-conditioned reading notes (guide, not source of truth):\n");
         prompt.push_str(notes);
         prompt.push_str("\n\n");
     }
-    prompt.push_str("Retrieved continuity:\n");
+    prompt.push_str("Retrieved sessions:\n");
     prompt.push_str(context_text);
     prompt.push('\n');
     prompt
@@ -937,15 +951,29 @@ fn resolve_source_event_content(
     engine: &Engine,
     item: &crate::model::ContextPackItem,
 ) -> Result<Option<String>> {
-    let source_event_id = item
-        .provenance
-        .get("extra")
-        .and_then(|value| value.get("source_event_id"))
-        .and_then(|value| value.as_str());
+    let source_event_id = provenance_source_event_id(&item.provenance);
     source_event_id
         .map(|id| engine.event_by_id(id))
         .transpose()
         .map(|event| event.flatten().map(|event| event.input.content))
+}
+
+fn provenance_source_event_id(provenance: &serde_json::Value) -> Option<&str> {
+    provenance
+        .get("source_event_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            provenance
+                .get("source_event")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            provenance
+                .get("extra")
+                .and_then(|value| value.get("source_event_id"))
+                .and_then(|value| value.as_str())
+        })
 }
 
 fn is_quantitative_question(question: &str) -> bool {
@@ -1428,6 +1456,66 @@ Turn 5 User: I usually listen to fiction on the train.";
     fn normalize_hypothesis_prefers_final_answer_suffix() {
         let raw = "Relevant facts: apples and pears.\nFinal answer: 2";
         assert_eq!(normalize_hypothesis(raw), "2");
+    }
+
+    #[test]
+    fn provenance_source_event_id_accepts_current_and_legacy_shapes() {
+        assert_eq!(
+            provenance_source_event_id(&json!({
+                "source_event_id": "evt-top-level",
+                "source_event": {"id": "evt-nested"},
+                "extra": {"source_event_id": "evt-legacy"}
+            })),
+            Some("evt-top-level")
+        );
+        assert_eq!(
+            provenance_source_event_id(&json!({
+                "source_event": {"id": "evt-nested"},
+                "extra": {"source_event_id": "evt-legacy"}
+            })),
+            Some("evt-nested")
+        );
+        assert_eq!(
+            provenance_source_event_id(&json!({
+                "extra": {"source_event_id": "evt-legacy"}
+            })),
+            Some("evt-legacy")
+        );
+        assert_eq!(provenance_source_event_id(&json!({})), None);
+    }
+
+    #[test]
+    fn render_context_pack_text_prefers_full_sessions_when_under_budget() {
+        let items = vec![RenderedContextItem {
+            index: 0,
+            sort_key: Some("2023/05/23 (Tue) 18:02".to_string()),
+            final_score: 1.0,
+            header: "[m1][semantic][score=1.000][session_date=2023/05/23 (Tue) 18:02]"
+                .to_string(),
+            session_text: "LongMemEval session: sess-1\nSession date: 2023/05/23 (Tue) 18:02\nTurn 1 User: My blue bike needs a tune-up.".to_string(),
+            rendered: "excerpt".to_string(),
+        }];
+
+        let rendered = render_context_pack_text(&items);
+        assert!(rendered.contains("LongMemEval session: sess-1"));
+        assert!(rendered.contains("My blue bike needs a tune-up."));
+        assert!(!rendered.contains("excerpt"));
+    }
+
+    #[test]
+    fn render_context_pack_text_falls_back_to_excerpts_when_full_sessions_are_too_large() {
+        let oversized = "A".repeat(longmemeval_full_context_char_budget() + 1);
+        let items = vec![RenderedContextItem {
+            index: 0,
+            sort_key: Some("2023/05/23 (Tue) 18:02".to_string()),
+            final_score: 1.0,
+            header: "[m1][semantic][score=1.000][session_date=2023/05/23 (Tue) 18:02]".to_string(),
+            session_text: oversized,
+            rendered: "excerpt".to_string(),
+        }];
+
+        let rendered = render_context_pack_text(&items);
+        assert_eq!(rendered, "excerpt");
     }
 
     #[test]

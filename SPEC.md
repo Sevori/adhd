@@ -192,6 +192,9 @@ Behavior:
 - `ice longmemeval run` MUST read an official LongMemEval JSON dataset, replay each history into an isolated ICE root, query the continuity pack for the benchmark question, and generate a `jsonl` predictions file with `question_id` and `hypothesis`.
 - `ice longmemeval run` MUST support an answer reader backed by either Ollama's native generate API or an OpenAI-compatible chat-completions endpoint.
 - `ice longmemeval run` MAY use a question-conditioned reading-notes pass over the retrieved sessions before final answer generation, but those notes MUST be derived only from the retrieved continuity evidence for that case.
+- `ice longmemeval run` SHOULD recover and present the full retrieved session transcripts to the reader when they fit within a bounded prompt budget, rather than answering only from clipped excerpts, because LongMemEval questions often require cross-session aggregation that is lost in summaries.
+- When both recovered sessions and derived helper notes are present, the recovered sessions MUST remain the source of truth for answer generation.
+- The default LongMemEval reader output budget MUST be large enough to finish supported counting and arithmetic answers without truncating the final answer; the default budget is 256 output tokens.
 - Replay MUST preserve the dataset session timestamps by ingesting them as source timestamps, not the local wall-clock time.
 - `ice longmemeval run` MUST NOT use benchmark-only labels such as `answer_session_ids`, `has_answer`, or `question_type` to generate the answer.
 - `ice longmemeval evaluate` MUST optionally call the official evaluator scripts from a checked-out LongMemEval repository and surface the generated evaluation artifact paths.

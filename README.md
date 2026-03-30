@@ -278,6 +278,7 @@ ICE now ships a native `LongMemEval` runner for generating benchmark predictions
 - preserves the original dataset timestamps during ingest
 - retrieves a bounded continuity pack for the benchmark question
 - can run a question-conditioned reading-notes pass over each retrieved session before the final answer
+- recovers full retrieved session transcripts for the final answer when they fit the prompt budget, instead of relying only on clipped excerpts
 - asks a reader model for the final answer
 - writes `jsonl` predictions in the official `{"question_id","hypothesis"}` shape
 
@@ -335,6 +336,11 @@ The command writes:
 - the official predictions file you can submit to the evaluator
 - a JSON report next to it
 - a debug directory with one prompt, one response, one serialized context pack, and optional reading notes per case
+
+Implementation note:
+
+- the final answer prompt now prefers the full recovered session transcripts when they stay within a bounded prompt budget; the reading notes are treated as a guide, not the source of truth
+- the default LongMemEval reader output budget is `256` tokens so arithmetic and counting answers do not get truncated mid-response
 
 ### Run the official evaluator
 

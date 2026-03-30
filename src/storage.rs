@@ -1252,6 +1252,7 @@ impl Storage {
     }
 
     pub fn provenance_for_memory(&self, memory: &MemoryRecord) -> Result<serde_json::Value> {
+        let source_event_id = memory.source_event_id.clone();
         let source_event = if let Some(source_event_id) = &memory.source_event_id {
             self.conn
                 .query_row(
@@ -1263,6 +1264,7 @@ impl Storage {
                     params![source_event_id],
                     |row| {
                         Ok(serde_json::json!({
+                            "id": source_event_id,
                             "ts": row.get::<_, String>(0)?,
                             "kind": row.get::<_, String>(1)?,
                             "source": row.get::<_, String>(2)?,
@@ -1292,6 +1294,7 @@ impl Storage {
         Ok(serde_json::json!({
             "memory_id": memory.id,
             "layer": memory.layer,
+            "source_event_id": source_event_id,
             "source_event": source_event,
             "parents": parents,
             "dimensions": dimensions,
