@@ -305,6 +305,18 @@ ice --root .ice-longmemeval longmemeval run \
   --candidate-limit 24
 ```
 
+You can also target any OpenAI-compatible `/v1/chat/completions` endpoint:
+
+```bash
+export OPENAI_API_KEY=YOUR_KEY
+ice --root .ice-longmemeval longmemeval run \
+  --dataset data/longmemeval/longmemeval_oracle.json \
+  --output artifacts/longmemeval/oracle-openai-compatible.jsonl \
+  --reader-provider openai-compatible \
+  --reader-endpoint https://api.openai.com/v1 \
+  --reader-model gpt-4.1-mini
+```
+
 Useful controls:
 
 - `--max-cases 20` to smoke-test on a subset
@@ -312,6 +324,8 @@ Useful controls:
 - `--question-id q1,q2` to target specific cases
 - `--question-type temporal-reasoning,multi-session` to focus on one family
 - `--work-dir /tmp/ice-longmemeval-work` to store per-case replay roots elsewhere
+- `--reader-provider ollama|openai-compatible` to switch the answer generator
+- `--reader-api-key-env OPENAI_API_KEY` to source a bearer token for compatible hosted endpoints
 
 The command writes:
 
@@ -325,6 +339,9 @@ Clone the benchmark repository first:
 
 ```bash
 git clone https://github.com/xiaowu0162/LongMemEval.git
+python3.12 -m venv /tmp/LongMemEval-venv
+/tmp/LongMemEval-venv/bin/pip install -r ./LongMemEval/requirements-lite.txt
+/tmp/LongMemEval-venv/bin/pip install 'httpx<0.28'
 ```
 
 Then run:
@@ -335,11 +352,13 @@ ice longmemeval evaluate \
   --repo ./LongMemEval \
   --predictions artifacts/longmemeval/oracle-predictions.jsonl \
   --dataset data/longmemeval/longmemeval_oracle.json \
+  --python-bin /tmp/LongMemEval-venv/bin/python \
   --judge-model gpt-4o
 ```
 
 Notes:
 
 - the official `print_qa_metrics.py` script currently assumes `gpt-4o`; ICE skips that summary step automatically for other judge models
+- the upstream evaluator stack is currently reliable on Python 3.12; Python 3.14 and `httpx 0.28+` break `openai==1.35.1`
 - the runner does not ingest benchmark-only supervision labels such as `answer_session_ids` or `has_answer`
 - `ice ingest` now accepts `--timestamp <RFC3339>` when you need to replay historical events with real time ordering

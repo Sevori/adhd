@@ -19,8 +19,10 @@ pub struct LongMemEvalRunConfig {
     pub output_path: PathBuf,
     pub work_dir: PathBuf,
     pub namespace_prefix: String,
+    pub reader_provider: LongMemEvalReaderProvider,
     pub reader_endpoint: String,
     pub reader_model: String,
+    pub reader_api_key_env: Option<String>,
     pub reader_timeout_secs: u64,
     pub reader_num_predict: usize,
     pub budget_tokens: usize,
@@ -29,6 +31,13 @@ pub struct LongMemEvalRunConfig {
     pub max_cases: Option<usize>,
     pub question_ids: Vec<String>,
     pub question_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LongMemEvalReaderProvider {
+    Ollama,
+    OpenAiCompatible,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +57,7 @@ pub struct LongMemEvalRunReport {
     pub report_path: String,
     pub debug_root: String,
     pub work_dir: String,
+    pub reader_provider: String,
     pub reader_model: String,
     pub reader_endpoint: String,
     pub budget_tokens: usize,
@@ -119,6 +129,49 @@ struct OllamaGenerateOptions {
 #[derive(Debug, Clone, Deserialize)]
 struct OllamaGenerateResponse {
     response: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiChatCompletionRequest {
+    model: String,
+    messages: Vec<OpenAiChatMessage>,
+    temperature: f64,
+    max_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiChatCompletionResponse {
+    choices: Vec<OpenAiChatChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiChatChoice {
+    message: OpenAiChatResponseMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiChatResponseMessage {
+    content: OpenAiMessageContent,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
 }
 
 pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunReport> {
@@ -203,8 +256,10 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
         let prompt = render_answer_prompt(&case, &context_text);
         let hypothesis = generate_answer(
             &client,
+            config.reader_provider,
             &config.reader_endpoint,
             &config.reader_model,
+            config.reader_api_key_env.as_deref(),
             config.reader_num_predict,
             &prompt,
         )
@@ -254,6 +309,7 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
         report_path: report_path.display().to_string(),
         debug_root: debug_root.display().to_string(),
         work_dir: config.work_dir.display().to_string(),
+        reader_provider: reader_provider_label(config.reader_provider).to_string(),
         reader_model: config.reader_model,
         reader_endpoint: config.reader_endpoint,
         budget_tokens: config.budget_tokens,
@@ -504,38 +560,111 @@ Retrieved continuity:\n\
 
 fn generate_answer(
     client: &Client,
+    provider: LongMemEvalReaderProvider,
     endpoint: &str,
     model: &str,
+    api_key_env: Option<&str>,
     num_predict: usize,
     prompt: &str,
 ) -> Result<String> {
-    let response = client
-        .post(format!("{endpoint}/api/generate"))
-        .json(&OllamaGenerateRequest {
+    match provider {
+        LongMemEvalReaderProvider::Ollama => {
+            let response = client
+                .post(format!("{}/api/generate", endpoint.trim_end_matches('/')))
+                .json(&OllamaGenerateRequest {
+                    model: model.to_string(),
+                    prompt: prompt.to_string(),
+                    stream: false,
+                    options: OllamaGenerateOptions {
+                        temperature: 0.0,
+                        num_predict,
+                    },
+                })
+                .send()
+                .with_context(|| format!("requesting LongMemEval answer from {model}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .unwrap_or_else(|error| format!("unable to read ollama error body: {error}"));
+                return Err(anyhow!(
+                    "LongMemEval reader request failed for {} with {}: {}",
+                    model,
+                    status,
+                    body
+                ));
+            }
+            let payload: OllamaGenerateResponse = response.json()?;
+            Ok(normalize_hypothesis(&payload.response))
+        }
+        LongMemEvalReaderProvider::OpenAiCompatible => generate_openai_compatible_answer(
+            client,
+            endpoint,
+            model,
+            api_key_env,
+            num_predict,
+            prompt,
+        ),
+    }
+}
+
+fn generate_openai_compatible_answer(
+    client: &Client,
+    endpoint: &str,
+    model: &str,
+    api_key_env: Option<&str>,
+    num_predict: usize,
+    prompt: &str,
+) -> Result<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let api_key = resolve_reader_api_key(api_key_env);
+    if endpoint.contains("api.openai.com") && api_key.is_none() {
+        bail!(
+            "LongMemEval openai-compatible reader requires an API key; set {} or pass a different endpoint",
+            api_key_env.unwrap_or("OPENAI_API_KEY")
+        );
+    }
+
+    let mut request = client
+        .post(format!("{endpoint}/chat/completions"))
+        .json(&OpenAiChatCompletionRequest {
             model: model.to_string(),
-            prompt: prompt.to_string(),
-            stream: false,
-            options: OllamaGenerateOptions {
-                temperature: 0.0,
-                num_predict,
-            },
-        })
+            messages: vec![OpenAiChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            temperature: 0.0,
+            max_tokens: num_predict,
+        });
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+
+    let response = request
         .send()
-        .with_context(|| format!("requesting LongMemEval answer from {model}"))?;
+        .with_context(|| format!("requesting openai-compatible LongMemEval answer from {model}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response
-            .text()
-            .unwrap_or_else(|error| format!("unable to read ollama error body: {error}"));
+        let body = response.text().unwrap_or_else(|error| {
+            format!("unable to read openai-compatible error body: {error}")
+        });
         return Err(anyhow!(
-            "LongMemEval reader request failed for {} with {}: {}",
+            "LongMemEval openai-compatible reader request failed for {} with {}: {}",
             model,
             status,
             body
         ));
     }
-    let payload: OllamaGenerateResponse = response.json()?;
-    Ok(normalize_hypothesis(&payload.response))
+    let payload: OpenAiChatCompletionResponse = response.json()?;
+    let content = payload
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("openai-compatible chat completion returned no choices"))?
+        .message
+        .content
+        .into_text();
+    Ok(normalize_hypothesis(&content))
 }
 
 fn normalize_hypothesis(raw: &str) -> String {
@@ -553,6 +682,41 @@ fn normalize_hypothesis(raw: &str) -> String {
         "I don't know".to_string()
     } else {
         unquoted.to_string()
+    }
+}
+
+impl OpenAiMessageContent {
+    fn into_text(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|part| {
+                    if part.kind == "text" {
+                        part.text
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+fn resolve_reader_api_key(env_name: Option<&str>) -> Option<String> {
+    env_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn reader_provider_label(provider: LongMemEvalReaderProvider) -> &'static str {
+    match provider {
+        LongMemEvalReaderProvider::Ollama => "ollama",
+        LongMemEvalReaderProvider::OpenAiCompatible => "openai-compatible",
     }
 }
 
@@ -682,6 +846,37 @@ mod tests {
         format!("http://{}", address)
     }
 
+    fn spawn_fake_openai_compatible(response_body: &str) -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind fake openai-compatible server");
+        let address = listener
+            .local_addr()
+            .expect("fake openai-compatible address");
+        let body = response_body.to_string();
+        thread::spawn(move || {
+            for _ in 0..1 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("accept fake openai-compatible request");
+                let mut request = vec![0_u8; 8192];
+                let read = stream
+                    .read(&mut request)
+                    .expect("read fake openai-compatible request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.contains("POST /v1/chat/completions"));
+                let payload = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(payload.as_bytes())
+                    .expect("write fake openai-compatible response");
+            }
+        });
+        format!("http://{}/v1", address)
+    }
+
     #[test]
     fn parse_longmemeval_datetime_supports_benchmark_format() {
         let parsed =
@@ -720,8 +915,10 @@ mod tests {
             output_path: output_path.clone(),
             work_dir: dir.path().join("work"),
             namespace_prefix: "longmemeval".to_string(),
+            reader_provider: LongMemEvalReaderProvider::Ollama,
             reader_endpoint: fake_endpoint,
             reader_model: "fake-reader".to_string(),
+            reader_api_key_env: None,
             reader_timeout_secs: 30,
             reader_num_predict: 32,
             budget_tokens: 256,
@@ -744,6 +941,60 @@ mod tests {
             Path::new(&report.case_reports[0].response_path).exists(),
             "expected response artifact to exist"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn run_longmemeval_supports_openai_compatible_reader() -> Result<()> {
+        let dir = tempdir()?;
+        let dataset_path = dir.path().join("oracle.json");
+        fs::write(
+            &dataset_path,
+            serde_json::to_vec_pretty(&json!([
+                {
+                    "question_id": "sample_2",
+                    "question_type": "single-session-user",
+                    "question": "What snack did I mention?",
+                    "answer": "almonds",
+                    "question_date": "2023/04/11 (Tue) 09:15",
+                    "haystack_dates": ["2023/04/10 (Mon) 18:30"],
+                    "haystack_session_ids": ["sess-2"],
+                    "haystack_sessions": [[
+                        {"role": "user", "content": "I packed almonds for the train ride.", "has_answer": true},
+                        {"role": "assistant", "content": "That is a solid snack.", "has_answer": false}
+                    ]],
+                    "answer_session_ids": ["sess-2"]
+                }
+            ]))?,
+        )?;
+        let output_path = dir.path().join("predictions.jsonl");
+        let fake_endpoint = spawn_fake_openai_compatible(
+            r#"{"choices":[{"message":{"content":"almonds"}}]}"#,
+        );
+
+        let report = run_longmemeval(LongMemEvalRunConfig {
+            dataset_path,
+            output_path: output_path.clone(),
+            work_dir: dir.path().join("work"),
+            namespace_prefix: "longmemeval".to_string(),
+            reader_provider: LongMemEvalReaderProvider::OpenAiCompatible,
+            reader_endpoint: fake_endpoint,
+            reader_model: "fake-chat".to_string(),
+            reader_api_key_env: None,
+            reader_timeout_secs: 30,
+            reader_num_predict: 32,
+            budget_tokens: 256,
+            candidate_limit: 12,
+            offset: 0,
+            max_cases: None,
+            question_ids: Vec::new(),
+            question_types: Vec::new(),
+        })?;
+
+        let predictions = fs::read_to_string(&output_path)?;
+        assert!(predictions.contains("\"question_id\":\"sample_2\""));
+        assert!(predictions.contains("\"hypothesis\":\"almonds\""));
+        assert_eq!(report.reader_provider, "openai-compatible");
         Ok(())
     }
 

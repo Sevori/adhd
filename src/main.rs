@@ -44,7 +44,8 @@ use ice::goose_install::{
 };
 use ice::http::serve;
 use ice::longmemeval::{
-    LongMemEvalEvaluateConfig, LongMemEvalRunConfig, evaluate_longmemeval, run_longmemeval,
+    LongMemEvalEvaluateConfig, LongMemEvalReaderProvider, LongMemEvalRunConfig,
+    evaluate_longmemeval, run_longmemeval,
 };
 use ice::market_head::{
     MarketHeadChallengeConfig, MarketHeadChallengeManifest, compare_market_head_judge_calibration,
@@ -406,10 +407,14 @@ struct LongMemEvalRunArgs {
     work_dir: Option<PathBuf>,
     #[arg(long, default_value = "longmemeval")]
     namespace_prefix: String,
-    #[arg(long, default_value = "http://127.0.0.1:11434")]
-    reader_endpoint: String,
+    #[arg(long, value_enum, default_value_t = LongMemEvalReaderProviderArg::Ollama)]
+    reader_provider: LongMemEvalReaderProviderArg,
+    #[arg(long)]
+    reader_endpoint: Option<String>,
     #[arg(long, default_value = "qwen2.5:14b")]
     reader_model: String,
+    #[arg(long)]
+    reader_api_key_env: Option<String>,
     #[arg(long, default_value_t = 180)]
     reader_timeout_secs: u64,
     #[arg(long, default_value_t = 128)]
@@ -440,6 +445,37 @@ struct LongMemEvalEvaluateArgs {
     python_bin: String,
     #[arg(long, default_value = "gpt-4o")]
     judge_model: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LongMemEvalReaderProviderArg {
+    Ollama,
+    OpenaiCompatible,
+}
+
+impl From<LongMemEvalReaderProviderArg> for LongMemEvalReaderProvider {
+    fn from(value: LongMemEvalReaderProviderArg) -> Self {
+        match value {
+            LongMemEvalReaderProviderArg::Ollama => Self::Ollama,
+            LongMemEvalReaderProviderArg::OpenaiCompatible => Self::OpenAiCompatible,
+        }
+    }
+}
+
+fn default_longmemeval_reader_endpoint(provider: LongMemEvalReaderProviderArg) -> &'static str {
+    match provider {
+        LongMemEvalReaderProviderArg::Ollama => "http://127.0.0.1:11434",
+        LongMemEvalReaderProviderArg::OpenaiCompatible => "https://api.openai.com/v1",
+    }
+}
+
+fn default_longmemeval_reader_api_key_env(
+    provider: LongMemEvalReaderProviderArg,
+) -> Option<&'static str> {
+    match provider {
+        LongMemEvalReaderProviderArg::Ollama => None,
+        LongMemEvalReaderProviderArg::OpenaiCompatible => Some("OPENAI_API_KEY"),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1272,13 +1308,25 @@ fn main() -> Result<()> {
                     .work_dir
                     .clone()
                     .unwrap_or_else(|| root.join("longmemeval").join("work"));
+                let reader_provider: LongMemEvalReaderProvider = args.reader_provider.into();
+                let reader_endpoint = args
+                    .reader_endpoint
+                    .clone()
+                    .unwrap_or_else(|| {
+                        default_longmemeval_reader_endpoint(args.reader_provider).to_string()
+                    });
                 let report = run_longmemeval(LongMemEvalRunConfig {
                     dataset_path: args.dataset,
                     output_path: args.output,
                     work_dir,
                     namespace_prefix: args.namespace_prefix,
-                    reader_endpoint: args.reader_endpoint,
+                    reader_provider,
+                    reader_endpoint,
                     reader_model: args.reader_model,
+                    reader_api_key_env: args.reader_api_key_env.or_else(|| {
+                        default_longmemeval_reader_api_key_env(args.reader_provider)
+                            .map(str::to_string)
+                    }),
                     reader_timeout_secs: args.reader_timeout_secs,
                     reader_num_predict: args.reader_num_predict,
                     budget_tokens: args.budget_tokens,
