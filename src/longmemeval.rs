@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::{cmp::Ordering, collections::BTreeSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -20,6 +21,7 @@ pub struct LongMemEvalRunConfig {
     pub work_dir: PathBuf,
     pub namespace_prefix: String,
     pub reader_provider: LongMemEvalReaderProvider,
+    pub reader_method: LongMemEvalReaderMethod,
     pub reader_endpoint: String,
     pub reader_model: String,
     pub reader_api_key_env: Option<String>,
@@ -42,6 +44,13 @@ pub enum LongMemEvalReaderProvider {
     OpenAiCompatible,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LongMemEvalReaderMethod {
+    Direct,
+    ConSeparate,
+}
+
 #[derive(Debug, Clone)]
 pub struct LongMemEvalEvaluateConfig {
     pub repo_path: PathBuf,
@@ -60,6 +69,7 @@ pub struct LongMemEvalRunReport {
     pub debug_root: String,
     pub work_dir: String,
     pub reader_provider: String,
+    pub reader_method: String,
     pub reader_model: String,
     pub reader_endpoint: String,
     pub reader_max_retries: usize,
@@ -81,6 +91,7 @@ pub struct LongMemEvalCaseReport {
     pub duration_ms: u128,
     pub case_root: String,
     pub context_manifest_path: String,
+    pub reading_notes_path: Option<String>,
     pub prompt_path: String,
     pub response_path: String,
 }
@@ -255,15 +266,35 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
             budget_tokens: config.budget_tokens,
             candidate_limit: config.candidate_limit,
         })?;
-        let context_text = render_context_pack_text(&pack);
-        let prompt = render_answer_prompt(&case, &context_text);
+        let rendered_items = render_context_items(&engine, &pack, &case.question)?;
+        let context_text = render_context_pack_text(&rendered_items);
+        let reading_notes = match config.reader_method {
+            LongMemEvalReaderMethod::Direct => None,
+            LongMemEvalReaderMethod::ConSeparate => Some(extract_reading_notes(
+                &client,
+                config.reader_provider,
+                &config.reader_endpoint,
+                &config.reader_model,
+                config.reader_api_key_env.as_deref(),
+                config.reader_num_predict,
+                config.reader_max_retries,
+                config.reader_retry_backoff_secs,
+                &case,
+                &rendered_items,
+            )?),
+        };
+        let answer_num_predict = match config.reader_method {
+            LongMemEvalReaderMethod::Direct => config.reader_num_predict,
+            LongMemEvalReaderMethod::ConSeparate => config.reader_num_predict.max(192),
+        };
+        let prompt = render_answer_prompt(&case, &context_text, reading_notes.as_deref());
         let hypothesis = generate_answer(
             &client,
             config.reader_provider,
             &config.reader_endpoint,
             &config.reader_model,
             config.reader_api_key_env.as_deref(),
-            config.reader_num_predict,
+            answer_num_predict,
             config.reader_max_retries,
             config.reader_retry_backoff_secs,
             &prompt,
@@ -283,9 +314,20 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
         let case_debug_root = debug_root.join(&question_slug);
         fs::create_dir_all(&case_debug_root)
             .with_context(|| format!("creating case debug root {}", case_debug_root.display()))?;
+        let reading_notes_path = reading_notes.as_ref().map(|_| {
+            case_debug_root
+                .join("reading-notes.txt")
+                .display()
+                .to_string()
+        });
         let prompt_path = case_debug_root.join("prompt.txt");
         let response_path = case_debug_root.join("response.txt");
         let pack_path = case_debug_root.join("context-pack.json");
+        if let Some(notes) = &reading_notes {
+            fs::write(case_debug_root.join("reading-notes.txt"), notes.as_bytes()).with_context(
+                || format!("writing reading notes under {}", case_debug_root.display()),
+            )?;
+        }
         fs::write(&prompt_path, prompt.as_bytes())
             .with_context(|| format!("writing prompt {}", prompt_path.display()))?;
         fs::write(&response_path, hypothesis.as_bytes())
@@ -302,6 +344,7 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
             duration_ms: started.elapsed().as_millis(),
             case_root: case_root.display().to_string(),
             context_manifest_path: pack.manifest_path,
+            reading_notes_path,
             prompt_path: prompt_path.display().to_string(),
             response_path: response_path.display().to_string(),
         });
@@ -315,6 +358,7 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
         debug_root: debug_root.display().to_string(),
         work_dir: config.work_dir.display().to_string(),
         reader_provider: reader_provider_label(config.reader_provider).to_string(),
+        reader_method: reader_method_label(config.reader_method).to_string(),
         reader_model: config.reader_model,
         reader_endpoint: config.reader_endpoint,
         reader_max_retries: config.reader_max_retries,
@@ -524,47 +568,422 @@ fn replay_case(
     Ok(())
 }
 
-fn render_context_pack_text(pack: &ContextPack) -> String {
+fn render_context_items(
+    engine: &Engine,
+    pack: &ContextPack,
+    question: &str,
+) -> Result<Vec<RenderedContextItem>> {
     if pack.items.is_empty() {
-        return "No continuity items were retrieved.".to_string();
+        return Ok(Vec::new());
     }
-    pack.items
+    let mut rendered = pack
+        .items
         .iter()
         .enumerate()
-        .map(|(index, item)| {
-            format!(
-                "[m{}][{}][score={:.3}] {}",
-                index + 1,
-                item.layer,
-                item.final_score,
-                trim_text(&item.body, 800)
-            )
+        .map(|(index, item)| render_context_item(engine, index, item, question))
+        .collect::<Result<Vec<_>>>()?;
+    rendered.sort_by(|left, right| {
+        left.sort_key
+            .cmp(&right.sort_key)
+            .then_with(|| {
+                right
+                    .final_score
+                    .partial_cmp(&left.final_score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    Ok(rendered)
+}
+
+fn render_context_pack_text(items: &[RenderedContextItem]) -> String {
+    if items.is_empty() {
+        return "No continuity items were retrieved.".to_string();
+    }
+    items
+        .into_iter()
+        .map(|item| item.rendered.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_answer_prompt(
+    case: &LongMemEvalCase,
+    context_text: &str,
+    reading_notes: Option<&str>,
+) -> String {
+    let mut prompt = String::from(
+        "You are answering a LongMemEval benchmark question with retrieved memory evidence.\n\
+Use only the retrieved evidence below.\n\
+If the evidence does not support a specific answer, reply exactly: Final answer: I don't know\n\
+Resolve the answer from the retrieved sessions, not from generic world knowledge.\n\
+Pay attention to who said each fact: `User:` lines describe the human, while `Assistant:` lines describe prior recommendations or prior answers.\n\
+For preference questions, infer what the human would likely want from their stated interests, goals, and prior choices.\n\
+For counting questions, count distinct items, events, purchases, visits, tasks, or sessions across all evidence before answering.\n\
+For arithmetic questions, list the relevant figures from the evidence, compute carefully, and do not drop any session.\n\
+For temporal or update questions, use the session dates and prefer the latest evidence that predates the question date.\n\
+Do not mention ICE, context packs, memories, provenance, or benchmark metadata.\n\
+If you need scratch work, keep it brief. Always end with a final line in exactly this format: Final answer: <answer>\n\
+\n",
+    );
+    prompt.push_str(&format!(
+        "Question date: {}\nQuestion: {}\n\n",
+        case.question_date, case.question
+    ));
+    if let Some(notes) = reading_notes {
+        prompt.push_str("Question-conditioned reading notes:\n");
+        prompt.push_str(notes);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("Retrieved continuity:\n");
+    prompt.push_str(context_text);
+    prompt.push('\n');
+    prompt
+}
+
+#[derive(Debug, Clone)]
+struct RenderedContextItem {
+    index: usize,
+    sort_key: Option<String>,
+    final_score: f64,
+    header: String,
+    session_text: String,
+    rendered: String,
+}
+
+fn render_context_item(
+    engine: &Engine,
+    index: usize,
+    item: &crate::model::ContextPackItem,
+    question: &str,
+) -> Result<RenderedContextItem> {
+    let source_text =
+        resolve_source_event_content(engine, item)?.unwrap_or_else(|| item.body.clone());
+    let transcript = extract_longmemeval_transcript(&source_text);
+    let session_date = extract_session_date_line(&transcript).map(str::to_string);
+    let excerpt = focus_transcript_excerpt(&transcript, question, 1100);
+    let header = match session_date.as_deref() {
+        Some(date) => format!(
+            "[m{}][{}][score={:.3}][session_date={}]",
+            index + 1,
+            item.layer,
+            item.final_score,
+            date
+        ),
+        None => format!(
+            "[m{}][{}][score={:.3}]",
+            index + 1,
+            item.layer,
+            item.final_score
+        ),
+    };
+
+    Ok(RenderedContextItem {
+        index,
+        sort_key: session_date,
+        final_score: item.final_score,
+        header: header.clone(),
+        session_text: transcript,
+        rendered: format!("{header}\n{excerpt}"),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ReadingNote {
+    session_date: Option<String>,
+    text: String,
+}
+
+fn extract_longmemeval_transcript(body: &str) -> String {
+    let body = body.trim();
+    let without_metadata = body
+        .split_once("content=")
+        .map(|(_, content)| content)
+        .unwrap_or(body);
+    let anchored = without_metadata
+        .find("LongMemEval session:")
+        .map(|index| &without_metadata[index..])
+        .unwrap_or(without_metadata);
+    anchored
+        .lines()
+        .take_while(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("| entities:") && !trimmed.contains(" | entities:")
         })
         .collect::<Vec<_>>()
         .join("\n")
+        .trim()
+        .to_string()
 }
 
-fn render_answer_prompt(case: &LongMemEvalCase, context_text: &str) -> String {
+fn extract_session_date_line(transcript: &str) -> Option<&str> {
+    transcript
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Session date: "))
+}
+
+fn focus_transcript_excerpt(transcript: &str, question: &str, max_chars: usize) -> String {
+    let lines = transcript
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "No retrieved transcript content.".to_string();
+    }
+
+    let keywords = question_keywords(question);
+    let header_len = lines
+        .iter()
+        .take(2)
+        .filter(|line| {
+            line.starts_with("LongMemEval session:") || line.starts_with("Session date:")
+        })
+        .count()
+        .max(1);
+
+    let mut scored = lines
+        .iter()
+        .enumerate()
+        .skip(header_len)
+        .map(|(index, line)| (index, score_line_against_question(line, &keywords)))
+        .filter(|(_, score)| *score > 0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    if scored.is_empty() {
+        return head_tail_excerpt(&lines, max_chars);
+    }
+
+    let mut included = BTreeSet::new();
+    for index in 0..header_len.min(lines.len()) {
+        included.insert(index);
+    }
+    for (index, _) in scored.into_iter().take(3) {
+        for line_index in index.saturating_sub(1)..=(index + 2).min(lines.len().saturating_sub(1)) {
+            included.insert(line_index);
+        }
+    }
+
+    let ordered = included.into_iter().collect::<Vec<_>>();
+    let mut rendered = Vec::new();
+    let mut previous = None;
+    for index in ordered {
+        if previous.is_some_and(|last| index > last + 1) {
+            rendered.push("...".to_string());
+        }
+        rendered.push(lines[index].to_string());
+        previous = Some(index);
+    }
+    trim_text(&rendered.join("\n"), max_chars)
+}
+
+fn head_tail_excerpt(lines: &[&str], max_chars: usize) -> String {
+    if lines.len() <= 8 {
+        return trim_text(&lines.join("\n"), max_chars);
+    }
+    let mut rendered = lines
+        .iter()
+        .take(5)
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    rendered.push("...".to_string());
+    let mut text = rendered.join("\n");
+    text.push('\n');
+    text.push_str(&lines[lines.len().saturating_sub(3)..].join("\n"));
+    trim_text(&text, max_chars)
+}
+
+fn question_keywords(question: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "can", "did", "do", "does", "for", "from",
+        "had", "has", "have", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our",
+        "please", "previous", "that", "the", "their", "this", "to", "was", "were", "what", "when",
+        "where", "which", "who", "with", "you", "your",
+    ];
+
+    let mut keywords = question
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !STOPWORDS.contains(&token.as_str()))
+        .collect::<Vec<_>>();
+    keywords.sort();
+    keywords.dedup();
+    keywords
+}
+
+fn score_line_against_question(line: &str, keywords: &[String]) -> usize {
+    if keywords.is_empty() {
+        return 0;
+    }
+    let line_lower = line.to_ascii_lowercase();
+    keywords
+        .iter()
+        .filter(|keyword| line_lower.contains(keyword.as_str()))
+        .count()
+}
+
+fn extract_reading_notes(
+    client: &Client,
+    provider: LongMemEvalReaderProvider,
+    endpoint: &str,
+    model: &str,
+    api_key_env: Option<&str>,
+    num_predict: usize,
+    max_retries: usize,
+    retry_backoff_secs: u64,
+    case: &LongMemEvalCase,
+    items: &[RenderedContextItem],
+) -> Result<String> {
+    if items.is_empty() {
+        return Ok("No reading notes were extracted.".to_string());
+    }
+    let mut notes = Vec::with_capacity(items.len());
+    let note_budget = num_predict.clamp(96, 256);
+    for item in items {
+        let prompt = render_reading_note_prompt(case, item);
+        let raw = generate_reader_text(
+            client,
+            provider,
+            endpoint,
+            model,
+            api_key_env,
+            note_budget,
+            max_retries,
+            retry_backoff_secs,
+            &prompt,
+        )?;
+        let text = normalize_reading_note(&raw);
+        if text.eq_ignore_ascii_case("empty") {
+            continue;
+        }
+        notes.push(ReadingNote {
+            session_date: item.sort_key.clone(),
+            text,
+        });
+    }
+    Ok(render_reading_notes(&notes))
+}
+
+fn render_reading_note_prompt(case: &LongMemEvalCase, item: &RenderedContextItem) -> String {
+    let quantitative_instructions = if is_quantitative_question(&case.question) {
+        "The question is quantitative. Copy exact quantities, amounts, durations, ages, dates, and item names from the session.\n\
+Prefer verbatim evidence lines over paraphrase.\n\
+If a line might contribute to a count, sum, average, or comparison, keep it.\n\
+"
+    } else {
+        ""
+    };
     format!(
-        "You are answering a LongMemEval benchmark question with an ICE continuity pack.\n\
-Return only the final answer as plain text.\n\
-Use only the retrieved continuity evidence below.\n\
-If the evidence does not support a specific answer, reply exactly: I don't know\n\
-For temporal questions, reason over the session dates and the question date.\n\
-Do not mention ICE, context packs, memories, provenance, or benchmark metadata.\n\
+        "I will give you one chat history session between a user and an assistant, plus a question.\n\
+Write compact reading notes containing every fact from either speaker that could matter for answering the question.\n\
+Explicitly preserve whether the evidence came from the User or the Assistant.\n\
+Preserve quantities, money, counts, dates, durations, purchases, visits, attended events, explicit outcomes, and price ranges.\n\
+{quantitative_instructions}\
+Do not answer the question yet.\n\
+If the session contains no relevant evidence, output exactly: empty\n\
+\n\
+Session header: {header}\n\
+Session content:\n\
+{session}\n\
 \n\
 Question date: {question_date}\n\
 Question: {question}\n\
 \n\
-Retrieved continuity:\n\
-{context_text}\n",
+Reading notes:",
+        header = item.header,
+        session = item.session_text,
         question_date = case.question_date,
         question = case.question,
-        context_text = context_text,
+        quantitative_instructions = quantitative_instructions,
     )
 }
 
+fn normalize_reading_note(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('`').trim();
+    if trimmed.is_empty() {
+        return "empty".to_string();
+    }
+    trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_reading_notes(notes: &[ReadingNote]) -> String {
+    if notes.is_empty() {
+        return "No reading notes were extracted.".to_string();
+    }
+    notes
+        .iter()
+        .enumerate()
+        .map(|(index, note)| match note.session_date.as_deref() {
+            Some(session_date) => format!(
+                "[note{}][session_date={}]\n{}",
+                index + 1,
+                session_date,
+                note.text
+            ),
+            None => format!("[note{}]\n{}", index + 1, note.text),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn resolve_source_event_content(
+    engine: &Engine,
+    item: &crate::model::ContextPackItem,
+) -> Result<Option<String>> {
+    let source_event_id = item
+        .provenance
+        .get("extra")
+        .and_then(|value| value.get("source_event_id"))
+        .and_then(|value| value.as_str());
+    source_event_id
+        .map(|id| engine.event_by_id(id))
+        .transpose()
+        .map(|event| event.flatten().map(|event| event.input.content))
+}
+
+fn is_quantitative_question(question: &str) -> bool {
+    let lowered = question.trim().to_ascii_lowercase();
+    lowered.starts_with("how many")
+        || lowered.starts_with("how much")
+        || lowered.starts_with("what is the total")
+        || lowered.starts_with("what's the total")
+        || lowered.starts_with("what is the average")
+        || lowered.starts_with("what's the average")
+}
+
 fn generate_answer(
+    client: &Client,
+    provider: LongMemEvalReaderProvider,
+    endpoint: &str,
+    model: &str,
+    api_key_env: Option<&str>,
+    num_predict: usize,
+    max_retries: usize,
+    retry_backoff_secs: u64,
+    prompt: &str,
+) -> Result<String> {
+    let raw = generate_reader_text(
+        client,
+        provider,
+        endpoint,
+        model,
+        api_key_env,
+        num_predict,
+        max_retries,
+        retry_backoff_secs,
+        prompt,
+    )?;
+    Ok(normalize_hypothesis(&raw))
+}
+
+fn generate_reader_text(
     client: &Client,
     provider: LongMemEvalReaderProvider,
     endpoint: &str,
@@ -582,9 +1001,9 @@ fn generate_answer(
     for attempt in 1..=attempts {
         let result = match provider {
             LongMemEvalReaderProvider::Ollama => {
-                generate_ollama_answer(client, endpoint, model, num_predict, prompt)
+                generate_ollama_text(client, endpoint, model, num_predict, prompt)
             }
-            LongMemEvalReaderProvider::OpenAiCompatible => generate_openai_compatible_answer(
+            LongMemEvalReaderProvider::OpenAiCompatible => generate_openai_compatible_text(
                 client,
                 endpoint,
                 model,
@@ -595,7 +1014,7 @@ fn generate_answer(
         };
 
         match result {
-            Ok(answer) => return Ok(answer),
+            Ok(text) => return Ok(text),
             Err(error) => {
                 let retryable = is_retryable_reader_error(&error);
                 if attempt >= attempts || !retryable {
@@ -610,7 +1029,7 @@ fn generate_answer(
     Err(last_error.unwrap_or_else(|| anyhow!("LongMemEval reader failed without an error payload")))
 }
 
-fn generate_ollama_answer(
+fn generate_ollama_text(
     client: &Client,
     endpoint: &str,
     model: &str,
@@ -643,10 +1062,10 @@ fn generate_ollama_answer(
         ));
     }
     let payload: OllamaGenerateResponse = response.json()?;
-    Ok(normalize_hypothesis(&payload.response))
+    Ok(payload.response)
 }
 
-fn generate_openai_compatible_answer(
+fn generate_openai_compatible_text(
     client: &Client,
     endpoint: &str,
     model: &str,
@@ -703,7 +1122,7 @@ fn generate_openai_compatible_answer(
         .message
         .content
         .into_text();
-    Ok(normalize_hypothesis(&content))
+    Ok(content)
 }
 
 fn normalize_hypothesis(raw: &str) -> String {
@@ -711,7 +1130,17 @@ fn normalize_hypothesis(raw: &str) -> String {
     if trimmed.is_empty() {
         return "I don't know".to_string();
     }
-    let single_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+    let lines = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    for line in lines.iter().rev() {
+        if let Some(answer) = strip_final_answer_prefix(line) {
+            return normalize_hypothesis(answer);
+        }
+    }
+    let single_line = lines.last().copied().unwrap_or(trimmed).trim();
     let unquoted = single_line
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
@@ -722,6 +1151,14 @@ fn normalize_hypothesis(raw: &str) -> String {
     } else {
         unquoted.to_string()
     }
+}
+
+fn strip_final_answer_prefix(line: &str) -> Option<&str> {
+    let prefix = "final answer:";
+    let lowered = line.to_ascii_lowercase();
+    lowered
+        .strip_prefix(prefix)
+        .map(|_| line[prefix.len()..].trim())
 }
 
 impl OpenAiMessageContent {
@@ -750,6 +1187,13 @@ fn reader_provider_label(provider: LongMemEvalReaderProvider) -> &'static str {
     match provider {
         LongMemEvalReaderProvider::Ollama => "ollama",
         LongMemEvalReaderProvider::OpenAiCompatible => "openai-compatible",
+    }
+}
+
+fn reader_method_label(method: LongMemEvalReaderMethod) -> &'static str {
+    match method {
+        LongMemEvalReaderMethod::Direct => "direct",
+        LongMemEvalReaderMethod::ConSeparate => "con-separate",
     }
 }
 
@@ -936,6 +1380,57 @@ mod tests {
     }
 
     #[test]
+    fn extract_longmemeval_transcript_strips_storage_metadata() {
+        let body = "kind=document\nsource=longmemeval\ncontent=LongMemEval session: sess-1\nSession date: 2023/05/23 (Tue) 18:02\nTurn 1 User: I graduated with a physics degree.\nTurn 2 Assistant: Nice.\n| entities: path:2023/05/23";
+        let transcript = extract_longmemeval_transcript(body);
+        assert!(transcript.starts_with("LongMemEval session: sess-1"));
+        assert!(transcript.contains("I graduated with a physics degree."));
+        assert!(!transcript.contains("kind=document"));
+        assert!(!transcript.contains("| entities:"));
+    }
+
+    #[test]
+    fn focus_transcript_excerpt_prefers_lines_matching_question_keywords() {
+        let transcript = "LongMemEval session: sess-1\n\
+Session date: 2023/05/23 (Tue) 18:02\n\
+Turn 1 User: I enjoy audiobooks during my commute.\n\
+Turn 2 Assistant: That's a nice habit.\n\
+Turn 3 User: My daily commute to work takes about 45 minutes each way.\n\
+Turn 4 Assistant: That's enough time for a few chapters.\n\
+Turn 5 User: I usually listen to fiction on the train.";
+        let excerpt =
+            focus_transcript_excerpt(transcript, "How long is my daily commute to work?", 500);
+        assert!(excerpt.contains("45 minutes each way"));
+        assert!(excerpt.contains("Session date: 2023/05/23 (Tue) 18:02"));
+    }
+
+    #[test]
+    fn head_tail_excerpt_keeps_tail_when_no_question_match_exists() {
+        let lines = [
+            "LongMemEval session: sess-1",
+            "Session date: 2023/05/23 (Tue) 18:02",
+            "Turn 1 User: Intro line.",
+            "Turn 2 Assistant: More setup.",
+            "Turn 3 User: Still setup.",
+            "Turn 4 Assistant: More setup.",
+            "Turn 5 User: Useful tail fact.",
+            "Turn 6 Assistant: Tail follow-up.",
+            "Turn 7 User: Final tail fact.",
+        ];
+        let excerpt = head_tail_excerpt(&lines, 500);
+        assert!(excerpt.contains("LongMemEval session: sess-1"));
+        assert!(excerpt.contains("Useful tail fact."));
+        assert!(excerpt.contains("Final tail fact."));
+        assert!(excerpt.contains("..."));
+    }
+
+    #[test]
+    fn normalize_hypothesis_prefers_final_answer_suffix() {
+        let raw = "Relevant facts: apples and pears.\nFinal answer: 2";
+        assert_eq!(normalize_hypothesis(raw), "2");
+    }
+
+    #[test]
     fn run_longmemeval_writes_predictions_and_debug_artifacts() -> Result<()> {
         let dir = tempdir()?;
         let dataset_path = dir.path().join("oracle.json");
@@ -967,6 +1462,7 @@ mod tests {
             work_dir: dir.path().join("work"),
             namespace_prefix: "longmemeval".to_string(),
             reader_provider: LongMemEvalReaderProvider::Ollama,
+            reader_method: LongMemEvalReaderMethod::Direct,
             reader_endpoint: fake_endpoint,
             reader_model: "fake-reader".to_string(),
             reader_api_key_env: None,
@@ -1030,6 +1526,7 @@ mod tests {
             work_dir: dir.path().join("work"),
             namespace_prefix: "longmemeval".to_string(),
             reader_provider: LongMemEvalReaderProvider::OpenAiCompatible,
+            reader_method: LongMemEvalReaderMethod::Direct,
             reader_endpoint: fake_endpoint,
             reader_model: "fake-chat".to_string(),
             reader_api_key_env: None,
@@ -1108,6 +1605,7 @@ mod tests {
             work_dir: dir.path().join("work"),
             namespace_prefix: "longmemeval".to_string(),
             reader_provider: LongMemEvalReaderProvider::OpenAiCompatible,
+            reader_method: LongMemEvalReaderMethod::Direct,
             reader_endpoint: format!("http://{address}/v1"),
             reader_model: "fake-chat".to_string(),
             reader_api_key_env: None,

@@ -10,10 +10,10 @@ use crate::continuity::AgentBadgeRecord;
 use crate::dispatch;
 use crate::embedding::cosine_similarity;
 use crate::model::{
-    ContextPack, ContextPackManifest, DimensionValue, EventInput, HandoffInput, HandoffRecord,
-    IngestManifest, MemoryLayer, MemoryRecord, MetricsSnapshot, QueryInput, RelationRecord,
-    ReplayRow, Selector, SubscriptionInput, SubscriptionPoll, SubscriptionRecord, ViewInput,
-    ViewManifest, ViewRecord,
+    ContextPack, ContextPackManifest, DimensionValue, EventInput, EventRecord, HandoffInput,
+    HandoffRecord, IngestManifest, MemoryLayer, MemoryRecord, MetricsSnapshot, QueryInput,
+    RelationRecord, ReplayRow, Selector, SubscriptionInput, SubscriptionPoll, SubscriptionRecord,
+    ViewInput, ViewManifest, ViewRecord,
 };
 use crate::query::build_context_pack;
 use crate::storage::Storage;
@@ -208,6 +208,11 @@ impl Engine {
     pub fn explain_context_pack(&self, id: &str) -> Result<ContextPackManifest> {
         let storage = self.lock_storage("explain_context_pack");
         storage.explain_context_pack(id)
+    }
+
+    pub fn event_by_id(&self, id: &str) -> Result<Option<EventRecord>> {
+        let storage = self.lock_storage("event_by_id");
+        storage.event_by_id(id)
     }
 
     pub fn annotate_item(
