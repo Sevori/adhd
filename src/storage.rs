@@ -3982,9 +3982,7 @@ impl Storage {
         let replacement_title = compact_learning_text(&replacement.title, 72);
         let previous_body = compact_learning_text(&previous.body, 220);
         let replacement_body = compact_learning_text(&replacement.body, 220);
-        let lesson_title = format!(
-            "Belief update: {previous_title} -> {replacement_title}"
-        );
+        let lesson_title = format!("Belief update: {previous_title} -> {replacement_title}");
         let lesson_body = format!(
             "Stable belief changed for {belief_key}.\nPrevious: {previous_body}\nCurrent: {replacement_body}\nReason: {reason}",
             belief_key = previous_key,
@@ -11349,8 +11347,7 @@ mod tests {
         let lesson = items
             .iter()
             .find(|item| {
-                item.kind == ContinuityKind::Lesson
-                    && item.title.starts_with("Belief update:")
+                item.kind == ContinuityKind::Lesson && item.title.starts_with("Belief update:")
             })
             .unwrap();
 

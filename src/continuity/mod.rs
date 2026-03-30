@@ -858,11 +858,12 @@ mod tests {
             })
             .unwrap();
 
-        assert!(read
-            .learning
-            .items
-            .iter()
-            .any(|item| item.title.starts_with("Belief update:")));
+        assert!(
+            read.learning
+                .items
+                .iter()
+                .any(|item| item.title.starts_with("Belief update:"))
+        );
         assert!(read.learning.summary.contains("Belief update:"));
         assert!(read.lessons.iter().any(|item| {
             item.extra["user"]["learning_trigger"]
