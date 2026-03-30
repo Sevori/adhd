@@ -104,6 +104,8 @@ impl UnifiedContinuityInterface for Engine {
             let latest_snapshot_id = storage.latest_snapshot_id(&context.id)?;
             let pack_item_count = pack.items.len();
             let now = Utc::now();
+            let lessons = filter_kind(&continuity, ContinuityKind::Lesson);
+            let learning = build_learning_view(&input.objective, &continuity, now);
             let agent_badges =
                 storage.list_agent_badges(Some(context.namespace.as_str()), None)?;
             let mut lane_projections =
@@ -160,6 +162,8 @@ impl UnifiedContinuityInterface for Engine {
                 incidents: filter_kind(&continuity, ContinuityKind::Incident),
                 operational_scars: filter_kind(&continuity, ContinuityKind::OperationalScar),
                 outcomes: filter_kind(&continuity, ContinuityKind::Outcome),
+                lessons,
+                learning: learning.clone(),
                 signals: filter_kind(&continuity, ContinuityKind::Signal),
                 open_threads: continuity
                     .iter()
@@ -174,6 +178,8 @@ impl UnifiedContinuityInterface for Engine {
                     "continuity_recall_timings_ms": recall.timings_ms,
                     "continuity_recall_compiler": recall.compiler,
                     "continuity_recall_top_why": recall.items.first().map(|item| item.why.clone()).unwrap_or_default(),
+                    "learning_mode": learning.mode,
+                    "learning_item_count": learning.items.len(),
                 }),
             })
         })

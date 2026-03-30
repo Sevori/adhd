@@ -15,10 +15,11 @@ pub use schema::{
     ContinuityHandoffInput, ContinuityHandoffRecord, ContinuityItemInput, ContinuityItemRecord,
     ContinuityPlasticityState, ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem,
     ContinuityRetentionState, CoordinationProjectedLane, CoordinationSignalInput, ExplainTarget,
-    HandoffProof, HandoffProofRegister, HeartbeatInput, LaneProjectionRecord, MachineProfile,
-    OpenContextInput, OutcomeInput, ReadContextInput, RecallInput, ResolveOrSupersedeInput,
-    ResumeInput, ResumeRecord, SignalInput, SnapshotInput, SnapshotManifest, SnapshotRecord,
-    SupportRef, TelemetryEventInput, UpsertAgentBadgeInput, WriteEventInput,
+    HandoffProof, HandoffProofRegister, HeartbeatInput, LaneProjectionRecord, LearningView,
+    LearningViewMode, MachineProfile, OpenContextInput, OutcomeInput, ReadContextInput,
+    RecallInput, ResolveOrSupersedeInput, ResumeInput, ResumeRecord, SignalInput, SnapshotInput,
+    SnapshotManifest, SnapshotRecord, SupportRef, TelemetryEventInput, UpsertAgentBadgeInput,
+    WriteEventInput,
 };
 pub use types::{
     ContextStatus, ContinuityKind, ContinuityStatus, CoordinationLane, CoordinationSeverity,
@@ -501,6 +502,270 @@ mod tests {
         );
         assert_eq!(read.recall.items[0].kind, ContinuityKind::OperationalScar);
         assert!(read.recall.summary.contains("operational_scar"));
+    }
+
+    #[test]
+    fn read_context_surfaces_recent_learning_digest_by_default() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "recent-learning".into(),
+                session_id: "session-1".into(),
+                objective: "surface recent learning".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let lesson = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Weekly pattern".into(),
+                body: "Repeated retries mean the interface needs a stronger guardrail.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.9),
+                salience: Some(0.78),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let outcome = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Outcome,
+                title: "Outcome hardening".into(),
+                body: "Adding a stronger fallback stopped the drift.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.86),
+                confidence: Some(0.9),
+                salience: Some(0.82),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let decision = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Fresh guardrail".into(),
+                body: "Default to the newest learnings before expanding the full history.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.92),
+                confidence: Some(0.91),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Fact,
+                title: "Ignore this fact".into(),
+                body: "Facts should not pollute the learning digest.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.95),
+                confidence: Some(0.95),
+                salience: Some(0.95),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        for (id, ts) in [
+            (lesson.id.as_str(), Utc::now() - Duration::days(6)),
+            (outcome.id.as_str(), Utc::now() - Duration::days(2)),
+            (decision.id.as_str(), Utc::now() - Duration::hours(3)),
+        ] {
+            conn.execute(
+                "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+                params![id, ts.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "What did we learn recently?".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.lessons.len(), 1);
+        assert_eq!(read.learning.mode, LearningViewMode::Recent);
+        assert_eq!(
+            read.learning
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Fresh guardrail", "Outcome hardening", "Weekly pattern"]
+        );
+        assert!(read.learning.summary.contains("Recent learning digest"));
+        assert!(read.learning.summary.contains("Fresh guardrail"));
+        assert_eq!(read.rationale["learning_mode"].as_str(), Some("recent"));
+        assert_eq!(read.rationale["learning_item_count"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn read_context_expands_full_learning_line_when_objective_requests_history() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "learning-lineage".into(),
+                session_id: "session-1".into(),
+                objective: "track learning lineage".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let incident = engine
+            .mark_incident(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Incident,
+                title: "Initial miss".into(),
+                body: "The system kept resurfacing stale context instead of the latest practice."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.83),
+                confidence: Some(0.88),
+                salience: Some(0.84),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let lesson = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Mid-course correction".into(),
+                body: "Tie learning to continuity instead of leaving it inside prompts.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.87),
+                confidence: Some(0.9),
+                salience: Some(0.83),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let outcome = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Outcome,
+                title: "Current operator habit".into(),
+                body: "The operator now sees the latest learning first and can ask for the whole line.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.91),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        for (id, ts) in [
+            (incident.id.as_str(), Utc::now() - Duration::days(10)),
+            (lesson.id.as_str(), Utc::now() - Duration::days(4)),
+            (outcome.id.as_str(), Utc::now() - Duration::days(1)),
+        ] {
+            conn.execute(
+                "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+                params![id, ts.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "Show the full learning timeline over time.".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.learning.mode, LearningViewMode::Lineage);
+        assert_eq!(
+            read.learning
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Initial miss",
+                "Mid-course correction",
+                "Current operator habit"
+            ]
+        );
+        assert!(read.learning.summary.contains("Initial miss"));
+        assert!(read.learning.summary.contains("Current operator habit"));
+        assert_eq!(read.rationale["learning_mode"].as_str(), Some("lineage"));
+        assert_eq!(read.rationale["learning_item_count"].as_u64(), Some(3));
     }
 
     #[test]

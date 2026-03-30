@@ -294,9 +294,25 @@ pub struct ContextRead {
     pub incidents: Vec<ContinuityItemRecord>,
     pub operational_scars: Vec<ContinuityItemRecord>,
     pub outcomes: Vec<ContinuityItemRecord>,
+    pub lessons: Vec<ContinuityItemRecord>,
+    pub learning: LearningView,
     pub signals: Vec<ContinuityItemRecord>,
     pub open_threads: Vec<ContinuityItemRecord>,
     pub rationale: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningViewMode {
+    Recent,
+    Lineage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningView {
+    pub mode: LearningViewMode,
+    pub summary: String,
+    pub items: Vec<ContinuityItemRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

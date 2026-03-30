@@ -127,6 +127,17 @@ ICE distinguishes fast episodic accumulation from slower semantic consolidation.
 - Semantic promotion SHOULD be conservative and SHOULD prefer repeated or independently confirmed state over one-off extraction.
 - For belief-keyed continuity items, promotion to durable semantic-like status SHOULD happen only after repeated confirmation or explicit operator validation, not from a single event alone.
 
+### Learning View
+
+`continuity_read_context` MUST expose a first-class learning view derived from continuity, not from prompt-only post-processing.
+
+- The learning view MUST surface the newest learnings by default so an agent can quickly answer "what did we learn recently?" without reconstructing chronology manually.
+- The learning view MUST also support a lineage mode. When the objective explicitly asks for history, timeline, evolution, lineage, or "what we learned over time", ICE SHOULD return the full learning line in chronological order.
+- The learning view SHOULD be derived from continuity kinds that represent actual adaptation pressure, especially `lesson`, `outcome`, `decision`, `incident`, and `operational_scar`.
+- The default learning view SHOULD prefer recent, high-signal learning items and SHOULD summarize them into a short digest that feels like a weekly review.
+- The lineage learning view SHOULD preserve sequence. It MUST help an agent explain how current practice emerged from earlier mistakes, decisions, outcomes, and lessons.
+- Learning summaries MUST remain provenance-backed. They MAY compress wording, but they MUST be built from stored continuity items rather than hidden benchmark labels or external annotations.
+
 ## MCP Tools
 
 The MCP interface exposes these tools via stdio:

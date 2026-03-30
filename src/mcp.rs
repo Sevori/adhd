@@ -936,7 +936,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "continuity_read_context",
-            "description": "Read the current context pack, active constraints, scars, decisions, and open threads. If no context is specified, the machine organism is used by default.",
+            "description": "Read the current context pack, active constraints, scars, decisions, learnings, and open threads. By default this surfaces the newest learnings; objectives that ask for history or lineage expand the full learning line. If no context is specified, the machine organism is used by default.",
             "inputSchema": {
                 "type": "object",
                 "required": ["objective"],
@@ -1540,6 +1540,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read["work_claims"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn continuity_read_context_tool_serializes_learning_view() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let bootstrap = dispatch_tool(
+            &engine,
+            "continuity_bootstrap",
+            json!({
+                "agent_id": "planner-a",
+                "agent_type": "codex",
+                "namespace": "demo",
+                "task_id": "learning-view",
+                "session_id": "session-1",
+                "objective": "Track learning over time"
+            }),
+        )
+        .unwrap();
+        let context_id = bootstrap["context"]["id"].as_str().unwrap();
+
+        dispatch_tool(
+            &engine,
+            "continuity_write_item",
+            json!({
+                "context_id": context_id,
+                "author_agent_id": "planner-a",
+                "kind": "lesson",
+                "title": "First lesson",
+                "body": "Keep the weekly learning digest short by default.",
+                "scope": "project"
+            }),
+        )
+        .unwrap();
+        dispatch_tool(
+            &engine,
+            "continuity_write_item",
+            json!({
+                "context_id": context_id,
+                "author_agent_id": "planner-a",
+                "kind": "decision",
+                "title": "Second pivot",
+                "body": "Expand the full line when the operator asks for history.",
+                "scope": "project"
+            }),
+        )
+        .unwrap();
+
+        let read = dispatch_tool(
+            &engine,
+            "continuity_read_context",
+            json!({
+                "context_id": context_id,
+                "objective": "Show the learning timeline over time"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(read["learning"]["mode"].as_str(), Some("lineage"));
+        assert_eq!(read["lessons"].as_array().map(Vec::len), Some(1));
+        assert_eq!(read["rationale"]["learning_mode"].as_str(), Some("lineage"));
     }
 
     #[test]
