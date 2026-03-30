@@ -1,0 +1,97 @@
+name: LongMemEval Oracle
+
+on:
+  workflow_dispatch:
+    inputs:
+      split:
+        description: Benchmark split to run
+        required: false
+        default: oracle
+        type: choice
+        options:
+          - oracle
+          - s
+          - m
+      max_cases:
+        description: Optional case limit for a partial run
+        required: false
+        default: ""
+        type: string
+      reader_model:
+        description: Reader model for answer generation
+        required: false
+        default: gpt-4.1-mini
+        type: string
+      judge_model:
+        description: Judge model for the official evaluator
+        required: false
+        default: gpt-4o
+        type: string
+
+concurrency:
+  group: longmemeval-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  longmemeval-oracle:
+    name: LongMemEval Oracle
+    if: ${{ secrets.OPENAI_API_KEY != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_ORGANIZATION: ${{ secrets.OPENAI_ORGANIZATION }}
+      LONGMEMEVAL_SPLIT: ${{ github.event.inputs.split || 'oracle' }}
+      LONGMEMEVAL_MAX_CASES: ${{ github.event.inputs.max_cases || '' }}
+      LONGMEMEVAL_READER_MODEL: ${{ github.event.inputs.reader_model || 'gpt-4.1-mini' }}
+      LONGMEMEVAL_JUDGE_MODEL: ${{ github.event.inputs.judge_model || 'gpt-4o' }}
+      ICE_BIN: target/release/ice
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run LongMemEval benchmark
+        run: bash scripts/run_longmemeval_oracle.sh
+
+      - name: Upload LongMemEval artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: longmemeval-${{ env.LONGMEMEVAL_SPLIT }}
+          path: .artifacts/longmemeval/
+          if-no-files-found: error
+          retention-days: 14
+
+  longmemeval-unavailable:
+    name: LongMemEval Oracle Unavailable
+    if: ${{ !(secrets.OPENAI_API_KEY != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Explain why the benchmark did not run
+        run: |
+          echo "LongMemEval benchmark skipped."
+          echo
+          echo "- OPENAI_API_KEY secret is missing, or"
+          echo "- this is a pull request from a fork where repository secrets are not exposed."

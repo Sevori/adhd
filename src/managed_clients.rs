@@ -382,8 +382,18 @@ mod tests {
 
     #[test]
     fn resolve_home_returns_absolute_path() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+
         let home = resolve_home("test-client").unwrap();
         assert!(home.is_absolute());
+        assert_eq!(home, dir.path());
+
+        restore_home(previous_home);
     }
 
     #[test]

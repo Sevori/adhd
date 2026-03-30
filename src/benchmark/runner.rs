@@ -275,6 +275,7 @@ pub(crate) fn populate_scenario(
                 kind: phase.kind.clone(),
                 agent_id: phase.actor_id.clone(),
                 agent_role: Some(phase.actor_role.clone()),
+                timestamp: None,
                 session_id: format!("session-{}", scenario.id),
                 task_id: Some(scenario.task_id.clone()),
                 project_id: Some(scenario.namespace.clone()),

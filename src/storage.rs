@@ -875,7 +875,7 @@ impl Storage {
         telemetry: &EngineTelemetry,
     ) -> Result<IngestManifest> {
         let start_total = Instant::now();
-        let now = Utc::now();
+        let now = input.timestamp.unwrap_or_else(Utc::now);
         let event_id = Uuid::now_v7().to_string();
         let content_hash = blake3::hash(input.content.as_bytes()).to_hex().to_string();
         let byte_size = input.content.len();
@@ -7303,6 +7303,9 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> Result<EventRecord> {
             scope,
             agent_id: row.get(4)?,
             agent_role: row.get(5)?,
+            timestamp: Some(
+                DateTime::parse_from_rfc3339(&row.get::<_, String>(1)?)?.with_timezone(&Utc),
+            ),
             session_id: row.get(6)?,
             task_id: row.get(7)?,
             project_id: row.get(8)?,
@@ -7645,6 +7648,7 @@ mod tests {
                     kind: EventKind::Prompt,
                     agent_id: "agent-a".into(),
                     agent_role: None,
+                    timestamp: None,
                     session_id: "session-a".into(),
                     task_id: Some("task-a".into()),
                     project_id: Some("project-a".into()),
@@ -7693,6 +7697,50 @@ mod tests {
     }
 
     #[test]
+    fn ingest_uses_explicit_timestamp_when_provided() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let telemetry = EngineTelemetry::new();
+        let mut storage = Storage::open(config).unwrap();
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2023-04-10T23:07:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let manifest = storage
+            .ingest(
+                EventInput {
+                    kind: EventKind::Document,
+                    agent_id: "importer".into(),
+                    agent_role: Some("importer".into()),
+                    timestamp: Some(timestamp),
+                    session_id: "historical-session".into(),
+                    task_id: Some("historical-task".into()),
+                    project_id: None,
+                    goal_id: None,
+                    run_id: None,
+                    namespace: Some("history".into()),
+                    environment: Some("longmemeval".into()),
+                    source: "import".into(),
+                    scope: Scope::Shared,
+                    tags: vec!["history".into()],
+                    dimensions: Vec::new(),
+                    content: "Historical note".into(),
+                    attributes: serde_json::json!({}),
+                },
+                &telemetry,
+            )
+            .unwrap();
+
+        assert_eq!(manifest.event.ts, timestamp);
+        let replay = storage
+            .replay(&telemetry, Some("historical-session"), 10)
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event.ts, timestamp);
+        assert_eq!(replay[0].event.input.timestamp, Some(timestamp));
+    }
+
+    #[test]
     fn continuity_priority_query_uses_salience_index() {
         let dir = tempdir().unwrap();
         let config = EngineConfig::with_root(dir.path());
@@ -7737,6 +7785,7 @@ mod tests {
                         kind: kind.clone(),
                         agent_id: "agent-a".into(),
                         agent_role: None,
+                        timestamp: None,
                         session_id: "session-a".into(),
                         task_id: Some("task-a".into()),
                         project_id: Some("project-a".into()),
@@ -7793,6 +7842,7 @@ mod tests {
                         kind: EventKind::Note,
                         agent_id: agent.into(),
                         agent_role: Some(agent.into()),
+                        timestamp: None,
                         session_id: "session-a".into(),
                         task_id: Some("task-a".into()),
                         project_id: Some("project-a".into()),
@@ -7891,6 +7941,7 @@ mod tests {
                     kind: EventKind::Note,
                     agent_id: "agent-a".into(),
                     agent_role: Some("planner".into()),
+                    timestamp: None,
                     session_id: "session-a".into(),
                     task_id: Some("task-a".into()),
                     project_id: Some("project-a".into()),
@@ -7956,6 +8007,7 @@ mod tests {
                     kind: EventKind::Note,
                     agent_id: "agent-a".into(),
                     agent_role: Some("planner".into()),
+                    timestamp: None,
                     session_id: "session-a".into(),
                     task_id: Some("task-a".into()),
                     project_id: Some("project-a".into()),

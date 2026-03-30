@@ -142,6 +142,8 @@ pub struct EventInput {
     pub kind: EventKind,
     pub agent_id: String,
     pub agent_role: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<DateTime<Utc>>,
     pub session_id: String,
     pub task_id: Option<String>,
     pub project_id: Option<String>,

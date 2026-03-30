@@ -40,6 +40,8 @@ SQLite (WAL mode) + zstd compressed log
 ### Events
 Raw observations from agents. Kind: `Observation`, `Action`, `Request`, `Response`, `Reflection`. Stored in `events` table. Each event produces memories in Hot and Episodic layers.
 
+Event ingestion MAY carry an optional source timestamp. When present, ICE MUST persist that timestamp as the event timestamp instead of the wall-clock ingest time. This exists to support replaying historical transcripts, benchmark traces, or imported chat sessions without destroying temporal ordering.
+
 ### Continuity Items
 Derived from events or written directly. The durable knowledge graph.
 
@@ -172,6 +174,7 @@ Phase 3 closes the metacognitive loop by making the extraction prompt dynamic. S
 ice --root <path>     # Storage root (default: .ice)
 ice ingest            # Ingest events from stdin
 ice query             # Query memories
+ice longmemeval       # Run or evaluate LongMemEval integrations
 ice mcp               # Start MCP stdio server
 ice serve             # Start HTTP server (default :4040)
 ice bench             # Run benchmark suite
@@ -179,6 +182,18 @@ ice metrics           # Show engine metrics
 ice handoff           # Generate handoff proof
 ice explain           # Explain context state
 ```
+
+### LongMemEval Integration
+
+ICE MAY run the external `LongMemEval` benchmark as an adapter workflow.
+
+Behavior:
+
+- `ice longmemeval run` MUST read an official LongMemEval JSON dataset, replay each history into an isolated ICE root, query the continuity pack for the benchmark question, and generate a `jsonl` predictions file with `question_id` and `hypothesis`.
+- `ice longmemeval run` MUST support an answer reader backed by either Ollama's native generate API or an OpenAI-compatible chat-completions endpoint.
+- Replay MUST preserve the dataset session timestamps by ingesting them as source timestamps, not the local wall-clock time.
+- `ice longmemeval run` MUST NOT use benchmark-only labels such as `answer_session_ids`, `has_answer`, or `question_type` to generate the answer.
+- `ice longmemeval evaluate` MUST optionally call the official evaluator scripts from a checked-out LongMemEval repository and surface the generated evaluation artifact paths.
 
 ### Managed Client Integration
 

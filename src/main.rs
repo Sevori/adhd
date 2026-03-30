@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
@@ -43,6 +43,10 @@ use ice::goose_install::{
     goose_status, install_goose, uninstall_goose,
 };
 use ice::http::serve;
+use ice::longmemeval::{
+    LongMemEvalEvaluateConfig, LongMemEvalReaderProvider, LongMemEvalRunConfig,
+    evaluate_longmemeval, run_longmemeval,
+};
 use ice::market_head::{
     MarketHeadChallengeConfig, MarketHeadChallengeManifest, compare_market_head_judge_calibration,
     compare_market_head_judge_disagreement, compare_market_head_judge_pack,
@@ -90,6 +94,8 @@ enum Command {
     Subscribe(SubscribeArgs),
     Explain(ExplainArgs),
     Metrics,
+    #[command(name = "longmemeval", alias = "long-mem-eval")]
+    LongMemEval(LongMemEvalArgs),
     Serve(ServeArgs),
     Mcp,
     Wrap(WrapArgs),
@@ -112,6 +118,8 @@ struct IngestArgs {
     kind: EventKind,
     #[arg(long)]
     agent: String,
+    #[arg(long)]
+    timestamp: Option<DateTime<Utc>>,
     #[arg(long)]
     session: String,
     #[arg(long)]
@@ -375,6 +383,103 @@ struct BenchArgs {
 struct UciArgs {
     #[arg(long)]
     json: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct LongMemEvalArgs {
+    #[command(subcommand)]
+    command: LongMemEvalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LongMemEvalCommand {
+    Run(LongMemEvalRunArgs),
+    Evaluate(LongMemEvalEvaluateArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct LongMemEvalRunArgs {
+    #[arg(long)]
+    dataset: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+    #[arg(long, default_value = "longmemeval")]
+    namespace_prefix: String,
+    #[arg(long, value_enum, default_value_t = LongMemEvalReaderProviderArg::Ollama)]
+    reader_provider: LongMemEvalReaderProviderArg,
+    #[arg(long)]
+    reader_endpoint: Option<String>,
+    #[arg(long, default_value = "qwen2.5:14b")]
+    reader_model: String,
+    #[arg(long)]
+    reader_api_key_env: Option<String>,
+    #[arg(long, default_value_t = 180)]
+    reader_timeout_secs: u64,
+    #[arg(long, default_value_t = 128)]
+    reader_num_predict: usize,
+    #[arg(long, default_value_t = 4)]
+    reader_max_retries: usize,
+    #[arg(long, default_value_t = 2)]
+    reader_retry_backoff_secs: u64,
+    #[arg(long, default_value_t = 512)]
+    budget_tokens: usize,
+    #[arg(long, default_value_t = 24)]
+    candidate_limit: usize,
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    #[arg(long)]
+    max_cases: Option<usize>,
+    #[arg(long = "question-id", value_delimiter = ',')]
+    question_ids: Vec<String>,
+    #[arg(long = "question-type", value_delimiter = ',')]
+    question_types: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct LongMemEvalEvaluateArgs {
+    #[arg(long)]
+    repo: PathBuf,
+    #[arg(long)]
+    predictions: PathBuf,
+    #[arg(long)]
+    dataset: PathBuf,
+    #[arg(long, default_value = "python3")]
+    python_bin: String,
+    #[arg(long, default_value = "gpt-4o")]
+    judge_model: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LongMemEvalReaderProviderArg {
+    Ollama,
+    OpenaiCompatible,
+}
+
+impl From<LongMemEvalReaderProviderArg> for LongMemEvalReaderProvider {
+    fn from(value: LongMemEvalReaderProviderArg) -> Self {
+        match value {
+            LongMemEvalReaderProviderArg::Ollama => Self::Ollama,
+            LongMemEvalReaderProviderArg::OpenaiCompatible => Self::OpenAiCompatible,
+        }
+    }
+}
+
+fn default_longmemeval_reader_endpoint(provider: LongMemEvalReaderProviderArg) -> &'static str {
+    match provider {
+        LongMemEvalReaderProviderArg::Ollama => "http://127.0.0.1:11434",
+        LongMemEvalReaderProviderArg::OpenaiCompatible => "https://api.openai.com/v1",
+    }
+}
+
+fn default_longmemeval_reader_api_key_env(
+    provider: LongMemEvalReaderProviderArg,
+) -> Option<&'static str> {
+    match provider {
+        LongMemEvalReaderProviderArg::Ollama => None,
+        LongMemEvalReaderProviderArg::OpenaiCompatible => Some("OPENAI_API_KEY"),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1029,6 +1134,7 @@ fn main() -> Result<()> {
                 kind: args.kind,
                 agent_id: args.agent,
                 agent_role: args.agent_role,
+                timestamp: args.timestamp,
                 session_id: args.session,
                 task_id: args.task,
                 project_id: args.project,
@@ -1200,6 +1306,52 @@ fn main() -> Result<()> {
             let snapshot = engine.metrics_snapshot()?;
             print!("{}", snapshot.prometheus_text);
         }
+        Command::LongMemEval(args) => match args.command {
+            LongMemEvalCommand::Run(args) => {
+                let work_dir = args
+                    .work_dir
+                    .clone()
+                    .unwrap_or_else(|| root.join("longmemeval").join("work"));
+                let reader_provider: LongMemEvalReaderProvider = args.reader_provider.into();
+                let reader_endpoint = args.reader_endpoint.clone().unwrap_or_else(|| {
+                    default_longmemeval_reader_endpoint(args.reader_provider).to_string()
+                });
+                let report = run_longmemeval(LongMemEvalRunConfig {
+                    dataset_path: args.dataset,
+                    output_path: args.output,
+                    work_dir,
+                    namespace_prefix: args.namespace_prefix,
+                    reader_provider,
+                    reader_endpoint,
+                    reader_model: args.reader_model,
+                    reader_api_key_env: args.reader_api_key_env.or_else(|| {
+                        default_longmemeval_reader_api_key_env(args.reader_provider)
+                            .map(str::to_string)
+                    }),
+                    reader_timeout_secs: args.reader_timeout_secs,
+                    reader_num_predict: args.reader_num_predict,
+                    reader_max_retries: args.reader_max_retries,
+                    reader_retry_backoff_secs: args.reader_retry_backoff_secs,
+                    budget_tokens: args.budget_tokens,
+                    candidate_limit: args.candidate_limit,
+                    offset: args.offset,
+                    max_cases: args.max_cases,
+                    question_ids: args.question_ids,
+                    question_types: args.question_types,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            LongMemEvalCommand::Evaluate(args) => {
+                let report = evaluate_longmemeval(LongMemEvalEvaluateConfig {
+                    repo_path: args.repo,
+                    predictions_path: args.predictions,
+                    dataset_path: args.dataset,
+                    python_bin: args.python_bin,
+                    judge_model: args.judge_model,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        },
         Command::Serve(args) => {
             let engine = open_engine(&root)?;
             block_on(serve(engine.clone(), args.addr))?;
@@ -3080,6 +3232,7 @@ async fn run_repo_sync(
                     kind: EventKind::Document,
                     agent_id: args.agent.clone(),
                     agent_role: Some("repo_sync".to_string()),
+                    timestamp: None,
                     session_id: session_id.clone(),
                     task_id: Some(args.task.clone()),
                     project_id: Some(repo_root_name(&repo_root)),
@@ -3237,6 +3390,7 @@ async fn run_repo_sync(
                         kind: EventKind::Trace,
                         agent_id: args.agent.clone(),
                         agent_role: Some("repo_sync_heartbeat".to_string()),
+                        timestamp: None,
                         session_id: session_id.clone(),
                         task_id: Some(args.task.clone()),
                         project_id: Some(repo_root_name(&repo_root)),
@@ -3590,6 +3744,7 @@ async fn run_wrapped(engine: Arc<Engine>, args: WrapArgs) -> Result<i32> {
         kind: EventKind::ShellCommand,
         agent_id: args.agent.clone(),
         agent_role: None,
+        timestamp: None,
         session_id: args.session.clone(),
         task_id: args.task.clone(),
         project_id: None,
@@ -3620,6 +3775,7 @@ async fn run_wrapped(engine: Arc<Engine>, args: WrapArgs) -> Result<i32> {
             kind: EventKind::ShellOutput,
             agent_id: args.agent.clone(),
             agent_role: None,
+            timestamp: None,
             session_id: args.session.clone(),
             task_id: args.task.clone(),
             project_id: None,
@@ -3646,6 +3802,7 @@ async fn run_wrapped(engine: Arc<Engine>, args: WrapArgs) -> Result<i32> {
             },
             agent_id: args.agent.clone(),
             agent_role: None,
+            timestamp: None,
             session_id: args.session.clone(),
             task_id: args.task.clone(),
             project_id: None,
@@ -3668,6 +3825,7 @@ async fn run_wrapped(engine: Arc<Engine>, args: WrapArgs) -> Result<i32> {
             kind: EventKind::Error,
             agent_id: args.agent,
             agent_role: None,
+            timestamp: None,
             session_id: args.session,
             task_id: args.task,
             project_id: None,
@@ -3717,6 +3875,7 @@ async fn run_demo(engine: Arc<Engine>, args: DemoArgs) -> Result<serde_json::Val
         kind: EventKind::Prompt,
         agent_id: planner.to_string(),
         agent_role: Some("planner".to_string()),
+        timestamp: None,
         session_id: session.to_string(),
         task_id: Some(task.to_string()),
         project_id: Some(project.to_string()),
@@ -3735,6 +3894,7 @@ async fn run_demo(engine: Arc<Engine>, args: DemoArgs) -> Result<serde_json::Val
         kind: EventKind::Error,
         agent_id: "api-agent".to_string(),
         agent_role: Some("executor".to_string()),
+        timestamp: None,
         session_id: session.to_string(),
         task_id: Some(task.to_string()),
         project_id: Some(project.to_string()),
@@ -3757,6 +3917,7 @@ async fn run_demo(engine: Arc<Engine>, args: DemoArgs) -> Result<serde_json::Val
         kind: EventKind::Note,
         agent_id: planner.to_string(),
         agent_role: Some("planner".to_string()),
+        timestamp: None,
         session_id: session.to_string(),
         task_id: Some(task.to_string()),
         project_id: Some(project.to_string()),
@@ -3778,6 +3939,7 @@ async fn run_demo(engine: Arc<Engine>, args: DemoArgs) -> Result<serde_json::Val
         kind: EventKind::Note,
         agent_id: debugger.to_string(),
         agent_role: Some("debugger".to_string()),
+        timestamp: None,
         session_id: session.to_string(),
         task_id: Some(task.to_string()),
         project_id: Some(project.to_string()),
@@ -3802,6 +3964,7 @@ async fn run_demo(engine: Arc<Engine>, args: DemoArgs) -> Result<serde_json::Val
             kind: EventKind::Note,
             agent_id: "noise-agent".to_string(),
             agent_role: Some("noise".to_string()),
+            timestamp: None,
             session_id: format!("noise-session-{turn}"),
             task_id: Some("noise".to_string()),
             project_id: Some("other-project".to_string()),
@@ -4515,6 +4678,7 @@ async fn run_legacy_bench(engine: Arc<Engine>, args: BenchArgs) -> Result<BenchR
             kind: EventKind::Note,
             agent_id: planner.clone(),
             agent_role: Some("planner".to_string()),
+            timestamp: None,
             session_id: session.clone(),
             task_id: Some(task.clone()),
             project_id: Some("bench-project".to_string()),
@@ -4549,6 +4713,7 @@ async fn run_legacy_bench(engine: Arc<Engine>, args: BenchArgs) -> Result<BenchR
             kind: EventKind::Note,
             agent_id: debugger.clone(),
             agent_role: Some("debugger".to_string()),
+            timestamp: None,
             session_id: format!("bench-shared-session-{case}"),
             task_id: Some(format!("bench-shared-task-{case}")),
             project_id: Some("bench-project".to_string()),
@@ -4577,6 +4742,7 @@ async fn run_legacy_bench(engine: Arc<Engine>, args: BenchArgs) -> Result<BenchR
                     debugger.clone()
                 },
                 agent_role: Some("bench".to_string()),
+                timestamp: None,
                 session_id: session.clone(),
                 task_id: Some(task.clone()),
                 project_id: Some("bench-project".to_string()),
