@@ -69,6 +69,64 @@ Decay: `effective_salience = salience * 0.5^(age / half_life)`, clamped to `[flo
 ### Retention States
 `Open` > `Active` > `Resolved` > `Superseded` > `Rejected`. Open and Active items get full half-life. Others get compressed decay.
 
+### Plasticity Loop
+
+ICE MUST support online plasticity at the continuity-item level. The kernel may not rely solely on offline benchmark analysis to learn what should survive.
+
+Mechanism:
+
+1. Every context pack is already a retrieval event. When a pack is materialized, ICE persists which memories were selected and which were rejected.
+2. When an agent records an outcome, it MAY attach:
+   - the `pack_id` that fed the action
+   - `used_memory_ids` for memories that actually influenced the action
+   - `confirmed_memory_ids` for memories whose claims were validated by the outcome
+   - `contradicted_memory_ids` for memories whose claims were invalidated by the outcome
+3. For continuity-backed memories in those sets, ICE MUST update per-item plasticity state.
+
+Minimum tracked plasticity state per continuity item:
+
+- `activation_count`: how often the item was retrieved into a pack
+- `successful_use_count`: how often the item participated in a successful outcome
+- `confirmation_count`: how often the item was explicitly validated
+- `contradiction_count`: how often the item was explicitly contradicted
+- `last_reactivated_at`
+- `last_confirmed_at`
+- `last_contradicted_at`
+- `stability_score`
+- `prediction_error`
+
+Retention and recall MUST incorporate plasticity state. A continuity item that is repeatedly retrieved and confirmed SHOULD retain salience longer than an otherwise identical item that is retrieved rarely or contradicted often.
+
+### Belief Keys
+
+ICE SHOULD support belief-keyed reconsolidation for continuity items that represent updateable world state.
+
+- A continuity item MAY declare a `belief_key` in its user metadata.
+- A continuity item MAY declare a `source_role` in its user metadata, such as `user`, `assistant`, `system`, `tool`, or another domain-specific role.
+- ICE MUST index `belief_key` and `source_role` as dimensions when present.
+
+Belief-keyed behavior:
+
+- Items sharing the same `belief_key` are treated as competing or reinforcing candidates for the same latent state.
+- Recall MUST apply winner-take-most competition inside each `belief_key` cluster. A strongly supported current item SHOULD receive a boost, while weaker competitors for the same latent state SHOULD be penalized.
+- `source_role` MUST affect recall for belief-keyed items. For `user.*` beliefs, user-authored evidence SHOULD outrank assistant-authored restatements or suggestions unless explicit confirmation data says otherwise.
+- Confirmation of one item SHOULD increase its stability.
+- Contradiction SHOULD increase prediction error and reduce effective salience.
+- Explicit supersession between items with the same `belief_key` SHOULD preserve lineage rather than overwriting history in place.
+
+Context-pack behavior for belief-keyed continuity:
+
+- When the pack compiler sees multiple continuity memories with the same `belief_key`, it SHOULD keep the strongest candidate and reject materially weaker competitors when the score gap is clear.
+- ICE MUST prefer preserving a single high-confidence current belief over spending budget on near-duplicate conflicting memories, unless the cluster is genuinely ambiguous.
+
+### Consolidation Gate
+
+ICE distinguishes fast episodic accumulation from slower semantic consolidation.
+
+- Episodic memories MAY aggregate aggressively inside time windows.
+- Semantic promotion SHOULD be conservative and SHOULD prefer repeated or independently confirmed state over one-off extraction.
+- For belief-keyed continuity items, promotion to durable semantic-like status SHOULD happen only after repeated confirmation or explicit operator validation, not from a single event alone.
+
 ## MCP Tools
 
 The MCP interface exposes these tools via stdio:

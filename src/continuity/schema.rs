@@ -213,6 +213,20 @@ pub struct ContinuityRetentionState {
     pub effective_salience: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContinuityPlasticityState {
+    pub activation_count: usize,
+    pub successful_use_count: usize,
+    pub confirmation_count: usize,
+    pub contradiction_count: usize,
+    pub independent_source_count: usize,
+    pub stability_score: f64,
+    pub prediction_error: f64,
+    pub last_reactivated_at: Option<DateTime<Utc>>,
+    pub last_confirmed_at: Option<DateTime<Utc>>,
+    pub last_contradicted_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuityItemRecord {
     pub id: String,
@@ -554,6 +568,14 @@ pub struct OutcomeInput {
     pub title: String,
     pub result: String,
     pub quality: f64,
+    #[serde(default)]
+    pub pack_id: Option<String>,
+    #[serde(default)]
+    pub used_memory_ids: Vec<String>,
+    #[serde(default)]
+    pub confirmed_memory_ids: Vec<String>,
+    #[serde(default)]
+    pub contradicted_memory_ids: Vec<String>,
     #[serde(default)]
     pub failures: Vec<String>,
     #[serde(default)]

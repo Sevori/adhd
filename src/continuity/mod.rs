@@ -13,12 +13,12 @@ pub use schema::{
     AgentAttachmentRecord, AgentBadgeRecord, AttachAgentInput, ClaimWorkInput, ContextRead,
     ContextRecord, ContinuityCompiledChunkRecord, ContinuityCompilerStateRecord,
     ContinuityHandoffInput, ContinuityHandoffRecord, ContinuityItemInput, ContinuityItemRecord,
-    ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem, ContinuityRetentionState,
-    CoordinationProjectedLane, CoordinationSignalInput, ExplainTarget, HandoffProof,
-    HandoffProofRegister, HeartbeatInput, LaneProjectionRecord, MachineProfile, OpenContextInput,
-    OutcomeInput, ReadContextInput, RecallInput, ResolveOrSupersedeInput, ResumeInput,
-    ResumeRecord, SignalInput, SnapshotInput, SnapshotManifest, SnapshotRecord, SupportRef,
-    TelemetryEventInput, UpsertAgentBadgeInput, WriteEventInput,
+    ContinuityPlasticityState, ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem,
+    ContinuityRetentionState, CoordinationProjectedLane, CoordinationSignalInput, ExplainTarget,
+    HandoffProof, HandoffProofRegister, HeartbeatInput, LaneProjectionRecord, MachineProfile,
+    OpenContextInput, OutcomeInput, ReadContextInput, RecallInput, ResolveOrSupersedeInput,
+    ResumeInput, ResumeRecord, SignalInput, SnapshotInput, SnapshotManifest, SnapshotRecord,
+    SupportRef, TelemetryEventInput, UpsertAgentBadgeInput, WriteEventInput,
 };
 pub use types::{
     ContextStatus, ContinuityKind, ContinuityStatus, CoordinationLane, CoordinationSeverity,

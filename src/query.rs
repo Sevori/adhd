@@ -144,6 +144,7 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             candidate.breakdown.salience = candidate.memory.importance.clamp(0.0, 1.0) * 0.3;
             candidate.breakdown.scope = scope_score(&query, &candidate.memory);
             let vector_weight = vector_score_weight(&candidate.memory);
+            let source_role_score = continuity_source_role_score(&candidate.memory);
             candidate.final_score = candidate.breakdown.continuity * 1.2
                 + candidate.breakdown.continuity_kind
                 + candidate.breakdown.continuity_status
@@ -156,12 +157,16 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                 + candidate.breakdown.salience
                 + candidate.breakdown.lineage * 0.35
                 + candidate.breakdown.view * 0.4
-                + candidate.breakdown.scope;
+                + candidate.breakdown.scope
+                + source_role_score;
             if let Some(kind) = continuity_kind_label(&candidate.memory) {
                 candidate.why.push(format!("continuity_kind:{kind}"));
             }
             if let Some(status) = continuity_status_label(&candidate.memory) {
                 candidate.why.push(format!("continuity_status:{status}"));
+            }
+            if let Some(source_role) = continuity_source_role_label(&candidate.memory) {
+                candidate.why.push(format!("source_role:{source_role}"));
             }
             candidate.why.sort();
             candidate.why.dedup();
@@ -178,9 +183,11 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
     let mut rejected = Vec::new();
     let mut seen_scope_keys = HashSet::new();
     let mut seen_sources = HashSet::new();
+    let mut seen_belief_keys = HashMap::<String, (f64, Option<String>)>::new();
     let mut used_tokens = 0usize;
 
     for candidate in candidates {
+        let belief_key = continuity_belief_key_label(&candidate.memory).map(ToString::to_string);
         let provenance = storage.provenance_for_memory(&candidate.memory)?;
         let item = ContextPackItem {
             memory_id: candidate.memory.id.clone(),
@@ -225,6 +232,24 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                 continue;
             }
         }
+        if let Some(belief_key) = belief_key.as_deref() {
+            if let Some((best_score, best_source_role)) = seen_belief_keys.get(belief_key) {
+                let source_role = continuity_source_role_label(&candidate.memory);
+                let assistant_shadowing_user = belief_key.starts_with("user.")
+                    && best_source_role.as_deref() == Some("user")
+                    && source_role == Some("assistant");
+                if assistant_shadowing_user || *best_score >= candidate.final_score + 0.05 {
+                    rejected.push(RejectedCandidate {
+                        memory_id: candidate.memory.id,
+                        layer: candidate.memory.layer,
+                        token_estimate: item.token_estimate,
+                        final_score: candidate.final_score,
+                        reason: "belief_key_competitor".to_string(),
+                    });
+                    continue;
+                }
+            }
+        }
         if used_tokens + item.token_estimate > query.budget_tokens {
             rejected.push(RejectedCandidate {
                 memory_id: candidate.memory.id,
@@ -240,6 +265,25 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
         seen_scope_keys.insert(candidate.memory.scope_key.clone());
         if let Some(source_event_id) = candidate.memory.source_event_id.clone() {
             seen_sources.insert(source_event_id);
+        }
+        if let Some(belief_key) = belief_key {
+            seen_belief_keys
+                .entry(belief_key)
+                .and_modify(|entry| {
+                    if candidate.final_score > entry.0 {
+                        *entry = (
+                            candidate.final_score,
+                            continuity_source_role_label(&candidate.memory)
+                                .map(ToString::to_string),
+                        );
+                    }
+                })
+                .or_insert_with(|| {
+                    (
+                        candidate.final_score,
+                        continuity_source_role_label(&candidate.memory).map(ToString::to_string),
+                    )
+                });
         }
         selected.push(item);
     }
@@ -390,6 +434,64 @@ fn continuity_status_label(memory: &MemoryRecord) -> Option<&str> {
         return None;
     }
     memory.extra.get("status").and_then(|value| value.as_str())
+}
+
+fn continuity_belief_key_label(memory: &MemoryRecord) -> Option<&str> {
+    if !memory.id.starts_with("continuity-memory:") {
+        return None;
+    }
+    continuity_metadata_str(&memory.extra, "belief_key")
+}
+
+fn continuity_source_role_label(memory: &MemoryRecord) -> Option<&str> {
+    if !memory.id.starts_with("continuity-memory:") {
+        return None;
+    }
+    continuity_metadata_str(&memory.extra, "source_role")
+}
+
+fn continuity_source_role_score(memory: &MemoryRecord) -> f64 {
+    let belief_key = continuity_belief_key_label(memory);
+    let source_role = continuity_source_role_label(memory);
+    let kind = continuity_kind_label(memory);
+    let is_user_belief = belief_key
+        .map(|value| value.starts_with("user."))
+        .unwrap_or(false);
+    match source_role {
+        Some("user") => {
+            if is_user_belief {
+                0.2
+            } else {
+                0.08
+            }
+        }
+        Some("assistant") => {
+            if is_user_belief {
+                -0.18
+            } else if matches!(kind, Some("fact" | "derivation" | "lesson")) {
+                -0.08
+            } else {
+                -0.03
+            }
+        }
+        Some("importer") | Some("system") | Some("tool") => {
+            if is_user_belief {
+                0.03
+            } else {
+                0.06
+            }
+        }
+        Some(_) | None => 0.0,
+    }
+}
+
+fn continuity_metadata_str<'a>(extra: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    extra.get(key).and_then(|value| value.as_str()).or_else(|| {
+        extra
+            .get("user")
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_str())
+    })
 }
 
 #[cfg(test)]
