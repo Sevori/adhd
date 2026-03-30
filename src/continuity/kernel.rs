@@ -588,6 +588,7 @@ impl UnifiedContinuityInterface for Engine {
                 kind: EventKind::Trace,
                 agent_id: input.agent_id,
                 agent_role: Some("telemetry".to_string()),
+                timestamp: None,
                 session_id: format!("telemetry-{}", Uuid::now_v7()),
                 task_id: input.task_id,
                 project_id: None,

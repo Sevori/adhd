@@ -267,3 +267,79 @@ ice --root .ice-bench bench \
   --candidate-limit 12 \
   --recent-window 6
 ```
+
+## LongMemEval
+
+ICE now ships a native `LongMemEval` runner for generating benchmark predictions from an isolated continuity replay, plus an optional wrapper around the official evaluator.
+
+### What it does
+
+- replays each LongMemEval history into a fresh ICE root
+- preserves the original dataset timestamps during ingest
+- retrieves a bounded continuity pack for the benchmark question
+- asks a reader model for the final answer
+- writes `jsonl` predictions in the official `{"question_id","hypothesis"}` shape
+
+### Get the official dataset
+
+```bash
+mkdir -p data/longmemeval
+cd data/longmemeval
+wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json
+wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_m_cleaned.json
+cd ../..
+```
+
+### Generate predictions
+
+This example uses an Ollama-served reader model and the lightweight `oracle` split first.
+
+```bash
+ice --root .ice-longmemeval longmemeval run \
+  --dataset data/longmemeval/longmemeval_oracle.json \
+  --output artifacts/longmemeval/oracle-predictions.jsonl \
+  --reader-endpoint http://127.0.0.1:11434 \
+  --reader-model qwen2.5:14b \
+  --budget-tokens 512 \
+  --candidate-limit 24
+```
+
+Useful controls:
+
+- `--max-cases 20` to smoke-test on a subset
+- `--offset 20` to resume on the next slice
+- `--question-id q1,q2` to target specific cases
+- `--question-type temporal-reasoning,multi-session` to focus on one family
+- `--work-dir /tmp/ice-longmemeval-work` to store per-case replay roots elsewhere
+
+The command writes:
+
+- the official predictions file you can submit to the evaluator
+- a JSON report next to it
+- a debug directory with one prompt, one response, and one serialized context pack per case
+
+### Run the official evaluator
+
+Clone the benchmark repository first:
+
+```bash
+git clone https://github.com/xiaowu0162/LongMemEval.git
+```
+
+Then run:
+
+```bash
+export OPENAI_API_KEY=YOUR_KEY
+ice longmemeval evaluate \
+  --repo ./LongMemEval \
+  --predictions artifacts/longmemeval/oracle-predictions.jsonl \
+  --dataset data/longmemeval/longmemeval_oracle.json \
+  --judge-model gpt-4o
+```
+
+Notes:
+
+- the official `print_qa_metrics.py` script currently assumes `gpt-4o`; ICE skips that summary step automatically for other judge models
+- the runner does not ingest benchmark-only supervision labels such as `answer_session_ids` or `has_answer`
+- `ice ingest` now accepts `--timestamp <RFC3339>` when you need to replay historical events with real time ordering

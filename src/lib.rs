@@ -10,6 +10,7 @@ pub mod embedding;
 pub mod engine;
 pub mod goose_install;
 pub mod http;
+pub mod longmemeval;
 pub mod managed_clients;
 pub mod market_head;
 pub mod mcp;

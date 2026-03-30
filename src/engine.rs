@@ -401,6 +401,7 @@ mod tests {
             kind: crate::model::EventKind::Note,
             agent_id: "agent-test".to_string(),
             agent_role: Some("tester".to_string()),
+            timestamp: None,
             session_id: "session-test".to_string(),
             task_id: Some("task-test".to_string()),
             project_id: None,
