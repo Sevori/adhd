@@ -419,7 +419,7 @@ struct LongMemEvalRunArgs {
     reader_api_key_env: Option<String>,
     #[arg(long, default_value_t = 180)]
     reader_timeout_secs: u64,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 256)]
     reader_num_predict: usize,
     #[arg(long, default_value_t = 4)]
     reader_max_retries: usize,
