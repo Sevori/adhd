@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::dispatch;
 use crate::model::{DimensionValue, EventInput, Scope, Selector};
@@ -181,6 +181,193 @@ pub(crate) fn filter_kind(
         .filter(|item| item.kind == kind)
         .cloned()
         .collect()
+}
+
+const RECENT_LEARNING_WINDOW_DAYS: i64 = 7;
+const RECENT_LEARNING_LIMIT: usize = 6;
+const LEARNING_SUMMARY_LIMIT: usize = 3;
+
+pub(crate) fn build_learning_view(
+    objective: &str,
+    items: &[ContinuityItemRecord],
+    now: DateTime<Utc>,
+) -> LearningView {
+    let mut candidates = learning_candidates(items);
+    if objective_requests_learning_line(objective) {
+        candidates.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        let summary = summarize_learning_line(&candidates, now);
+        return LearningView {
+            mode: LearningViewMode::Lineage,
+            summary,
+            items: candidates,
+        };
+    }
+
+    let recent_cutoff = now - Duration::days(RECENT_LEARNING_WINDOW_DAYS);
+    let recent_window_items = candidates
+        .iter()
+        .filter(|item| item.updated_at >= recent_cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
+    let used_recent_window = !recent_window_items.is_empty();
+    let mut recent_items = if used_recent_window {
+        recent_window_items
+    } else {
+        candidates
+    };
+    recent_items.truncate(RECENT_LEARNING_LIMIT);
+    let summary = summarize_recent_learning(&recent_items, used_recent_window, now);
+
+    LearningView {
+        mode: LearningViewMode::Recent,
+        summary,
+        items: recent_items,
+    }
+}
+
+fn learning_candidates(items: &[ContinuityItemRecord]) -> Vec<ContinuityItemRecord> {
+    let mut candidates = items
+        .iter()
+        .filter(|item| is_learning_candidate(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| {
+                right
+                    .importance
+                    .partial_cmp(&left.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.title.cmp(&left.title))
+    });
+    candidates
+}
+
+fn is_learning_candidate(item: &ContinuityItemRecord) -> bool {
+    if item.status == ContinuityStatus::Rejected {
+        return false;
+    }
+    matches!(
+        item.kind,
+        ContinuityKind::Lesson
+            | ContinuityKind::Outcome
+            | ContinuityKind::Decision
+            | ContinuityKind::Incident
+            | ContinuityKind::OperationalScar
+    )
+}
+
+fn objective_requests_learning_line(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "history",
+        "timeline",
+        "lineage",
+        "evolution",
+        "over time",
+        "weekly review",
+        "how we learned",
+        "what we learned over",
+        "historico",
+        "histórico",
+        "linha",
+        "evolucao",
+        "evolução",
+        "ao longo",
+        "semana inteira",
+        "linha de aprendizado",
+        "full learning line",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn summarize_recent_learning(
+    items: &[ContinuityItemRecord],
+    used_recent_window: bool,
+    now: DateTime<Utc>,
+) -> String {
+    if items.is_empty() {
+        return "No recent learnings are recorded yet.".to_string();
+    }
+    let focus = items
+        .iter()
+        .take(LEARNING_SUMMARY_LIMIT)
+        .map(|item| {
+            format!(
+                "{} [{}; {}]",
+                item.title,
+                item.kind.as_str(),
+                relative_time_label(item.updated_at, now)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let window_label = if used_recent_window {
+        format!("the last {} days", RECENT_LEARNING_WINDOW_DAYS)
+    } else {
+        "the latest recorded history".to_string()
+    };
+    format!(
+        "Recent learning digest from {}: {}. {} learning signal(s) are surfaced here.",
+        window_label,
+        focus,
+        items.len()
+    )
+}
+
+fn summarize_learning_line(items: &[ContinuityItemRecord], now: DateTime<Utc>) -> String {
+    if items.is_empty() {
+        return "No learning line is recorded yet.".to_string();
+    }
+    if items.len() == 1 {
+        let item = &items[0];
+        return format!(
+            "Learning line has a single recorded pivot: {} [{}; {}].",
+            item.title,
+            item.kind.as_str(),
+            relative_time_label(item.updated_at, now)
+        );
+    }
+
+    let first = items.first().expect("non-empty learning line");
+    let last = items.last().expect("non-empty learning line");
+    let span_days = (last.updated_at - first.updated_at).num_days().max(0);
+    let mut pivots = vec![first.title.clone()];
+    if items.len() > 2 {
+        pivots.push(items[items.len() / 2].title.clone());
+    }
+    pivots.push(last.title.clone());
+    pivots.dedup();
+
+    format!(
+        "Learning line spans {} signal(s) across {} day(s): {}.",
+        items.len(),
+        span_days,
+        pivots.join(" -> ")
+    )
+}
+
+fn relative_time_label(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let delta = now.signed_duration_since(ts);
+    if delta.num_days() >= 1 {
+        format!("{}d ago", delta.num_days())
+    } else if delta.num_hours() >= 1 {
+        format!("{}h ago", delta.num_hours())
+    } else if delta.num_minutes() >= 1 {
+        format!("{}m ago", delta.num_minutes())
+    } else {
+        "just now".to_string()
+    }
 }
 
 pub(crate) fn default_work_claim_lease_seconds() -> u64 {
