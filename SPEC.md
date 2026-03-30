@@ -123,6 +123,8 @@ Belief-keyed behavior:
 - Confirmation of one item SHOULD increase its stability.
 - Contradiction SHOULD increase prediction error and reduce effective salience.
 - Explicit supersession between items with the same `belief_key` SHOULD preserve lineage rather than overwriting history in place.
+- Explicit supersession between items with the same `belief_key` SHOULD also emit a provenance-backed `lesson` item that explains the update from prior belief to current belief.
+- That derived `lesson` MUST link both endpoints of the update, preserve the operator note when present, and surface in the learning view like a real learning signal rather than hidden scoring state.
 
 Context-pack behavior for belief-keyed continuity:
 

@@ -3934,11 +3934,116 @@ impl Storage {
                 }
             }
         }
+        if input.new_status == ContinuityStatus::Superseded {
+            if let Some(supersedes_id) = input.supersedes_id.as_deref() {
+                let items = self.list_continuity_items(&existing_context.0, true)?;
+                if let (Some(previous), Some(replacement)) = (
+                    items.iter().find(|item| item.id == input.continuity_id),
+                    items.iter().find(|item| item.id == supersedes_id),
+                ) {
+                    self.maybe_emit_belief_update_lesson(
+                        previous,
+                        replacement,
+                        &input.actor_agent_id,
+                        input.resolution_note.as_deref(),
+                    )?;
+                }
+            }
+        }
         self.mark_continuity_context_dirty(&existing_context.0)?;
         self.list_continuity_items(&existing_context.0, true)?
             .into_iter()
             .find(|item| item.id == input.continuity_id)
             .ok_or_else(|| anyhow!("failed to reload continuity item"))
+    }
+
+    fn maybe_emit_belief_update_lesson(
+        &self,
+        previous: &ContinuityItemRecord,
+        replacement: &ContinuityItemRecord,
+        actor_agent_id: &str,
+        resolution_note: Option<&str>,
+    ) -> Result<Option<ContinuityItemRecord>> {
+        let Some(previous_key) = continuity_belief_key(&previous.extra) else {
+            return Ok(None);
+        };
+        let Some(replacement_key) = continuity_belief_key(&replacement.extra) else {
+            return Ok(None);
+        };
+        if previous_key != replacement_key || previous.id == replacement.id {
+            return Ok(None);
+        }
+
+        let reason = resolution_note
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("A newer belief with the same key replaced the prior state.");
+        let previous_title = compact_learning_text(&previous.title, 72);
+        let replacement_title = compact_learning_text(&replacement.title, 72);
+        let previous_body = compact_learning_text(&previous.body, 220);
+        let replacement_body = compact_learning_text(&replacement.body, 220);
+        let lesson_title = format!("Belief update: {previous_title} -> {replacement_title}");
+        let lesson_body = format!(
+            "Stable belief changed for {belief_key}.\nPrevious: {previous_body}\nCurrent: {replacement_body}\nReason: {reason}",
+            belief_key = previous_key,
+        );
+
+        let mut lesson_extra = serde_json::json!({
+            "learning_trigger": "prediction_error_reconsolidation",
+            "learning_belief_key": previous_key,
+            "previous_continuity_id": previous.id,
+            "current_continuity_id": replacement.id,
+            "resolution_note": resolution_note,
+        });
+        if let Some(source_role) = continuity_source_role(&replacement.extra)
+            .or_else(|| continuity_source_role(&previous.extra))
+        {
+            lesson_extra["learning_source_role"] = serde_json::json!(source_role);
+        }
+
+        let lesson = self.persist_continuity_item(ContinuityItemInput {
+            context_id: previous.context_id.clone(),
+            author_agent_id: actor_agent_id.to_string(),
+            kind: ContinuityKind::Lesson,
+            title: lesson_title,
+            body: lesson_body,
+            scope: Scope::Project,
+            status: Some(ContinuityStatus::Resolved),
+            importance: Some(
+                ((previous.importance + replacement.importance) * 0.5).clamp(0.75, 0.95),
+            ),
+            confidence: Some(replacement.confidence.max(0.85)),
+            salience: Some(replacement.salience.max(0.78)),
+            layer: Some(MemoryLayer::Semantic),
+            supports: vec![
+                SupportRef {
+                    support_type: "continuity".to_string(),
+                    support_id: previous.id.clone(),
+                    reason: Some("belief_update_previous".to_string()),
+                    weight: 1.0,
+                },
+                SupportRef {
+                    support_type: "continuity".to_string(),
+                    support_id: replacement.id.clone(),
+                    reason: Some("belief_update_current".to_string()),
+                    weight: 1.2,
+                },
+            ],
+            dimensions: vec![
+                DimensionValue {
+                    key: "learning_trigger".to_string(),
+                    value: "prediction_error_reconsolidation".to_string(),
+                    weight: 95,
+                },
+                DimensionValue {
+                    key: "learning_belief_key".to_string(),
+                    value: previous_key,
+                    weight: 90,
+                },
+            ],
+            extra: lesson_extra,
+        })?;
+        Ok(Some(lesson))
     }
 
     fn refresh_work_claim(
@@ -7753,6 +7858,17 @@ fn continuity_retention_adjustment(item: &ContinuityItemRecord) -> f64 {
     score
 }
 
+fn compact_learning_text(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut trimmed = compact.chars().take(keep).collect::<String>();
+    trimmed.push_str("...");
+    trimmed
+}
+
 fn normalize_spacing_interval_hours(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(2.0, 24.0 * 21.0)
@@ -11155,5 +11271,104 @@ mod tests {
             replacement_after.extra["plasticity"]["confirmation_count"],
             serde_json::json!(1)
         );
+    }
+
+    #[test]
+    fn resolve_or_supersede_emits_learning_lesson_for_belief_updates() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-belief-learning".into(),
+                session_id: "session-belief-learning".into(),
+                objective: "surface belief learning updates".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in London".into(),
+                body: "Alice currently lives in London.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.8),
+                confidence: Some(0.8),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+        let replacement = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Fact,
+                title: "Alice lives in Berlin".into(),
+                body: "Alice currently lives in Berlin.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.82),
+                confidence: Some(0.82),
+                salience: Some(0.82),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "belief_key": "user.location.city",
+                    "source_role": "user",
+                }),
+            })
+            .unwrap();
+
+        storage
+            .resolve_continuity_item(ResolveOrSupersedeInput {
+                continuity_id: stale.id.clone(),
+                actor_agent_id: "agent-a".into(),
+                new_status: ContinuityStatus::Superseded,
+                supersedes_id: Some(replacement.id.clone()),
+                resolution_note: Some("The user moved.".into()),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let items = storage.list_continuity_items(&context.id, true).unwrap();
+        let lesson = items
+            .iter()
+            .find(|item| {
+                item.kind == ContinuityKind::Lesson && item.title.starts_with("Belief update:")
+            })
+            .unwrap();
+
+        assert!(lesson.body.contains("Alice currently lives in London."));
+        assert!(lesson.body.contains("Alice currently lives in Berlin."));
+        assert!(lesson.body.contains("The user moved."));
+        assert_eq!(
+            lesson.extra["user"]["learning_trigger"],
+            serde_json::json!("prediction_error_reconsolidation")
+        );
+        assert_eq!(
+            lesson.extra["user"]["learning_belief_key"],
+            serde_json::json!("user.location.city")
+        );
+        assert!(lesson.supports.iter().any(|support| {
+            support.support_id == stale.id
+                && support.reason.as_deref() == Some("belief_update_previous")
+        }));
+        assert!(lesson.supports.iter().any(|support| {
+            support.support_id == replacement.id
+                && support.reason.as_deref() == Some("belief_update_current")
+        }));
     }
 }
