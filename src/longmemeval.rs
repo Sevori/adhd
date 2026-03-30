@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::{cmp::Ordering, collections::BTreeSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -255,7 +256,7 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
             budget_tokens: config.budget_tokens,
             candidate_limit: config.candidate_limit,
         })?;
-        let context_text = render_context_pack_text(&pack);
+        let context_text = render_context_pack_text(&pack, &case.question);
         let prompt = render_answer_prompt(&case, &context_text);
         let hypothesis = generate_answer(
             &client,
@@ -524,24 +525,32 @@ fn replay_case(
     Ok(())
 }
 
-fn render_context_pack_text(pack: &ContextPack) -> String {
+fn render_context_pack_text(pack: &ContextPack, question: &str) -> String {
     if pack.items.is_empty() {
         return "No continuity items were retrieved.".to_string();
     }
-    pack.items
+    let mut rendered = pack
+        .items
         .iter()
         .enumerate()
-        .map(|(index, item)| {
-            format!(
-                "[m{}][{}][score={:.3}] {}",
-                index + 1,
-                item.layer,
-                item.final_score,
-                trim_text(&item.body, 800)
-            )
-        })
+        .map(|(index, item)| render_context_item(index, item, question))
+        .collect::<Vec<_>>();
+    rendered.sort_by(|left, right| {
+        left.sort_key
+            .cmp(&right.sort_key)
+            .then_with(|| {
+                right
+                    .final_score
+                    .partial_cmp(&left.final_score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    rendered
+        .into_iter()
+        .map(|item| item.rendered)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n\n")
 }
 
 fn render_answer_prompt(case: &LongMemEvalCase, context_text: &str) -> String {
@@ -550,7 +559,12 @@ fn render_answer_prompt(case: &LongMemEvalCase, context_text: &str) -> String {
 Return only the final answer as plain text.\n\
 Use only the retrieved continuity evidence below.\n\
 If the evidence does not support a specific answer, reply exactly: I don't know\n\
-For temporal questions, reason over the session dates and the question date.\n\
+Think silently before answering.\n\
+Resolve the answer from the retrieved sessions, not from generic world knowledge.\n\
+Pay attention to who said each fact: `User:` lines describe the human, while `Assistant:` lines describe prior recommendations or answers.\n\
+For preference questions, infer what the human would likely want from their stated interests, goals, and prior choices.\n\
+For counting questions, count distinct items or tasks across all retrieved sessions before answering.\n\
+For temporal or update questions, use the session dates and prefer the latest evidence that predates the question date.\n\
 Do not mention ICE, context packs, memories, provenance, or benchmark metadata.\n\
 \n\
 Question date: {question_date}\n\
@@ -562,6 +576,176 @@ Retrieved continuity:\n\
         question = case.question,
         context_text = context_text,
     )
+}
+
+#[derive(Debug, Clone)]
+struct RenderedContextItem {
+    index: usize,
+    sort_key: Option<String>,
+    final_score: f64,
+    rendered: String,
+}
+
+fn render_context_item(
+    index: usize,
+    item: &crate::model::ContextPackItem,
+    question: &str,
+) -> RenderedContextItem {
+    let transcript = extract_longmemeval_transcript(&item.body);
+    let session_date = extract_session_date_line(&transcript).map(str::to_string);
+    let excerpt = focus_transcript_excerpt(&transcript, question, 1100);
+    let header = match session_date.as_deref() {
+        Some(date) => format!(
+            "[m{}][{}][score={:.3}][session_date={}]",
+            index + 1,
+            item.layer,
+            item.final_score,
+            date
+        ),
+        None => format!(
+            "[m{}][{}][score={:.3}]",
+            index + 1,
+            item.layer,
+            item.final_score
+        ),
+    };
+
+    RenderedContextItem {
+        index,
+        sort_key: session_date,
+        final_score: item.final_score,
+        rendered: format!("{header}\n{excerpt}"),
+    }
+}
+
+fn extract_longmemeval_transcript(body: &str) -> String {
+    let body = body.trim();
+    let without_metadata = body
+        .split_once("content=")
+        .map(|(_, content)| content)
+        .unwrap_or(body);
+    let anchored = without_metadata
+        .find("LongMemEval session:")
+        .map(|index| &without_metadata[index..])
+        .unwrap_or(without_metadata);
+    anchored
+        .lines()
+        .take_while(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("| entities:") && !trimmed.contains(" | entities:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn extract_session_date_line(transcript: &str) -> Option<&str> {
+    transcript
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Session date: "))
+}
+
+fn focus_transcript_excerpt(transcript: &str, question: &str, max_chars: usize) -> String {
+    let lines = transcript
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "No retrieved transcript content.".to_string();
+    }
+
+    let keywords = question_keywords(question);
+    let header_len = lines
+        .iter()
+        .take(2)
+        .filter(|line| {
+            line.starts_with("LongMemEval session:") || line.starts_with("Session date:")
+        })
+        .count()
+        .max(1);
+
+    let mut scored = lines
+        .iter()
+        .enumerate()
+        .skip(header_len)
+        .map(|(index, line)| (index, score_line_against_question(line, &keywords)))
+        .filter(|(_, score)| *score > 0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    if scored.is_empty() {
+        return head_tail_excerpt(&lines, max_chars);
+    }
+
+    let mut included = BTreeSet::new();
+    for index in 0..header_len.min(lines.len()) {
+        included.insert(index);
+    }
+    for (index, _) in scored.into_iter().take(3) {
+        for line_index in index.saturating_sub(1)..=(index + 2).min(lines.len().saturating_sub(1)) {
+            included.insert(line_index);
+        }
+    }
+
+    let ordered = included.into_iter().collect::<Vec<_>>();
+    let mut rendered = Vec::new();
+    let mut previous = None;
+    for index in ordered {
+        if previous.is_some_and(|last| index > last + 1) {
+            rendered.push("...".to_string());
+        }
+        rendered.push(lines[index].to_string());
+        previous = Some(index);
+    }
+    trim_text(&rendered.join("\n"), max_chars)
+}
+
+fn head_tail_excerpt(lines: &[&str], max_chars: usize) -> String {
+    if lines.len() <= 8 {
+        return trim_text(&lines.join("\n"), max_chars);
+    }
+    let mut rendered = lines
+        .iter()
+        .take(5)
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    rendered.push("...".to_string());
+    let mut text = rendered.join("\n");
+    text.push('\n');
+    text.push_str(&lines[lines.len().saturating_sub(3)..].join("\n"));
+    trim_text(&text, max_chars)
+}
+
+fn question_keywords(question: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "can", "did", "do", "does", "for", "from",
+        "had", "has", "have", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our",
+        "please", "previous", "that", "the", "their", "this", "to", "was", "were", "what", "when",
+        "where", "which", "who", "with", "you", "your",
+    ];
+
+    let mut keywords = question
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !STOPWORDS.contains(&token.as_str()))
+        .collect::<Vec<_>>();
+    keywords.sort();
+    keywords.dedup();
+    keywords
+}
+
+fn score_line_against_question(line: &str, keywords: &[String]) -> usize {
+    if keywords.is_empty() {
+        return 0;
+    }
+    let line_lower = line.to_ascii_lowercase();
+    keywords
+        .iter()
+        .filter(|keyword| line_lower.contains(keyword.as_str()))
+        .count()
 }
 
 fn generate_answer(
@@ -933,6 +1117,51 @@ mod tests {
         let parsed =
             parse_longmemeval_datetime("2023/04/10 (Mon) 23:07").expect("parse benchmark date");
         assert_eq!(parsed.to_rfc3339(), "2023-04-10T23:07:00+00:00");
+    }
+
+    #[test]
+    fn extract_longmemeval_transcript_strips_storage_metadata() {
+        let body = "kind=document\nsource=longmemeval\ncontent=LongMemEval session: sess-1\nSession date: 2023/05/23 (Tue) 18:02\nTurn 1 User: I graduated with a physics degree.\nTurn 2 Assistant: Nice.\n| entities: path:2023/05/23";
+        let transcript = extract_longmemeval_transcript(body);
+        assert!(transcript.starts_with("LongMemEval session: sess-1"));
+        assert!(transcript.contains("I graduated with a physics degree."));
+        assert!(!transcript.contains("kind=document"));
+        assert!(!transcript.contains("| entities:"));
+    }
+
+    #[test]
+    fn focus_transcript_excerpt_prefers_lines_matching_question_keywords() {
+        let transcript = "LongMemEval session: sess-1\n\
+Session date: 2023/05/23 (Tue) 18:02\n\
+Turn 1 User: I enjoy audiobooks during my commute.\n\
+Turn 2 Assistant: That's a nice habit.\n\
+Turn 3 User: My daily commute to work takes about 45 minutes each way.\n\
+Turn 4 Assistant: That's enough time for a few chapters.\n\
+Turn 5 User: I usually listen to fiction on the train.";
+        let excerpt =
+            focus_transcript_excerpt(transcript, "How long is my daily commute to work?", 500);
+        assert!(excerpt.contains("45 minutes each way"));
+        assert!(excerpt.contains("Session date: 2023/05/23 (Tue) 18:02"));
+    }
+
+    #[test]
+    fn head_tail_excerpt_keeps_tail_when_no_question_match_exists() {
+        let lines = [
+            "LongMemEval session: sess-1",
+            "Session date: 2023/05/23 (Tue) 18:02",
+            "Turn 1 User: Intro line.",
+            "Turn 2 Assistant: More setup.",
+            "Turn 3 User: Still setup.",
+            "Turn 4 Assistant: More setup.",
+            "Turn 5 User: Useful tail fact.",
+            "Turn 6 Assistant: Tail follow-up.",
+            "Turn 7 User: Final tail fact.",
+        ];
+        let excerpt = head_tail_excerpt(&lines, 500);
+        assert!(excerpt.contains("LongMemEval session: sess-1"));
+        assert!(excerpt.contains("Useful tail fact."));
+        assert!(excerpt.contains("Final tail fact."));
+        assert!(excerpt.contains("..."));
     }
 
     #[test]
