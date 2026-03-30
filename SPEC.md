@@ -89,13 +89,23 @@ Minimum tracked plasticity state per continuity item:
 - `successful_use_count`: how often the item participated in a successful outcome
 - `confirmation_count`: how often the item was explicitly validated
 - `contradiction_count`: how often the item was explicitly contradicted
+- `spaced_reactivation_count`: how often the item was reactivated after a meaningful spacing interval
+- `spacing_interval_hours`: the current interval ICE expects before another reactivation should count as strong reinforcement
 - `last_reactivated_at`
 - `last_confirmed_at`
 - `last_contradicted_at`
+- `last_strengthened_at`
 - `stability_score`
 - `prediction_error`
 
 Retention and recall MUST incorporate plasticity state. A continuity item that is repeatedly retrieved and confirmed SHOULD retain salience longer than an otherwise identical item that is retrieved rarely or contradicted often.
+
+Spacing rule:
+
+- ICE SHOULD treat massed repetition and spaced reactivation differently.
+- Re-reading or reusing the same memory repeatedly inside a short window MUST NOT count as strong reinforcement every time.
+- Successful reactivation after a meaningful interval SHOULD increase durability more than immediate repetition.
+- Contradiction SHOULD collapse the spacing interval and reduce stability so stale beliefs become easier to overwrite with fresher evidence.
 
 ### Belief Keys
 
