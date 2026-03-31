@@ -136,6 +136,8 @@ struct LaneProjectionIdentity {
     task_id: Option<String>,
 }
 
+type RepoProjectionHints = BTreeMap<(String, String, String), BTreeSet<(String, String)>>;
+
 #[derive(Debug, Clone)]
 struct LaneProjectionAccumulator {
     identity: LaneProjectionIdentity,
@@ -154,6 +156,14 @@ struct LaneProjectionAccumulator {
     dispatch_assignment_explicit_cli_count: usize,
     dispatch_assignment_live_badge_opt_in_count: usize,
     coordination_lanes: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RawLogStats<'a> {
+    content_hash: &'a str,
+    byte_size: usize,
+    token_estimate: usize,
+    importance: f64,
 }
 
 impl LaneProjectionAccumulator {
@@ -967,10 +977,12 @@ impl Storage {
             &event_id,
             now,
             &input,
-            &content_hash,
-            byte_size,
-            token_estimate,
-            importance,
+            RawLogStats {
+                content_hash: &content_hash,
+                byte_size,
+                token_estimate,
+                importance,
+            },
         )?;
         telemetry.observe_raw_log_append_seconds(start_append.elapsed().as_secs_f64());
 
@@ -3505,7 +3517,7 @@ impl Storage {
         limit: usize,
     ) -> Result<ContinuityRecall> {
         let started = Instant::now();
-        let limit = limit.max(1).min(24);
+        let limit = limit.clamp(1, 24);
         let priority_window = limit.max(8) * 8;
         let lexical_window = limit.max(8) * 6;
         let now = Utc::now();
@@ -3942,20 +3954,20 @@ impl Storage {
                 }
             }
         }
-        if input.new_status == ContinuityStatus::Superseded {
-            if let Some(supersedes_id) = input.supersedes_id.as_deref() {
-                let items = self.list_continuity_items(&existing_context.0, true)?;
-                if let (Some(previous), Some(replacement)) = (
-                    items.iter().find(|item| item.id == input.continuity_id),
-                    items.iter().find(|item| item.id == supersedes_id),
-                ) {
-                    self.maybe_emit_belief_update_lesson(
-                        previous,
-                        replacement,
-                        &input.actor_agent_id,
-                        input.resolution_note.as_deref(),
-                    )?;
-                }
+        if input.new_status == ContinuityStatus::Superseded
+            && let Some(supersedes_id) = input.supersedes_id.as_deref()
+        {
+            let items = self.list_continuity_items(&existing_context.0, true)?;
+            if let (Some(previous), Some(replacement)) = (
+                items.iter().find(|item| item.id == input.continuity_id),
+                items.iter().find(|item| item.id == supersedes_id),
+            ) {
+                self.maybe_emit_belief_update_lesson(
+                    previous,
+                    replacement,
+                    &input.actor_agent_id,
+                    input.resolution_note.as_deref(),
+                )?;
             }
         }
         self.mark_continuity_context_dirty(&existing_context.0)?;
@@ -4191,10 +4203,10 @@ impl Storage {
             let Some(mut coordination) = work_claim_coordination(&claim) else {
                 continue;
             };
-            if let Some(expected_attachment) = coordination.attachment_id.as_deref() {
-                if attachment_id != Some(expected_attachment) {
-                    continue;
-                }
+            if let Some(expected_attachment) = coordination.attachment_id.as_deref()
+                && attachment_id != Some(expected_attachment)
+            {
+                continue;
             }
             coordination.renewed_at = Some(now);
             coordination.lease_expires_at =
@@ -5733,21 +5745,21 @@ impl Storage {
         let active_cutoff = Utc::now() - chrono::Duration::seconds(30);
         let mut badges = Vec::new();
         for attachment in attachments {
-            if let Some(namespace) = namespace {
-                if attachment.namespace != namespace {
-                    continue;
-                }
+            if let Some(namespace) = namespace
+                && attachment.namespace != namespace
+            {
+                continue;
             }
             let stored = self.get_stored_agent_badge(&attachment.attachment_id)?;
-            let derived = self.derive_agent_badge_from_metric(&attachment, live_work_claims)?;
+            let derived = self.derive_agent_badge_from_metric(attachment, live_work_claims)?;
             let task = stored
                 .as_ref()
                 .and_then(|badge| badge.task_id.clone())
                 .or_else(|| derived.task_id.clone());
-            if let Some(filter_task) = task_id {
-                if task.as_deref() != Some(filter_task) {
-                    continue;
-                }
+            if let Some(filter_task) = task_id
+                && task.as_deref() != Some(filter_task)
+            {
+                continue;
             }
             let updated_at = stored
                 .as_ref()
@@ -5861,19 +5873,16 @@ impl Storage {
             BTreeMap::new();
         let mut repo_projection_by_attachment: BTreeMap<String, LaneProjectionIdentity> =
             BTreeMap::new();
-        let mut repo_projection_hints: BTreeMap<
-            (String, String, String),
-            BTreeSet<(String, String)>,
-        > = BTreeMap::new();
+        let mut repo_projection_hints: RepoProjectionHints = BTreeMap::new();
 
         for badge in badges.iter().filter(|badge| badge.connected) {
-            let Some(identity) = self.lane_projection_from_badge(&badge) else {
+            let Some(identity) = self.lane_projection_from_badge(badge) else {
                 continue;
             };
-            if let Some(filter_task) = task_id {
-                if identity.task_id.as_deref() != Some(filter_task) {
-                    continue;
-                }
+            if let Some(filter_task) = task_id
+                && identity.task_id.as_deref() != Some(filter_task)
+            {
+                continue;
             }
             projection_identity_by_id
                 .entry(identity.projection_id.clone())
@@ -5885,7 +5894,7 @@ impl Storage {
                     accumulator.updated_at = badge.updated_at;
                     accumulator
                 });
-            entry.absorb_badge(&badge);
+            entry.absorb_badge(badge);
             if identity.projection_kind == "repo" {
                 repo_projection_by_attachment.insert(badge.attachment_id.clone(), identity.clone());
                 if let (Some(resource), Some(repo_root)) =
@@ -5904,11 +5913,15 @@ impl Storage {
         }
 
         let mut projected_claims = Vec::<(String, ContinuityItemRecord)>::new();
-        for claim in live_work_claims.iter().cloned().filter(|claim| {
-            namespace
-                .map(|filter_namespace| claim.namespace == filter_namespace)
-                .unwrap_or(true)
-        }) {
+        for claim in live_work_claims
+            .iter()
+            .filter(|claim| {
+                namespace
+                    .map(|filter_namespace| claim.namespace == filter_namespace)
+                    .unwrap_or(true)
+            })
+            .cloned()
+        {
             let coordination = work_claim_coordination(&claim);
             let repo_projection_hint = coordination.as_ref().and_then(|coordination| {
                 coordination
@@ -5943,10 +5956,10 @@ impl Storage {
             ) else {
                 continue;
             };
-            if let Some(filter_task) = task_id {
-                if identity.task_id.as_deref() != Some(filter_task) {
-                    continue;
-                }
+            if let Some(filter_task) = task_id
+                && identity.task_id.as_deref() != Some(filter_task)
+            {
+                continue;
             }
             projection_identity_by_id
                 .entry(identity.projection_id.clone())
@@ -5995,11 +6008,15 @@ impl Storage {
             }
         }
 
-        for signal_item in active_signals.iter().cloned().filter(|item| {
-            namespace
-                .map(|filter_namespace| item.namespace == filter_namespace)
-                .unwrap_or(true)
-        }) {
+        for signal_item in active_signals
+            .iter()
+            .filter(|item| {
+                namespace
+                    .map(|filter_namespace| item.namespace == filter_namespace)
+                    .unwrap_or(true)
+            })
+            .cloned()
+        {
             let Some(signal) = coordination_signal(&signal_item) else {
                 continue;
             };
@@ -6009,10 +6026,10 @@ impl Storage {
                 &projection_identity_by_id,
                 &repo_projection_hints,
             ) {
-                if let Some(filter_task) = task_id {
-                    if identity.task_id.as_deref() != Some(filter_task) {
-                        continue;
-                    }
+                if let Some(filter_task) = task_id
+                    && identity.task_id.as_deref() != Some(filter_task)
+                {
+                    continue;
                 }
                 projection_identity_by_id
                     .entry(identity.projection_id.clone())
@@ -6262,7 +6279,7 @@ impl Storage {
         signal_item: &ContinuityItemRecord,
         signal: &crate::continuity::CoordinationSignalRecord,
         known_projections: &BTreeMap<String, LaneProjectionIdentity>,
-        repo_projection_hints: &BTreeMap<(String, String, String), BTreeSet<(String, String)>>,
+        repo_projection_hints: &RepoProjectionHints,
     ) -> Vec<LaneProjectionIdentity> {
         let mut identities = BTreeMap::<String, LaneProjectionIdentity>::new();
 
@@ -6348,17 +6365,17 @@ impl Storage {
         branch: Option<&str>,
         task_id: Option<&str>,
     ) -> Option<String> {
-        if projection_kind == "repo" {
-            if let Some(repo_root) = repo_root {
-                return Some(format!(
-                    "repo:{}:{}",
-                    repo_root,
-                    branch
-                        .map(ToString::to_string)
-                        .or_else(|| Self::branch_from_repo_resource(resource))
-                        .unwrap_or_default()
-                ));
-            }
+        if projection_kind == "repo"
+            && let Some(repo_root) = repo_root
+        {
+            return Some(format!(
+                "repo:{}:{}",
+                repo_root,
+                branch
+                    .map(ToString::to_string)
+                    .or_else(|| Self::branch_from_repo_resource(resource))
+                    .unwrap_or_default()
+            ));
         }
         if let Some(resource) = resource {
             return Some(format!("{projection_kind}:{resource}"));
@@ -6681,7 +6698,6 @@ impl Storage {
     ) -> Option<ContinuityItemRecord> {
         let mut claims = live_work_claims
             .iter()
-            .cloned()
             .filter(|claim| claim.namespace == attachment.namespace)
             .filter(|claim| claim.author_agent_id == attachment.agent_id)
             .filter(|claim| {
@@ -6695,6 +6711,7 @@ impl Storage {
                         .map(|context_id| claim.context_id == context_id)
                         .unwrap_or(false)
             })
+            .cloned()
             .collect::<Vec<_>>();
         claims.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         claims.into_iter().next()
@@ -6705,10 +6722,7 @@ impl Storage {
         event_id: &str,
         ts: DateTime<Utc>,
         input: &EventInput,
-        content_hash: &str,
-        byte_size: usize,
-        token_estimate: usize,
-        importance: f64,
+        stats: RawLogStats<'_>,
     ) -> Result<(i64, i64)> {
         let mut seq = self.meta_i64("segment_seq")?;
         let mut line = self.meta_i64("segment_line")?;
@@ -6747,10 +6761,10 @@ impl Storage {
             "dimensions": input.dimensions,
             "attributes": input.attributes,
             "content": input.content,
-            "content_hash": content_hash,
-            "byte_size": byte_size,
-            "token_estimate": token_estimate,
-            "importance": importance,
+            "content_hash": stats.content_hash,
+            "byte_size": stats.byte_size,
+            "token_estimate": stats.token_estimate,
+            "importance": stats.importance,
             "segment_seq": seq,
             "segment_line": line,
         });
@@ -8209,7 +8223,7 @@ fn apply_belief_key_competition(items: &mut [ScoredContinuityRecallItem]) {
             .map(|index| continuity_belief_competition_rank(&items[*index]))
             .unwrap_or(winner_rank);
         let winner_bonus =
-            (0.08 + (winner_rank - runner_up_rank).max(0.0).min(0.12)).clamp(0.08, 0.2);
+            (0.08 + (winner_rank - runner_up_rank).clamp(0.0, 0.12)).clamp(0.08, 0.2);
         let winner_source_role = items[winner_index].source_role.clone();
         let winner = &mut items[winner_index].item;
         winner.score += winner_bonus;
@@ -8220,7 +8234,7 @@ fn apply_belief_key_competition(items: &mut [ScoredContinuityRecallItem]) {
 
         for loser_index in ordered.into_iter().skip(1) {
             let loser_rank = continuity_belief_competition_rank(&items[loser_index]);
-            let penalty = (0.1 + (winner_rank - loser_rank).max(0.0).min(0.18)).clamp(0.1, 0.28);
+            let penalty = (0.1 + (winner_rank - loser_rank).clamp(0.0, 0.18)).clamp(0.1, 0.28);
             let loser_source_role = items[loser_index].source_role.clone();
             let loser = &mut items[loser_index].item;
             loser.score -= penalty;
@@ -8379,10 +8393,10 @@ fn compiler_bundle_body(
             support_item.status.as_str(),
             support_item.retention.class,
         ));
-        if let Some(reason) = support_ref.reason.as_deref().map(str::trim) {
-            if !reason.is_empty() {
-                body.push_str(&format!(" | reason {reason}"));
-            }
+        if let Some(reason) = support_ref.reason.as_deref().map(str::trim)
+            && !reason.is_empty()
+        {
+            body.push_str(&format!(" | reason {reason}"));
         }
         body.push_str(&format!(" | weight {:.2}", support_ref.weight));
         body.push_str(&format!(
@@ -8471,10 +8485,10 @@ fn continuity_recall_answer_hint(items: &[ContinuityRecallItem]) -> Option<Strin
     ) {
         return None;
     }
-    if let Some(next) = items.get(1) {
-        if (top.score - next.score) < 0.1 {
-            return None;
-        }
+    if let Some(next) = items.get(1)
+        && (top.score - next.score) < 0.1
+    {
+        return None;
     }
     let answer = if matches!(
         top.kind,
@@ -8767,7 +8781,7 @@ fn error_regex() -> &'static Regex {
 }
 
 fn encode_vector(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -9399,30 +9413,32 @@ mod tests {
                 dimensions: Vec::new(),
                 extra: merge_coordination_signal_extra(
                     serde_json::json!({}),
-                    CoordinationLane::Backoff,
-                    CoordinationSeverity::Block,
-                    None,
-                    Some(CoordinationProjectedLane {
-                        projection_id: "repo:/tmp/demo:main".into(),
-                        projection_kind: "repo".into(),
-                        label: "demo @ main".into(),
+                    crate::continuity::CoordinationSignalExtraInput {
+                        lane: CoordinationLane::Backoff,
+                        severity: CoordinationSeverity::Block,
+                        target_agent_id: None,
+                        target_projected_lane: Some(CoordinationProjectedLane {
+                            projection_id: "repo:/tmp/demo:main".into(),
+                            projection_kind: "repo".into(),
+                            label: "demo @ main".into(),
+                            resource: Some("repo/demo/main".into()),
+                            repo_root: Some("/tmp/demo".into()),
+                            branch: Some("main".into()),
+                            task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
+                        }),
+                        claim_id: None,
                         resource: Some("repo/demo/main".into()),
-                        repo_root: Some("/tmp/demo".into()),
-                        branch: Some("main".into()),
-                        task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                    }),
-                    None,
-                    Some("repo/demo/main".into()),
-                    vec!["repo:/tmp/demo:main".into()],
-                    vec![CoordinationProjectedLane {
-                        projection_id: "repo:/tmp/demo:main".into(),
-                        projection_kind: "repo".into(),
-                        label: "demo @ main".into(),
-                        resource: Some("repo/demo/main".into()),
-                        repo_root: Some("/tmp/demo".into()),
-                        branch: Some("main".into()),
-                        task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                    }],
+                        projection_ids: vec!["repo:/tmp/demo:main".into()],
+                        projected_lanes: vec![CoordinationProjectedLane {
+                            projection_id: "repo:/tmp/demo:main".into(),
+                            projection_kind: "repo".into(),
+                            label: "demo @ main".into(),
+                            resource: Some("repo/demo/main".into()),
+                            repo_root: Some("/tmp/demo".into()),
+                            branch: Some("main".into()),
+                            task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
+                        }],
+                    },
                 ),
             })
             .unwrap();
@@ -9909,14 +9925,16 @@ mod tests {
                 dimensions: Vec::new(),
                 extra: merge_coordination_signal_extra(
                     serde_json::json!({}),
-                    CoordinationLane::Review,
-                    CoordinationSeverity::Info,
-                    None,
-                    None,
-                    None,
-                    Some("src/storage.rs".into()),
-                    Vec::new(),
-                    Vec::new(),
+                    crate::continuity::CoordinationSignalExtraInput {
+                        lane: CoordinationLane::Review,
+                        severity: CoordinationSeverity::Info,
+                        target_agent_id: None,
+                        target_projected_lane: None,
+                        claim_id: None,
+                        resource: Some("src/storage.rs".into()),
+                        projection_ids: Vec::new(),
+                        projected_lanes: Vec::new(),
+                    },
                 ),
             })
             .unwrap();
@@ -10024,26 +10042,11 @@ mod tests {
                 dimensions: Vec::new(),
                 extra: merge_coordination_signal_extra(
                     serde_json::json!({}),
-                    CoordinationLane::Backoff,
-                    CoordinationSeverity::Block,
-                    Some("agent-a".into()),
-                    Some(CoordinationProjectedLane {
-                        projection_id: "repo:/tmp/demo:main".into(),
-                        projection_kind: "repo".into(),
-                        label: "demo @ main".into(),
-                        resource: Some("repo/demo/main".into()),
-                        repo_root: Some("/tmp/demo".into()),
-                        branch: Some("main".into()),
-                        task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                    }),
-                    None,
-                    Some("src/storage.rs".into()),
-                    vec![
-                        "repo:/tmp/demo:main".into(),
-                        "repo:/tmp/demo:feature/shadow".into(),
-                    ],
-                    vec![
-                        CoordinationProjectedLane {
+                    crate::continuity::CoordinationSignalExtraInput {
+                        lane: CoordinationLane::Backoff,
+                        severity: CoordinationSeverity::Block,
+                        target_agent_id: Some("agent-a".into()),
+                        target_projected_lane: Some(CoordinationProjectedLane {
                             projection_id: "repo:/tmp/demo:main".into(),
                             projection_kind: "repo".into(),
                             label: "demo @ main".into(),
@@ -10051,17 +10054,34 @@ mod tests {
                             repo_root: Some("/tmp/demo".into()),
                             branch: Some("main".into()),
                             task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                        },
-                        CoordinationProjectedLane {
-                            projection_id: "repo:/tmp/demo:feature/shadow".into(),
-                            projection_kind: "repo".into(),
-                            label: "demo @ feature/shadow".into(),
-                            resource: Some("repo/demo/feature/shadow".into()),
-                            repo_root: Some("/tmp/demo".into()),
-                            branch: Some("feature/shadow".into()),
-                            task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                        },
-                    ],
+                        }),
+                        claim_id: None,
+                        resource: Some("src/storage.rs".into()),
+                        projection_ids: vec![
+                            "repo:/tmp/demo:main".into(),
+                            "repo:/tmp/demo:feature/shadow".into(),
+                        ],
+                        projected_lanes: vec![
+                            CoordinationProjectedLane {
+                                projection_id: "repo:/tmp/demo:main".into(),
+                                projection_kind: "repo".into(),
+                                label: "demo @ main".into(),
+                                resource: Some("repo/demo/main".into()),
+                                repo_root: Some("/tmp/demo".into()),
+                                branch: Some("main".into()),
+                                task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
+                            },
+                            CoordinationProjectedLane {
+                                projection_id: "repo:/tmp/demo:feature/shadow".into(),
+                                projection_kind: "repo".into(),
+                                label: "demo @ feature/shadow".into(),
+                                resource: Some("repo/demo/feature/shadow".into()),
+                                repo_root: Some("/tmp/demo".into()),
+                                branch: Some("feature/shadow".into()),
+                                task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
+                            },
+                        ],
+                    },
                 ),
             })
             .unwrap();
@@ -10082,35 +10102,11 @@ mod tests {
                 dimensions: Vec::new(),
                 extra: merge_coordination_signal_extra(
                     serde_json::json!({}),
-                    CoordinationLane::Review,
-                    CoordinationSeverity::Info,
-                    Some("agent-b".into()),
-                    Some(CoordinationProjectedLane {
-                        projection_id: "repo:/tmp/demo:feature/shadow".into(),
-                        projection_kind: "repo".into(),
-                        label: "demo @ feature/shadow".into(),
-                        resource: Some("repo/demo/feature/shadow".into()),
-                        repo_root: Some("/tmp/demo".into()),
-                        branch: Some("feature/shadow".into()),
-                        task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                    }),
-                    None,
-                    Some("src/storage.rs".into()),
-                    vec![
-                        "repo:/tmp/demo:main".into(),
-                        "repo:/tmp/demo:feature/shadow".into(),
-                    ],
-                    vec![
-                        CoordinationProjectedLane {
-                            projection_id: "repo:/tmp/demo:main".into(),
-                            projection_kind: "repo".into(),
-                            label: "demo @ main".into(),
-                            resource: Some("repo/demo/main".into()),
-                            repo_root: Some("/tmp/demo".into()),
-                            branch: Some("main".into()),
-                            task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                        },
-                        CoordinationProjectedLane {
+                    crate::continuity::CoordinationSignalExtraInput {
+                        lane: CoordinationLane::Review,
+                        severity: CoordinationSeverity::Info,
+                        target_agent_id: Some("agent-b".into()),
+                        target_projected_lane: Some(CoordinationProjectedLane {
                             projection_id: "repo:/tmp/demo:feature/shadow".into(),
                             projection_kind: "repo".into(),
                             label: "demo @ feature/shadow".into(),
@@ -10118,8 +10114,34 @@ mod tests {
                             repo_root: Some("/tmp/demo".into()),
                             branch: Some("feature/shadow".into()),
                             task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
-                        },
-                    ],
+                        }),
+                        claim_id: None,
+                        resource: Some("src/storage.rs".into()),
+                        projection_ids: vec![
+                            "repo:/tmp/demo:main".into(),
+                            "repo:/tmp/demo:feature/shadow".into(),
+                        ],
+                        projected_lanes: vec![
+                            CoordinationProjectedLane {
+                                projection_id: "repo:/tmp/demo:main".into(),
+                                projection_kind: "repo".into(),
+                                label: "demo @ main".into(),
+                                resource: Some("repo/demo/main".into()),
+                                repo_root: Some("/tmp/demo".into()),
+                                branch: Some("main".into()),
+                                task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
+                            },
+                            CoordinationProjectedLane {
+                                projection_id: "repo:/tmp/demo:feature/shadow".into(),
+                                projection_kind: "repo".into(),
+                                label: "demo @ feature/shadow".into(),
+                                resource: Some("repo/demo/feature/shadow".into()),
+                                repo_root: Some("/tmp/demo".into()),
+                                branch: Some("feature/shadow".into()),
+                                task_id: Some(DEFAULT_MACHINE_TASK_ID.into()),
+                            },
+                        ],
+                    },
                 ),
             })
             .unwrap();

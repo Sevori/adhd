@@ -212,7 +212,11 @@ fn accumulate_feature(vector: &mut [f32], feature: &[u8]) {
     let hash = blake3::hash(feature);
     let bytes = hash.as_bytes();
     let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize % vector.len();
-    let sign = if bytes[4] % 2 == 0 { 1.0 } else { -1.0 };
+    let sign = if bytes[4].is_multiple_of(2) {
+        1.0
+    } else {
+        -1.0
+    };
     vector[index] += sign;
 }
 

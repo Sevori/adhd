@@ -42,14 +42,14 @@ pub enum UciResponse {
     AgentAttachment(AgentAttachmentRecord),
     AgentBadge(AgentBadgeRecord),
     Context(ContextRecord),
-    ContextRead(ContextRead),
+    ContextRead(Box<ContextRead>),
     Recall(ContinuityRecall),
     IngestManifests(Vec<IngestManifest>),
     ContinuityItems(Vec<ContinuityItemRecord>),
     Subscription(SubscriptionRecord),
-    Handoff(ContinuityHandoffRecord),
-    Snapshot(SnapshotRecord),
-    Resume(ResumeRecord),
+    Handoff(Box<ContinuityHandoffRecord>),
+    Snapshot(Box<SnapshotRecord>),
+    Resume(Box<ResumeRecord>),
     Explain(serde_json::Value),
     Replay(Vec<ReplayRow>),
     Telemetry(serde_json::Value),
@@ -101,7 +101,7 @@ pub trait UnifiedContinuityInterface {
             UciRequest::Heartbeat { input } => UciResponse::AgentAttachment(self.heartbeat(input)?),
             UciRequest::OpenContext { input } => UciResponse::Context(self.open_context(input)?),
             UciRequest::ReadContext { input } => {
-                UciResponse::ContextRead(self.read_context(input)?)
+                UciResponse::ContextRead(Box::new(self.read_context(input)?))
             }
             UciRequest::Recall { input } => UciResponse::Recall(self.recall(input)?),
             UciRequest::WriteEvents { inputs } => {
@@ -120,9 +120,11 @@ pub trait UnifiedContinuityInterface {
                 UciResponse::ContinuityItems(vec![self.publish_signal(input)?])
             }
             UciRequest::Subscribe { input } => UciResponse::Subscription(self.subscribe(input)?),
-            UciRequest::Handoff { input } => UciResponse::Handoff(self.handoff(input)?),
-            UciRequest::Snapshot { input } => UciResponse::Snapshot(self.snapshot(input)?),
-            UciRequest::Resume { input } => UciResponse::Resume(self.resume(input)?),
+            UciRequest::Handoff { input } => UciResponse::Handoff(Box::new(self.handoff(input)?)),
+            UciRequest::Snapshot { input } => {
+                UciResponse::Snapshot(Box::new(self.snapshot(input)?))
+            }
+            UciRequest::Resume { input } => UciResponse::Resume(Box::new(self.resume(input)?)),
             UciRequest::Explain { target } => UciResponse::Explain(self.explain(target)?),
             UciRequest::Replay { selector, limit } => {
                 UciResponse::Replay(self.replay_selector(selector, limit)?)

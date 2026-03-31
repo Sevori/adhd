@@ -110,10 +110,10 @@ fn resolve_codex_home(
     if let Some(home) = requested_home {
         return resolve_absolute_path(home);
     }
-    if let Some(config_path) = config_path {
-        if let Some(parent) = config_path.parent() {
-            return Ok(parent.to_path_buf());
-        }
+    if let Some(config_path) = config_path
+        && let Some(parent) = config_path.parent()
+    {
+        return Ok(parent.to_path_buf());
     }
     if let Some(value) = env::var_os("CODEX_HOME") {
         let path = PathBuf::from(value);

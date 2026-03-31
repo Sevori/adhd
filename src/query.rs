@@ -125,8 +125,8 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
     let lineage_start = Instant::now();
     let seed_ids = merged
         .keys()
-        .cloned()
         .take(query.candidate_limit.min(8))
+        .cloned()
         .collect::<Vec<_>>();
     let lineage = storage.lineage_neighbors(&seed_ids, query.candidate_limit.min(12))?;
     let lineage_ms = lineage_start.elapsed().as_millis();
@@ -230,34 +230,34 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             });
             continue;
         }
-        if let Some(source_event_id) = &candidate.memory.source_event_id {
-            if seen_sources.contains(source_event_id) {
+        if let Some(source_event_id) = &candidate.memory.source_event_id
+            && seen_sources.contains(source_event_id)
+        {
+            rejected.push(RejectedCandidate {
+                memory_id: candidate.memory.id,
+                layer: candidate.memory.layer,
+                token_estimate: item.token_estimate,
+                final_score: candidate.final_score,
+                reason: "duplicate_source_event".to_string(),
+            });
+            continue;
+        }
+        if let Some(belief_key) = belief_key.as_deref()
+            && let Some((best_score, best_source_role)) = seen_belief_keys.get(belief_key)
+        {
+            let source_role = continuity_source_role_label(&candidate.memory);
+            let assistant_shadowing_user = belief_key.starts_with("user.")
+                && best_source_role.as_deref() == Some("user")
+                && source_role == Some("assistant");
+            if assistant_shadowing_user || *best_score >= candidate.final_score + 0.05 {
                 rejected.push(RejectedCandidate {
                     memory_id: candidate.memory.id,
                     layer: candidate.memory.layer,
                     token_estimate: item.token_estimate,
                     final_score: candidate.final_score,
-                    reason: "duplicate_source_event".to_string(),
+                    reason: "belief_key_competitor".to_string(),
                 });
                 continue;
-            }
-        }
-        if let Some(belief_key) = belief_key.as_deref() {
-            if let Some((best_score, best_source_role)) = seen_belief_keys.get(belief_key) {
-                let source_role = continuity_source_role_label(&candidate.memory);
-                let assistant_shadowing_user = belief_key.starts_with("user.")
-                    && best_source_role.as_deref() == Some("user")
-                    && source_role == Some("assistant");
-                if assistant_shadowing_user || *best_score >= candidate.final_score + 0.05 {
-                    rejected.push(RejectedCandidate {
-                        memory_id: candidate.memory.id,
-                        layer: candidate.memory.layer,
-                        token_estimate: item.token_estimate,
-                        final_score: candidate.final_score,
-                        reason: "belief_key_competitor".to_string(),
-                    });
-                    continue;
-                }
             }
         }
         if !history_requested
@@ -401,15 +401,14 @@ fn scope_score(query: &QueryInput, memory: &MemoryRecord) -> f64 {
     if query.agent_id.as_deref() == Some(memory.agent_id.as_str()) {
         score += 0.08;
     }
-    if let Some(namespace) = query.namespace.as_deref() {
-        if memory
+    if let Some(namespace) = query.namespace.as_deref()
+        && memory
             .extra
             .get("namespace")
             .and_then(|value| value.as_str())
             == Some(namespace)
-        {
-            score += 0.12;
-        }
+    {
+        score += 0.12;
     }
     score
 }

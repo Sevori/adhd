@@ -836,10 +836,10 @@ impl DispatchSpine {
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
             let messages = notifications.timeout_iter(remaining).collect::<Vec<_>>()?;
-            if !messages.is_empty() {
-                if let Some(record) = self.route_once(engine, input.route.clone())? {
-                    return Ok(Some(record));
-                }
+            if !messages.is_empty()
+                && let Some(record) = self.route_once(engine, input.route.clone())?
+            {
+                return Ok(Some(record));
             }
         }
         Ok(None)
@@ -868,15 +868,15 @@ impl DispatchSpine {
         while start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
             let messages = notifications.timeout_iter(remaining).collect::<Vec<_>>()?;
-            if !messages.is_empty() {
-                if let Some(record) = self.claim_for_worker(
+            if !messages.is_empty()
+                && let Some(record) = self.claim_for_worker(
                     engine,
                     worker_input.clone(),
                     token_budget,
                     candidate_limit,
-                )? {
-                    return Ok(Some(record));
-                }
+                )?
+            {
+                return Ok(Some(record));
             }
         }
         Ok(None)
@@ -903,15 +903,15 @@ impl DispatchSpine {
             anyhow::bail!("assignment {} not found", input.assignment_id);
         };
         let mut assignment = read_assignment_record(&row)?;
-        if let Some(worker_id) = &input.worker_id {
-            if worker_id != &assignment.worker_id {
-                anyhow::bail!(
-                    "assignment {} belongs to worker {}, not {}",
-                    assignment.id,
-                    assignment.worker_id,
-                    worker_id
-                );
-            }
+        if let Some(worker_id) = &input.worker_id
+            && worker_id != &assignment.worker_id
+        {
+            anyhow::bail!(
+                "assignment {} belongs to worker {}, not {}",
+                assignment.id,
+                assignment.worker_id,
+                worker_id
+            );
         }
         let completed_at = Utc::now();
         let final_status = if input.failed {
@@ -1162,17 +1162,17 @@ impl DispatchSpine {
                 assignment.pressure.anxiety,
                 None,
             );
-            if let Some(attached_lane) = assignment.attached_projected_lane.as_ref() {
-                if attached_lane.projection_id != assignment.projected_lane.projection_id {
-                    record_dispatch_projection_assignment(
-                        &mut projections,
-                        attached_lane,
-                        Some(assignment.namespace.as_str()),
-                        Some(assignment.task_id.as_str()),
-                        assignment.pressure.anxiety,
-                        assignment.attached_projected_lane_source,
-                    );
-                }
+            if let Some(attached_lane) = assignment.attached_projected_lane.as_ref()
+                && attached_lane.projection_id != assignment.projected_lane.projection_id
+            {
+                record_dispatch_projection_assignment(
+                    &mut projections,
+                    attached_lane,
+                    Some(assignment.namespace.as_str()),
+                    Some(assignment.task_id.as_str()),
+                    assignment.pressure.anxiety,
+                    assignment.attached_projected_lane_source,
+                );
             }
         }
         for projection in projections.into_values() {
@@ -2103,10 +2103,10 @@ fn worker_can_take_signal(worker: &DispatchWorkerRecord, signal: &DispatchSignal
     if worker.status.eq_ignore_ascii_case("offline") {
         return false;
     }
-    if let Some(target_role) = signal.target_role.as_deref() {
-        if worker.role != target_role {
-            return false;
-        }
+    if let Some(target_role) = signal.target_role.as_deref()
+        && worker.role != target_role
+    {
+        return false;
     }
     if worker.tier == DispatchWorkerTier::Script
         && signal.preferred_tier != Some(DispatchWorkerTier::Script)
