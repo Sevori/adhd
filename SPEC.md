@@ -139,6 +139,21 @@ ICE distinguishes fast episodic accumulation from slower semantic consolidation.
 - Semantic promotion SHOULD be conservative and SHOULD prefer repeated or independently confirmed state over one-off extraction.
 - For belief-keyed continuity items, promotion to durable semantic-like status SHOULD happen only after repeated confirmation or explicit operator validation, not from a single event alone.
 
+### Current Practice and Stale Guidance
+
+ICE MUST derive a first-class current-practice view from continuity instead of forcing the operator to infer the latest operating guidance from historical debris.
+
+- Guidance-like continuity includes at least `decision`, `constraint`, `lesson`, and validated `outcome`.
+- A continuity item MAY declare a `practice_key` in its user metadata.
+- ICE MUST index `practice_key` as a dimension when present.
+- ICE MUST derive a lifecycle state for guidance-like continuity: `current`, `aging`, `stale`, or `retired`.
+- `superseded` and `rejected` guidance MUST be treated as `retired` in the derived lifecycle, even if the raw item still exists for lineage.
+- By default, recall and context-pack compilation SHOULD boost `current` guidance and penalize `stale` or `retired` guidance.
+- When the objective explicitly asks for history, timeline, lineage, evolution, or why a practice changed, ICE SHOULD relax stale-guidance suppression so the full operating line can be reconstructed.
+- `continuity_read_context` MUST expose a first-class `current_practice` view summarizing the active operating guidance for the task.
+- The default `current_practice` view SHOULD prefer the latest active guidance and collapse weaker competitors for the same `practice_key` or `belief_key`.
+- Historical guidance MUST remain available for provenance and learning-line reconstruction. ICE may not fake recency by deleting lineage.
+
 ### Learning View
 
 `continuity_read_context` MUST expose a first-class learning view derived from continuity, not from prompt-only post-processing.

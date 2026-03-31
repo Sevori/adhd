@@ -22,11 +22,11 @@ use crate::continuity::{
     ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem, ContinuityRetentionState,
     ContinuityStatus, CoordinationLane, CoordinationSeverity, DEFAULT_MACHINE_TASK_ID,
     HeartbeatInput, LaneProjectionRecord, MACHINE_NAMESPACE_ALIAS, MachineProfile,
-    OpenContextInput, OutcomeInput, ResolveOrSupersedeInput, SnapshotManifest, SnapshotRecord,
-    SupportRef, UpsertAgentBadgeInput, WorkClaimConflict, WorkClaimCoordination,
-    coordination_signal, default_work_claim_lease_seconds, merge_work_claim_extra,
-    normalize_work_claim_resources, work_claim_coordination, work_claim_is_live, work_claim_key,
-    work_claims_conflict,
+    OpenContextInput, OutcomeInput, PracticeLifecycleState, ResolveOrSupersedeInput,
+    SnapshotManifest, SnapshotRecord, SupportRef, UpsertAgentBadgeInput, WorkClaimConflict,
+    WorkClaimCoordination, coordination_signal, default_work_claim_lease_seconds,
+    merge_work_claim_extra, normalize_work_claim_resources, work_claim_coordination,
+    work_claim_is_live, work_claim_key, work_claims_conflict,
 };
 use crate::embedding::{EmbeddingRuntime, l2_norm};
 use crate::model::{
@@ -3658,6 +3658,7 @@ impl Storage {
                     now,
                 )?;
                 let belief_key = continuity_belief_key(&item.extra);
+                let practice_key = continuity_practice_key(&item.extra);
                 let source_role = continuity_source_role(&item.extra);
                 let plasticity = plasticity_map
                     .get(&item.id)
@@ -3724,12 +3725,19 @@ impl Storage {
                         why,
                     },
                     belief_key,
+                    practice_key,
                     source_role,
                     plasticity,
+                    practice_state: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         apply_belief_key_competition(&mut recall_items);
+        apply_practice_lifecycle_competition(
+            &mut recall_items,
+            crate::continuity::objective_requests_history_context(objective),
+            now,
+        );
         recall_items.sort_by(|a, b| {
             b.item
                 .score
@@ -7250,6 +7258,10 @@ fn continuity_belief_key(extra: &serde_json::Value) -> Option<String> {
     continuity_metadata_str(extra, "belief_key")
 }
 
+fn continuity_practice_key(extra: &serde_json::Value) -> Option<String> {
+    continuity_metadata_str(extra, "practice_key")
+}
+
 fn continuity_source_role(extra: &serde_json::Value) -> Option<String> {
     continuity_metadata_str(extra, "source_role")
 }
@@ -7302,6 +7314,13 @@ fn continuity_dimensions(
         dimensions.push(DimensionValue {
             key: "belief_key".to_string(),
             value: belief_key,
+            weight: 100,
+        });
+    }
+    if let Some(practice_key) = continuity_practice_key(&input.extra) {
+        dimensions.push(DimensionValue {
+            key: "practice_key".to_string(),
+            value: practice_key,
             weight: 100,
         });
     }
@@ -7730,8 +7749,10 @@ struct StoredContinuityPlasticity {
 struct ScoredContinuityRecallItem {
     item: ContinuityRecallItem,
     belief_key: Option<String>,
+    practice_key: Option<String>,
     source_role: Option<String>,
     plasticity: Option<ContinuityPlasticityState>,
+    practice_state: Option<PracticeLifecycleState>,
 }
 
 fn read_continuity_row(row: &rusqlite::Row<'_>) -> Result<RawContinuityRow> {
@@ -7809,6 +7830,7 @@ fn build_continuity_record(
         supersedes_id: raw.supersedes_id,
         resolved_at: raw.resolved_at,
         supports,
+        practice_state: None,
         extra,
     })
 }
@@ -7964,6 +7986,178 @@ fn continuity_belief_competition_rank(item: &ScoredContinuityRecallItem) -> f64 
         score -= 0.12 * plasticity.prediction_error;
     }
     score
+}
+
+fn is_guidance_like_kind(kind: ContinuityKind) -> bool {
+    matches!(
+        kind,
+        ContinuityKind::Decision
+            | ContinuityKind::Constraint
+            | ContinuityKind::Lesson
+            | ContinuityKind::Outcome
+    )
+}
+
+fn continuity_practice_anchor(
+    updated_at: DateTime<Utc>,
+    plasticity: Option<&ContinuityPlasticityState>,
+) -> DateTime<Utc> {
+    let mut anchor = updated_at;
+    if let Some(plasticity) = plasticity {
+        for ts in [
+            plasticity.last_strengthened_at,
+            plasticity.last_confirmed_at,
+            plasticity.last_reactivated_at,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if ts > anchor {
+                anchor = ts;
+            }
+        }
+    }
+    anchor
+}
+
+fn derive_recall_practice_state(
+    item: &ContinuityRecallItem,
+    plasticity: Option<&ContinuityPlasticityState>,
+    now: DateTime<Utc>,
+) -> Option<PracticeLifecycleState> {
+    if !is_guidance_like_kind(item.kind) {
+        return None;
+    }
+    if matches!(
+        item.status,
+        ContinuityStatus::Superseded | ContinuityStatus::Rejected
+    ) {
+        return Some(PracticeLifecycleState::Retired);
+    }
+    let anchor = continuity_practice_anchor(item.updated_at, plasticity);
+    let age_hours = (now - anchor).num_seconds().max(0) as f64 / 3600.0;
+    let base_half_life: f64 = match item.kind {
+        ContinuityKind::Outcome => 96.0,
+        ContinuityKind::Lesson => 168.0,
+        ContinuityKind::Decision => 216.0,
+        ContinuityKind::Constraint => 288.0,
+        _ => 96.0,
+    };
+    let fresh_window_hours = base_half_life.clamp(12.0, 24.0 * 14.0) * 0.18;
+    let stale_window_hours = base_half_life.clamp(24.0, 24.0 * 45.0) * 0.55;
+    if item.status == ContinuityStatus::Resolved {
+        if age_hours <= fresh_window_hours * 0.75 {
+            Some(PracticeLifecycleState::Aging)
+        } else {
+            Some(PracticeLifecycleState::Stale)
+        }
+    } else if age_hours <= fresh_window_hours {
+        Some(PracticeLifecycleState::Current)
+    } else if age_hours <= stale_window_hours {
+        Some(PracticeLifecycleState::Aging)
+    } else {
+        Some(PracticeLifecycleState::Stale)
+    }
+}
+
+fn practice_state_adjustment(
+    state: Option<PracticeLifecycleState>,
+    history_requested: bool,
+) -> f64 {
+    match (state, history_requested) {
+        (Some(PracticeLifecycleState::Current), false) => 0.16,
+        (Some(PracticeLifecycleState::Aging), false) => 0.03,
+        (Some(PracticeLifecycleState::Stale), false) => -0.2,
+        (Some(PracticeLifecycleState::Retired), false) => -0.34,
+        (Some(PracticeLifecycleState::Current), true) => 0.05,
+        (Some(PracticeLifecycleState::Aging), true) => 0.0,
+        (Some(PracticeLifecycleState::Stale), true) => -0.02,
+        (Some(PracticeLifecycleState::Retired), true) => -0.06,
+        (None, _) => 0.0,
+    }
+}
+
+fn practice_state_why(state: Option<PracticeLifecycleState>) -> Option<&'static str> {
+    match state {
+        Some(PracticeLifecycleState::Current) => Some("practice_current"),
+        Some(PracticeLifecycleState::Aging) => Some("practice_aging"),
+        Some(PracticeLifecycleState::Stale) => Some("practice_stale"),
+        Some(PracticeLifecycleState::Retired) => Some("practice_retired"),
+        None => None,
+    }
+}
+
+fn continuity_practice_competition_rank(item: &ScoredContinuityRecallItem) -> f64 {
+    let mut score = item.item.score;
+    if let Some(plasticity) = item.plasticity.as_ref() {
+        score += 0.04 * (plasticity.confirmation_count as f64 + 1.0).ln();
+        score += 0.03 * (plasticity.successful_use_count as f64 + 1.0).ln();
+        score += 0.05 * (plasticity.spaced_reactivation_count as f64 + 1.0).ln();
+        score -= 0.08 * plasticity.contradiction_count as f64;
+        score -= 0.12 * plasticity.prediction_error;
+    }
+    score
+}
+
+fn apply_practice_lifecycle_competition(
+    items: &mut [ScoredContinuityRecallItem],
+    history_requested: bool,
+    now: DateTime<Utc>,
+) {
+    for item in items.iter_mut() {
+        let state = derive_recall_practice_state(&item.item, item.plasticity.as_ref(), now);
+        item.practice_state = state;
+        item.item.score += practice_state_adjustment(state, history_requested);
+        if let Some(why) = practice_state_why(state) {
+            item.item.why.push(why.to_string());
+        }
+    }
+
+    if history_requested {
+        return;
+    }
+
+    let mut practice_groups = HashMap::<String, Vec<usize>>::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(practice_key) = item.practice_key.as_ref() else {
+            continue;
+        };
+        practice_groups
+            .entry(practice_key.clone())
+            .or_default()
+            .push(index);
+    }
+
+    for indices in practice_groups.into_values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let mut ordered = indices;
+        ordered.sort_by(|left, right| {
+            continuity_practice_competition_rank(&items[*right])
+                .partial_cmp(&continuity_practice_competition_rank(&items[*left]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    items[*right]
+                        .item
+                        .updated_at
+                        .cmp(&items[*left].item.updated_at)
+                })
+        });
+        let winner_index = ordered[0];
+        let winner_rank = continuity_practice_competition_rank(&items[winner_index]);
+        let winner = &mut items[winner_index].item;
+        winner.score += 0.08;
+        winner.why.push("practice_key_winner".to_string());
+
+        for loser_index in ordered.into_iter().skip(1) {
+            let loser_rank = continuity_practice_competition_rank(&items[loser_index]);
+            let penalty = (0.1 + (winner_rank - loser_rank).clamp(0.0, 0.18)).clamp(0.1, 0.24);
+            let loser = &mut items[loser_index].item;
+            loser.score -= penalty;
+            loser.why.push("practice_key_competitor".to_string());
+        }
+    }
 }
 
 fn apply_belief_key_competition(items: &mut [ScoredContinuityRecallItem]) {
