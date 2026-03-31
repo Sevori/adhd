@@ -396,6 +396,8 @@ pub struct ContinuityRecallCompiler {
     #[serde(default)]
     pub lexical_fallback_count: usize,
     #[serde(default)]
+    pub stale_debris_demoted_count: usize,
+    #[serde(default)]
     pub priority_seed_count: usize,
     #[serde(default)]
     pub operational_seed_count: usize,

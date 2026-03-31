@@ -373,6 +373,7 @@ pub struct QueryInput {
 pub struct ScoreBreakdown {
     pub continuity: f64,
     pub practice_evidence: f64,
+    pub stale_debris: f64,
     pub continuity_kind: f64,
     pub continuity_status: f64,
     pub selector: f64,

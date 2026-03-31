@@ -9,7 +9,7 @@ use crate::continuity::{annotate_practice_states, build_current_practice_view};
 use crate::embedding::cosine_similarity;
 use crate::model::{
     CandidateRecord, ContextPack, ContextPackItem, ContextPackManifest, MemoryRecord, QueryInput,
-    RejectedCandidate, ScoreBreakdown,
+    RejectedCandidate, Scope, ScoreBreakdown,
 };
 use crate::storage::Storage;
 
@@ -162,8 +162,16 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             let source_role_score = continuity_source_role_score(&candidate.memory);
             let (practice_score, practice_why) =
                 continuity_practice_lifecycle_score(&candidate.memory, now, history_requested);
+            let (stale_debris_score, stale_debris_why) = continuity_stale_debris_score(
+                &candidate.memory,
+                &candidate.breakdown,
+                history_requested,
+                now,
+            );
+            candidate.breakdown.stale_debris = stale_debris_score;
             candidate.final_score = candidate.breakdown.continuity * 1.2
                 + candidate.breakdown.practice_evidence * 0.95
+                + candidate.breakdown.stale_debris
                 + candidate.breakdown.continuity_kind
                 + candidate.breakdown.continuity_status
                 + candidate.breakdown.lexical * 0.95
@@ -193,6 +201,9 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             if let Some(practice_why) = practice_why {
                 candidate.why.push(practice_why.to_string());
             }
+            candidate
+                .why
+                .extend(stale_debris_why.into_iter().map(ToString::to_string));
             candidate.why.sort();
             candidate.why.dedup();
             candidate
@@ -228,6 +239,16 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             body: candidate.memory.body.clone(),
         };
 
+        if candidate.breakdown.stale_debris <= -0.3 {
+            rejected.push(RejectedCandidate {
+                memory_id: candidate.memory.id,
+                layer: candidate.memory.layer,
+                token_estimate: item.token_estimate,
+                final_score: candidate.final_score,
+                reason: "stale_semantic_debris".to_string(),
+            });
+            continue;
+        }
         if candidate.final_score < 0.18 {
             rejected.push(RejectedCandidate {
                 memory_id: candidate.memory.id,
@@ -699,6 +720,118 @@ fn continuity_source_role_score(memory: &MemoryRecord) -> f64 {
         }
         Some(_) | None => 0.0,
     }
+}
+
+fn continuity_memory_plasticity_state(
+    memory: &MemoryRecord,
+) -> Option<crate::continuity::ContinuityPlasticityState> {
+    memory
+        .extra
+        .get("plasticity")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn continuity_memory_has_reinforcement(memory: &MemoryRecord) -> bool {
+    continuity_memory_plasticity_state(memory)
+        .map(|plasticity| {
+            plasticity.confirmation_count > 0
+                || plasticity.successful_use_count > 0
+                || plasticity.spaced_reactivation_count > 0
+                || plasticity.last_strengthened_at.is_some()
+                || plasticity.last_confirmed_at.is_some()
+        })
+        .unwrap_or(false)
+}
+
+fn continuity_memory_practice_anchor(memory: &MemoryRecord) -> DateTime<Utc> {
+    let mut anchor = memory.ts;
+    if let Some(plasticity) = continuity_memory_plasticity_state(memory) {
+        for ts in [
+            plasticity.last_strengthened_at,
+            plasticity.last_confirmed_at,
+            plasticity.last_reactivated_at,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if ts > anchor {
+                anchor = ts;
+            }
+        }
+    }
+    anchor
+}
+
+fn continuity_stale_debris_score(
+    memory: &MemoryRecord,
+    breakdown: &ScoreBreakdown,
+    history_requested: bool,
+    now: DateTime<Utc>,
+) -> (f64, Vec<&'static str>) {
+    let Some(kind) = continuity_kind_label(memory) else {
+        return (0.0, Vec::new());
+    };
+    if history_requested
+        || !matches!(kind, "decision" | "constraint" | "lesson" | "outcome")
+        || !matches!(continuity_status_label(memory), Some("open" | "active"))
+    {
+        return (0.0, Vec::new());
+    }
+
+    let (_, practice_state) = continuity_practice_lifecycle_score(memory, now, false);
+    if !matches!(practice_state, Some("practice_stale" | "practice_retired")) {
+        return (0.0, Vec::new());
+    }
+
+    let lexical_only = breakdown.lexical > 0.0
+        && breakdown.continuity == 0.0
+        && breakdown.practice_evidence == 0.0
+        && breakdown.temporal == 0.0
+        && breakdown.selector == 0.0
+        && breakdown.view == 0.0;
+    let has_anchor = continuity_practice_key_label(memory).is_some()
+        || continuity_belief_key_label(memory).is_some();
+    let has_reinforcement = continuity_memory_has_reinforcement(memory);
+    let anchor = continuity_memory_practice_anchor(memory);
+    let age_hours = (now - anchor).num_seconds().max(0) as f64 / 3600.0;
+    let ancient = age_hours >= 24.0 * 10.0;
+
+    if !lexical_only && has_anchor && has_reinforcement && !ancient {
+        return (0.0, Vec::new());
+    }
+
+    let mut penalty: f64 = match practice_state {
+        Some("practice_retired") => 0.16,
+        Some("practice_stale") => 0.1,
+        _ => 0.0,
+    };
+    let mut why = vec!["stale_semantic_debris"];
+
+    if lexical_only {
+        penalty += 0.16;
+        why.push("debris_lexical_only");
+    }
+    if !has_anchor {
+        penalty += 0.1;
+        why.push("debris_unanchored");
+    }
+    if !has_reinforcement {
+        penalty += 0.08;
+        why.push("debris_unreinforced");
+    }
+    if ancient {
+        penalty += 0.08;
+        why.push("debris_ancient");
+    }
+    if memory.scope == Scope::Shared {
+        penalty += 0.08;
+        why.push("debris_shared_scope");
+    } else if memory.scope == Scope::Project {
+        penalty += 0.03;
+    }
+
+    (-penalty.clamp(0.0, 0.58), why)
 }
 
 fn continuity_metadata_str<'a>(extra: &'a serde_json::Value, key: &str) -> Option<&'a str> {
