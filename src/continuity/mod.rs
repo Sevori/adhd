@@ -29,11 +29,12 @@ pub use types::{
 // Re-export pub(crate) items used by other modules in this crate.
 pub(crate) use helpers::{
     annotate_practice_states, build_current_practice_view, build_next_step_view,
-    build_operational_state_view, coordination_signal, default_work_claim_lease_seconds,
-    merge_work_claim_extra, normalize_work_claim_resources,
+    build_operational_state_view, build_recent_update_view, coordination_signal,
+    default_work_claim_lease_seconds, merge_work_claim_extra, normalize_work_claim_resources,
     objective_requests_current_state_context, objective_requests_history_context,
     objective_requests_next_step_context, objective_requests_operational_state_context,
-    work_claim_coordination, work_claim_is_live, work_claim_key, work_claims_conflict,
+    objective_requests_recent_update_context, work_claim_coordination, work_claim_is_live,
+    work_claim_key, work_claims_conflict,
 };
 pub(crate) use schema::{CoordinationSignalRecord, WorkClaimConflict, WorkClaimCoordination};
 
@@ -1447,6 +1448,25 @@ mod tests {
     }
 
     #[test]
+    fn objective_requests_recent_update_context_detects_latest_progress_prompts() {
+        assert!(objective_requests_recent_update_context(
+            "Continue from here on main."
+        ));
+        assert!(objective_requests_recent_update_context(
+            "What changed recently in the recall behavior?"
+        ));
+        assert!(objective_requests_recent_update_context(
+            "Qual a última decisão que mudou isso?"
+        ));
+        assert!(!objective_requests_recent_update_context(
+            "What guidance is currently live?"
+        ));
+        assert!(!objective_requests_recent_update_context(
+            "Show the full lineage over time."
+        ));
+    }
+
+    #[test]
     fn read_context_implicit_operational_prompt_surfaces_current_plan_to_second_agent() {
         let dir = tempdir().unwrap();
         let engine = Engine::open(dir.path()).unwrap();
@@ -1651,6 +1671,205 @@ mod tests {
                 .any(|item| item.memory_id == current.memory_id)
         );
         assert!(read.recall.compiler.operational_seed_count >= 2);
+    }
+
+    #[test]
+    fn read_context_continue_from_here_prefers_recent_active_guidance_to_second_agent() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let planner = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["write_item".into(), "read_context".into()],
+                namespace: "demo".into(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let worker = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "worker".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["read_context".into()],
+                namespace: "demo".into(),
+                role: Some("worker".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: DEFAULT_MACHINE_TASK_ID.into(),
+                session_id: "session-recent-update".into(),
+                objective: "track latest merged guidance".into(),
+                selector: None,
+                agent_id: Some("planner".into()),
+                attachment_id: Some(planner.id.clone()),
+            })
+            .unwrap();
+        engine
+            .upsert_agent_badge(UpsertAgentBadgeInput {
+                attachment_id: Some(worker.id.clone()),
+                agent_id: None,
+                namespace: None,
+                context_id: Some(context.id.clone()),
+                display_name: Some("Worker".into()),
+                status: Some("active".into()),
+                focus: Some("continue from latest merged state".into()),
+                headline: Some("pick up the newest merged guidance".into()),
+                resource: Some("repo/demo/main".into()),
+                repo_root: Some("/tmp/demo".into()),
+                branch: Some("main".into()),
+                metadata: serde_json::json!({"source": "test"}),
+            })
+            .unwrap();
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old lexical continuation anchor".into(),
+                body: "Continue from here by following the old lexical continuation anchor.".into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.95),
+                confidence: Some(0.95),
+                salience: Some(0.95),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Merged task-local guidance".into(),
+                body: "Continue from the merged task-local guidance, not the stale lexical anchor."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.9),
+                salience: Some(0.89),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let recent_lesson = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Recent merge lesson".into(),
+                body: "The recent merge proved that latest guidance should outrank old lexical recall."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.86),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    reason: Some("supports_recent_guidance".into()),
+                    weight: 1.0,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap()
+            .remove(0);
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - Duration::minutes(50)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(50)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                recent_lesson.id.as_str(),
+                (Utc::now() - Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                recent_lesson.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "continue from here on main".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("worker".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: false,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.recall.items[0].id, current.id);
+        assert!(
+            read.recall
+                .items
+                .iter()
+                .any(|item| item.id == recent_lesson.id
+                    && item.why.iter().any(|why| why == "recent_update"))
+        );
+        assert!(read.recall.items.iter().any(|item| {
+            item.id == stale.id
+                && item
+                    .why
+                    .iter()
+                    .any(|why| why == "practice_stale" || why == "practice_retired")
+        }));
+        assert!(read.recall.compiler.recent_update_seed_count >= 2);
     }
 
     #[test]
