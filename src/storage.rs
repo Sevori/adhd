@@ -3524,6 +3524,10 @@ impl Storage {
         let history_requested = crate::continuity::objective_requests_history_context(objective);
         let current_state_requested =
             crate::continuity::objective_requests_current_state_context(objective);
+        let operational_state_requested =
+            crate::continuity::objective_requests_operational_state_context(objective);
+        let next_step_requested =
+            crate::continuity::objective_requests_next_step_context(objective);
 
         let mut seeds = BTreeMap::<String, RecallSeed>::new();
         let compiled_started = Instant::now();
@@ -3564,14 +3568,15 @@ impl Storage {
         }
 
         let mut live_state_len = 0usize;
-        if current_state_requested {
+        let mut operational_state_len = 0usize;
+        if current_state_requested || operational_state_requested {
             let mut continuity = self.list_continuity_items(context_id, true)?;
             crate::continuity::annotate_practice_states(&mut continuity, now);
-            let current_practice = crate::continuity::build_current_practice_view(&continuity, now);
-            let missing_ids = current_practice
-                .items
-                .iter()
-                .filter_map(|item| {
+            let mut missing_ids = Vec::new();
+            if current_state_requested {
+                let current_practice =
+                    crate::continuity::build_current_practice_view(&continuity, now);
+                missing_ids.extend(current_practice.items.iter().filter_map(|item| {
                     let seed = seeds.entry(item.id.clone()).or_default();
                     seed.live_state_rank.get_or_insert(live_state_len);
                     live_state_len += 1;
@@ -3580,8 +3585,37 @@ impl Storage {
                     } else {
                         None
                     }
-                })
-                .collect::<Vec<_>>();
+                }));
+            }
+            if operational_state_requested {
+                let operational_state =
+                    crate::continuity::build_operational_state_view(&continuity, now);
+                missing_ids.extend(operational_state.iter().filter_map(|item| {
+                    let seed = seeds.entry(item.id.clone()).or_default();
+                    seed.operational_state_rank
+                        .get_or_insert(operational_state_len);
+                    operational_state_len += 1;
+                    if seed.raw.is_none() {
+                        Some(item.id.clone())
+                    } else {
+                        None
+                    }
+                }));
+            }
+            if next_step_requested {
+                let next_steps = crate::continuity::build_next_step_view(&continuity);
+                missing_ids.extend(next_steps.iter().filter_map(|item| {
+                    let seed = seeds.entry(item.id.clone()).or_default();
+                    seed.next_step_rank.get_or_insert(0);
+                    if seed.raw.is_none() {
+                        Some(item.id.clone())
+                    } else {
+                        None
+                    }
+                }));
+            }
+            missing_ids.sort();
+            missing_ids.dedup();
             for raw in self.raw_continuity_rows_by_ids(&missing_ids)? {
                 let seed = seeds.entry(raw.id.clone()).or_default();
                 seed.raw = Some(raw);
@@ -3686,6 +3720,10 @@ impl Storage {
             .values()
             .filter(|seed| seed.priority_rank.is_some())
             .count();
+        let operational_seed_count = seeds
+            .values()
+            .filter(|seed| seed.operational_state_rank.is_some())
+            .count();
         let mut recall_items = seeds
             .into_values()
             .filter_map(|mut seed| seed.raw.take().map(|raw| (raw, seed)))
@@ -3706,6 +3744,13 @@ impl Storage {
                 let lexical_score = rank_score(seed.lexical_rank, lexical_len);
                 let priority_score = rank_score(seed.priority_rank, priority_len);
                 let live_state_score = rank_score(seed.live_state_rank, live_state_len);
+                let operational_state_score =
+                    rank_score(seed.operational_state_rank, operational_state_len);
+                let next_step_score = if seed.next_step_rank.is_some() {
+                    1.0
+                } else {
+                    0.0
+                };
                 let compiled_score = rank_score(seed.compiled_rank, compiled_len);
                 let lexical_weight = if seed.compiled_band.is_some() {
                     0.75
@@ -3716,6 +3761,8 @@ impl Storage {
                     + compiled_score * 1.2
                     + priority_score * 0.65
                     + live_state_score * 1.35
+                    + operational_state_score * 0.95
+                    + next_step_score * 1.1
                     + item.retention.effective_salience * 0.9
                     + continuity_kind_boost(item.kind)
                     + continuity_status_boost(item.status)
@@ -3746,6 +3793,12 @@ impl Storage {
                 }
                 if seed.live_state_rank.is_some() {
                     why.push("live_state".to_string());
+                }
+                if seed.operational_state_rank.is_some() {
+                    why.push("operational_state".to_string());
+                }
+                if seed.next_step_rank.is_some() {
+                    why.push("next_step".to_string());
                 }
                 if anchor_support_scores.contains_key(&item.id) {
                     why.push("causal_anchor".to_string());
@@ -3830,6 +3883,7 @@ impl Storage {
                 compiled_hit_count,
                 lexical_fallback_count,
                 priority_seed_count,
+                operational_seed_count,
                 dominant_band,
                 band_hit_counts,
             },
@@ -7769,6 +7823,8 @@ struct RecallSeed {
     lexical_rank: Option<usize>,
     priority_rank: Option<usize>,
     live_state_rank: Option<usize>,
+    operational_state_rank: Option<usize>,
+    next_step_rank: Option<usize>,
     compiled_rank: Option<usize>,
     compiled_band: Option<String>,
 }
@@ -11715,6 +11771,172 @@ mod tests {
             .find(|item| item.id == current.id)
             .unwrap();
         assert!(current_item.why.iter().any(|why| why == "live_state"));
+
+        let stale_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == stale.id)
+            .unwrap();
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "practice_stale" || why == "practice_retired")
+        );
+    }
+
+    #[test]
+    fn recall_continuity_prefers_implicit_operational_state_over_stale_lexical_anchor() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-implicit-operational-state".into(),
+                session_id: "session-implicit-operational-state".into(),
+                objective: "track organism plan".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old protocol friction plan".into(),
+                body: "The plan says to keep following the old brutal feedback anchor on main."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.95),
+                confidence: Some(0.95),
+                salience: Some(0.95),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "organism.main.plan",
+                }),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Constraint,
+                title: "Merged main plan".into(),
+                body:
+                    "Operate from the merged main guidance and keep the latest evidence attached."
+                        .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.89),
+                confidence: Some(0.9),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "organism.main.plan",
+                }),
+            })
+            .unwrap();
+        let next_step = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::WorkingState,
+                title: "model-next-step".into(),
+                body: "Push the merged main guidance first.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.83),
+                confidence: Some(0.86),
+                salience: Some(0.84),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "next_step": true,
+                }),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        let stale_ts = (Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+        let current_ts = (Utc::now() - chrono::Duration::minutes(40)).to_rfc3339();
+        let next_step_ts = (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![stale.id.as_str(), stale_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![current.id.as_str(), current_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(40)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![next_step.id.as_str(), next_step_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                next_step.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(&context.id, "what should we do next on main?", false, 8)
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(next_step.id.as_str())
+        );
+        assert_eq!(recall.compiler.operational_seed_count, 2);
+
+        let next_step_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == next_step.id)
+            .unwrap();
+        assert!(next_step_item.why.iter().any(|why| why == "next_step"));
+
+        let current_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == current.id)
+            .unwrap();
+        assert!(
+            current_item
+                .why
+                .iter()
+                .any(|why| why == "operational_state")
+        );
 
         let stale_item = recall
             .items

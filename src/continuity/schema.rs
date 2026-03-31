@@ -397,6 +397,8 @@ pub struct ContinuityRecallCompiler {
     pub lexical_fallback_count: usize,
     #[serde(default)]
     pub priority_seed_count: usize,
+    #[serde(default)]
+    pub operational_seed_count: usize,
     pub dominant_band: Option<String>,
     #[serde(default)]
     pub band_hit_counts: BTreeMap<String, usize>,

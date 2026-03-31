@@ -156,7 +156,10 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - The default `current_practice` view MUST surface the evidence that currently backs each live practice, favoring corroborated guidance over uncorroborated same-cluster competitors when the support signal is materially stronger.
 - When a context pack includes a recalled live practice, ICE SHOULD also carry the strongest provenance-backed evidence chain for that practice instead of sending doctrine without proof.
 - When the objective explicitly asks for the current, live, latest, or active state, continuity recall SHOULD seed from the derived `current_practice` view before relying on lexical matches alone.
+- When the objective implicitly asks for operational state, such as plan, status, blockers, next step, priorities, or what to do now, continuity recall SHOULD seed from live operational state even if the wording does not contain `current`, `live`, or `latest`.
+- This implicit operational-state path SHOULD combine live `current_practice` with bounded open-pressure state such as next steps, active blockers, live coordination pressure, and non-stale open guidance.
 - This live-state recall path MUST prefer recently active operating guidance over stale lexical competitors when both speak about the same cluster, while keeping the stale branch available for explicit history reconstruction.
+- Explicit current-state seeding and implicit operational-state seeding MUST remain distinct telemetry paths so ICE can measure when a recall win came from operational priors instead of lexical fallback.
 - Evidence-chain promotion MUST be bounded and provenance-backed. It may only use stored continuity evidence already attached to the winning practice, not hidden benchmark labels or prompt-only annotations.
 - Historical guidance MUST remain available for provenance and learning-line reconstruction. ICE may not fake recency by deleting lineage.
 
