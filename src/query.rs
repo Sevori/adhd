@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::embedding::cosine_similarity;
@@ -135,6 +135,7 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
     });
 
     let now = Utc::now();
+    let history_requested = objective_requests_history_context(&query.query_text);
     let mut candidates = merged
         .into_values()
         .map(|mut candidate| {
@@ -145,6 +146,8 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             candidate.breakdown.scope = scope_score(&query, &candidate.memory);
             let vector_weight = vector_score_weight(&candidate.memory);
             let source_role_score = continuity_source_role_score(&candidate.memory);
+            let (practice_score, practice_why) =
+                continuity_practice_lifecycle_score(&candidate.memory, now, history_requested);
             candidate.final_score = candidate.breakdown.continuity * 1.2
                 + candidate.breakdown.continuity_kind
                 + candidate.breakdown.continuity_status
@@ -158,7 +161,8 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                 + candidate.breakdown.lineage * 0.35
                 + candidate.breakdown.view * 0.4
                 + candidate.breakdown.scope
-                + source_role_score;
+                + source_role_score
+                + practice_score;
             if let Some(kind) = continuity_kind_label(&candidate.memory) {
                 candidate.why.push(format!("continuity_kind:{kind}"));
             }
@@ -167,6 +171,9 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             }
             if let Some(source_role) = continuity_source_role_label(&candidate.memory) {
                 candidate.why.push(format!("source_role:{source_role}"));
+            }
+            if let Some(practice_why) = practice_why {
+                candidate.why.push(practice_why.to_string());
             }
             candidate.why.sort();
             candidate.why.dedup();
@@ -184,10 +191,13 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
     let mut seen_scope_keys = HashSet::new();
     let mut seen_sources = HashSet::new();
     let mut seen_belief_keys = HashMap::<String, (f64, Option<String>)>::new();
+    let mut seen_practice_keys = HashMap::<String, f64>::new();
     let mut used_tokens = 0usize;
 
     for candidate in candidates {
         let belief_key = continuity_belief_key_label(&candidate.memory).map(ToString::to_string);
+        let practice_key =
+            continuity_practice_key_label(&candidate.memory).map(ToString::to_string);
         let provenance = storage.provenance_for_memory(&candidate.memory)?;
         let item = ContextPackItem {
             memory_id: candidate.memory.id.clone(),
@@ -250,6 +260,20 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                 }
             }
         }
+        if !history_requested
+            && let Some(practice_key) = practice_key.as_deref()
+            && let Some(best_score) = seen_practice_keys.get(practice_key)
+            && *best_score >= candidate.final_score + 0.04
+        {
+            rejected.push(RejectedCandidate {
+                memory_id: candidate.memory.id,
+                layer: candidate.memory.layer,
+                token_estimate: item.token_estimate,
+                final_score: candidate.final_score,
+                reason: "practice_key_competitor".to_string(),
+            });
+            continue;
+        }
         if used_tokens + item.token_estimate > query.budget_tokens {
             rejected.push(RejectedCandidate {
                 memory_id: candidate.memory.id,
@@ -284,6 +308,16 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                         continuity_source_role_label(&candidate.memory).map(ToString::to_string),
                     )
                 });
+        }
+        if let Some(practice_key) = practice_key {
+            seen_practice_keys
+                .entry(practice_key)
+                .and_modify(|entry| {
+                    if candidate.final_score > *entry {
+                        *entry = candidate.final_score;
+                    }
+                })
+                .or_insert(candidate.final_score);
         }
         selected.push(item);
     }
@@ -443,11 +477,73 @@ fn continuity_belief_key_label(memory: &MemoryRecord) -> Option<&str> {
     continuity_metadata_str(&memory.extra, "belief_key")
 }
 
+fn continuity_practice_key_label(memory: &MemoryRecord) -> Option<&str> {
+    if !memory.id.starts_with("continuity-memory:") {
+        return None;
+    }
+    continuity_metadata_str(&memory.extra, "practice_key")
+}
+
 fn continuity_source_role_label(memory: &MemoryRecord) -> Option<&str> {
     if !memory.id.starts_with("continuity-memory:") {
         return None;
     }
     continuity_metadata_str(&memory.extra, "source_role")
+}
+
+fn continuity_practice_lifecycle_score(
+    memory: &MemoryRecord,
+    now: DateTime<Utc>,
+    history_requested: bool,
+) -> (f64, Option<&'static str>) {
+    let Some(kind) = continuity_kind_label(memory) else {
+        return (0.0, None);
+    };
+    if !matches!(kind, "decision" | "constraint" | "lesson" | "outcome") {
+        return (0.0, None);
+    }
+    let status = continuity_status_label(memory);
+    let age_hours = (now - memory.ts).num_seconds().max(0) as f64 / 3600.0;
+    let base_half_life: f64 = match kind {
+        "outcome" => 96.0,
+        "lesson" => 168.0,
+        "decision" => 216.0,
+        "constraint" => 288.0,
+        _ => 96.0,
+    };
+    let fresh_window_hours = base_half_life.clamp(12.0, 24.0 * 14.0) * 0.18;
+    let stale_window_hours = base_half_life.clamp(24.0, 24.0 * 45.0) * 0.55;
+    let state = match status {
+        Some("superseded" | "rejected") => Some("practice_retired"),
+        Some("resolved") => {
+            if age_hours <= fresh_window_hours * 0.75 {
+                Some("practice_aging")
+            } else {
+                Some("practice_stale")
+            }
+        }
+        _ => {
+            if age_hours <= fresh_window_hours {
+                Some("practice_current")
+            } else if age_hours <= stale_window_hours {
+                Some("practice_aging")
+            } else {
+                Some("practice_stale")
+            }
+        }
+    };
+    let score = match (state, history_requested) {
+        (Some("practice_current"), false) => 0.16,
+        (Some("practice_aging"), false) => 0.03,
+        (Some("practice_stale"), false) => -0.2,
+        (Some("practice_retired"), false) => -0.34,
+        (Some("practice_current"), true) => 0.05,
+        (Some("practice_aging"), true) => 0.0,
+        (Some("practice_stale"), true) => -0.02,
+        (Some("practice_retired"), true) => -0.06,
+        _ => 0.0,
+    };
+    (score, state)
 }
 
 fn continuity_source_role_score(memory: &MemoryRecord) -> f64 {
@@ -492,6 +588,33 @@ fn continuity_metadata_str<'a>(extra: &'a serde_json::Value, key: &str) -> Optio
             .and_then(|value| value.get(key))
             .and_then(|value| value.as_str())
     })
+}
+
+fn objective_requests_history_context(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "history",
+        "timeline",
+        "lineage",
+        "evolution",
+        "over time",
+        "weekly review",
+        "how we learned",
+        "what we learned over",
+        "historico",
+        "histórico",
+        "linha",
+        "evolucao",
+        "evolução",
+        "ao longo",
+        "semana inteira",
+        "linha de aprendizado",
+        "full learning line",
+        "why did it change",
+        "how did it change",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 #[cfg(test)]

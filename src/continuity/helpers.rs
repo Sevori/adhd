@@ -186,6 +186,7 @@ pub(crate) fn filter_kind(
 const RECENT_LEARNING_WINDOW_DAYS: i64 = 7;
 const RECENT_LEARNING_LIMIT: usize = 6;
 const LEARNING_SUMMARY_LIMIT: usize = 3;
+const CURRENT_PRACTICE_LIMIT: usize = 5;
 
 pub(crate) fn build_learning_view(
     objective: &str,
@@ -193,7 +194,7 @@ pub(crate) fn build_learning_view(
     now: DateTime<Utc>,
 ) -> LearningView {
     let mut candidates = learning_candidates(items);
-    if objective_requests_learning_line(objective) {
+    if objective_requests_history_context(objective) {
         candidates.sort_by(|left, right| {
             left.updated_at
                 .cmp(&right.updated_at)
@@ -227,6 +228,95 @@ pub(crate) fn build_learning_view(
         mode: LearningViewMode::Recent,
         summary,
         items: recent_items,
+    }
+}
+
+pub(crate) fn annotate_practice_states(items: &mut [ContinuityItemRecord], now: DateTime<Utc>) {
+    let mut strongest_clusters = BTreeMap::<String, (usize, f64, DateTime<Utc>)>::new();
+    let mut baseline_states = vec![None; items.len()];
+    let mut practice_ranks = vec![0.0; items.len()];
+
+    for (index, item) in items.iter().enumerate() {
+        let state = derive_practice_state(item, now);
+        baseline_states[index] = state;
+        let Some(state) = state else {
+            continue;
+        };
+        practice_ranks[index] = current_practice_rank(item, state, now);
+        if let Some(cluster_key) = continuity_practice_cluster_key(item) {
+            strongest_clusters
+                .entry(cluster_key)
+                .and_modify(|entry| {
+                    let current = (practice_ranks[index], item.updated_at);
+                    let best = (entry.1, entry.2);
+                    if current.0 > best.0 || (current.0 == best.0 && current.1 > best.1) {
+                        *entry = (index, current.0, current.1);
+                    }
+                })
+                .or_insert((index, practice_ranks[index], item.updated_at));
+        }
+    }
+
+    for (index, item) in items.iter_mut().enumerate() {
+        let mut state = baseline_states[index];
+        if let (Some(current_state), Some(cluster_key)) =
+            (state, continuity_practice_cluster_key(item))
+            && let Some((winner_index, winner_rank, winner_updated_at)) =
+                strongest_clusters.get(&cluster_key)
+            && *winner_index != index
+            && current_state != PracticeLifecycleState::Retired
+        {
+            let rank_gap = *winner_rank - practice_ranks[index];
+            if rank_gap >= 0.14 || *winner_updated_at > item.updated_at {
+                state = Some(PracticeLifecycleState::Stale);
+            } else if current_state == PracticeLifecycleState::Current {
+                state = Some(PracticeLifecycleState::Aging);
+            }
+        }
+        item.practice_state = state;
+    }
+}
+
+pub(crate) fn build_current_practice_view(
+    items: &[ContinuityItemRecord],
+    now: DateTime<Utc>,
+) -> PracticeView {
+    let mut practice_items = items
+        .iter()
+        .filter(|item| is_current_practice_candidate(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    practice_items.sort_by(|left, right| {
+        practice_state_sort_rank(right.practice_state)
+            .cmp(&practice_state_sort_rank(left.practice_state))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| {
+                right
+                    .importance
+                    .partial_cmp(&left.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.title.cmp(&left.title))
+    });
+
+    let mut seen_clusters = BTreeSet::new();
+    let mut selected = Vec::new();
+    for item in practice_items {
+        if let Some(cluster_key) = continuity_practice_cluster_key(&item)
+            && !seen_clusters.insert(cluster_key)
+        {
+            continue;
+        }
+        selected.push(item);
+        if selected.len() >= CURRENT_PRACTICE_LIMIT {
+            break;
+        }
+    }
+
+    let summary = summarize_current_practice(&selected, now);
+    PracticeView {
+        summary,
+        items: selected,
     }
 }
 
@@ -266,7 +356,7 @@ fn is_learning_candidate(item: &ContinuityItemRecord) -> bool {
     )
 }
 
-fn objective_requests_learning_line(objective: &str) -> bool {
+pub(crate) fn objective_requests_history_context(objective: &str) -> bool {
     let normalized = objective.to_ascii_lowercase();
     [
         "history",
@@ -286,6 +376,8 @@ fn objective_requests_learning_line(objective: &str) -> bool {
         "semana inteira",
         "linha de aprendizado",
         "full learning line",
+        "why did it change",
+        "how did it change",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -357,6 +449,31 @@ fn summarize_learning_line(items: &[ContinuityItemRecord], now: DateTime<Utc>) -
     )
 }
 
+fn summarize_current_practice(items: &[ContinuityItemRecord], now: DateTime<Utc>) -> String {
+    if items.is_empty() {
+        return "No current practice is established yet.".to_string();
+    }
+    let focus = items
+        .iter()
+        .take(LEARNING_SUMMARY_LIMIT)
+        .map(|item| {
+            format!(
+                "{} [{}; {}; {}]",
+                item.title,
+                item.kind.as_str(),
+                practice_state_label(item.practice_state),
+                relative_time_label(item.updated_at, now)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Current practice favors {} active guidance signal(s): {}.",
+        items.len(),
+        focus
+    )
+}
+
 fn relative_time_label(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let delta = now.signed_duration_since(ts);
     if delta.num_days() >= 1 {
@@ -367,6 +484,138 @@ fn relative_time_label(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
         format!("{}m ago", delta.num_minutes())
     } else {
         "just now".to_string()
+    }
+}
+
+fn is_current_practice_candidate(item: &ContinuityItemRecord) -> bool {
+    if !is_guidance_like(item.kind) {
+        return false;
+    }
+    matches!(
+        item.practice_state,
+        Some(PracticeLifecycleState::Current | PracticeLifecycleState::Aging)
+    )
+}
+
+fn derive_practice_state(
+    item: &ContinuityItemRecord,
+    now: DateTime<Utc>,
+) -> Option<PracticeLifecycleState> {
+    if !is_guidance_like(item.kind) {
+        return None;
+    }
+    if matches!(
+        item.status,
+        ContinuityStatus::Superseded | ContinuityStatus::Rejected
+    ) {
+        return Some(PracticeLifecycleState::Retired);
+    }
+
+    let anchor = continuity_practice_anchor(item).unwrap_or(item.updated_at);
+    let age_hours = (now - anchor).num_seconds().max(0) as f64 / 3600.0;
+    let fresh_window_hours = (item.retention.half_life_hours * 0.18).clamp(12.0, 24.0 * 14.0);
+    let stale_window_hours = (item.retention.half_life_hours * 0.55).clamp(48.0, 24.0 * 45.0);
+
+    if item.status == ContinuityStatus::Resolved {
+        if age_hours <= fresh_window_hours * 0.75 {
+            Some(PracticeLifecycleState::Aging)
+        } else {
+            Some(PracticeLifecycleState::Stale)
+        }
+    } else if age_hours <= fresh_window_hours {
+        Some(PracticeLifecycleState::Current)
+    } else if age_hours <= stale_window_hours {
+        Some(PracticeLifecycleState::Aging)
+    } else {
+        Some(PracticeLifecycleState::Stale)
+    }
+}
+
+fn continuity_practice_anchor(item: &ContinuityItemRecord) -> Option<DateTime<Utc>> {
+    let plasticity = item
+        .extra
+        .get("plasticity")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ContinuityPlasticityState>(value).ok());
+    let mut anchors = vec![item.updated_at];
+    if let Some(plasticity) = plasticity {
+        if let Some(value) = plasticity.last_strengthened_at {
+            anchors.push(value);
+        }
+        if let Some(value) = plasticity.last_confirmed_at {
+            anchors.push(value);
+        }
+        if let Some(value) = plasticity.last_reactivated_at {
+            anchors.push(value);
+        }
+    }
+    anchors.into_iter().max()
+}
+
+fn current_practice_rank(
+    item: &ContinuityItemRecord,
+    state: PracticeLifecycleState,
+    now: DateTime<Utc>,
+) -> f64 {
+    let recency_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+    let state_score = match state {
+        PracticeLifecycleState::Current => 0.32,
+        PracticeLifecycleState::Aging => 0.12,
+        PracticeLifecycleState::Stale => -0.18,
+        PracticeLifecycleState::Retired => -0.32,
+    };
+    state_score
+        + item.retention.effective_salience
+        + item.importance * 0.24
+        + item.confidence * 0.16
+        - (recency_hours / 72.0).min(0.22)
+}
+
+fn continuity_practice_cluster_key(item: &ContinuityItemRecord) -> Option<String> {
+    item_metadata_str(&item.extra, "practice_key")
+        .or_else(|| item_metadata_str(&item.extra, "belief_key"))
+}
+
+fn item_metadata_str(extra: &serde_json::Value, key: &str) -> Option<String> {
+    extra
+        .get(key)
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            extra
+                .get("user")
+                .and_then(|user| user.get(key))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn is_guidance_like(kind: ContinuityKind) -> bool {
+    matches!(
+        kind,
+        ContinuityKind::Decision
+            | ContinuityKind::Constraint
+            | ContinuityKind::Lesson
+            | ContinuityKind::Outcome
+    )
+}
+
+fn practice_state_sort_rank(state: Option<PracticeLifecycleState>) -> usize {
+    match state.unwrap_or(PracticeLifecycleState::Stale) {
+        PracticeLifecycleState::Current => 3,
+        PracticeLifecycleState::Aging => 2,
+        PracticeLifecycleState::Stale => 1,
+        PracticeLifecycleState::Retired => 0,
+    }
+}
+
+fn practice_state_label(state: Option<PracticeLifecycleState>) -> &'static str {
+    match state.unwrap_or(PracticeLifecycleState::Stale) {
+        PracticeLifecycleState::Current => "current",
+        PracticeLifecycleState::Aging => "aging",
+        PracticeLifecycleState::Stale => "stale",
+        PracticeLifecycleState::Retired => "retired",
     }
 }
 

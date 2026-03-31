@@ -1154,6 +1154,7 @@ mod tests {
                     supersedes_id: None,
                     resolved_at: None,
                     supports: Vec::new(),
+                    practice_state: None,
                     extra,
                 }
             };
@@ -1238,6 +1239,7 @@ mod tests {
             supersedes_id: None,
             resolved_at: None,
             supports: Vec::new(),
+            practice_state: None,
             extra: serde_json::json!({
                 "requires_validation": true,
                 "evidence": { "sparse_cells": false }

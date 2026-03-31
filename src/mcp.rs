@@ -936,7 +936,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "continuity_read_context",
-            "description": "Read the current context pack, active constraints, scars, decisions, learnings, and open threads. By default this surfaces the newest learnings; objectives that ask for history or lineage expand the full learning line. If no context is specified, the machine organism is used by default.",
+            "description": "Read the current context pack, current practice, active constraints, scars, decisions, learnings, and open threads. By default this favors active operating guidance and the newest learnings; objectives that ask for history or lineage expand the full learning line. If no context is specified, the machine organism is used by default.",
             "inputSchema": {
                 "type": "object",
                 "required": ["objective"],
@@ -1599,6 +1599,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(read["learning"]["mode"].as_str(), Some("lineage"));
+        assert!(read["current_practice"]["summary"].is_string());
         assert_eq!(read["lessons"].as_array().map(Vec::len), Some(1));
         assert_eq!(read["rationale"]["learning_mode"].as_str(), Some("lineage"));
     }

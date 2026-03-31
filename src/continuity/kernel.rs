@@ -69,7 +69,7 @@ impl UnifiedContinuityInterface for Engine {
                 &context,
                 resolve_selector_namespace(storage, input.selector.clone())?,
             );
-            let continuity = storage.list_continuity_items(&context.id, input.include_resolved)?;
+            let mut continuity = storage.list_continuity_items(&context.id, input.include_resolved)?;
             let recall = storage.recall_continuity(
                 &context.id,
                 &input.objective,
@@ -104,7 +104,9 @@ impl UnifiedContinuityInterface for Engine {
             let latest_snapshot_id = storage.latest_snapshot_id(&context.id)?;
             let pack_item_count = pack.items.len();
             let now = Utc::now();
+            annotate_practice_states(&mut continuity, now);
             let lessons = filter_kind(&continuity, ContinuityKind::Lesson);
+            let current_practice = build_current_practice_view(&continuity, now);
             let learning = build_learning_view(&input.objective, &continuity, now);
             let agent_badges =
                 storage.list_agent_badges(Some(context.namespace.as_str()), None)?;
@@ -163,6 +165,7 @@ impl UnifiedContinuityInterface for Engine {
                 operational_scars: filter_kind(&continuity, ContinuityKind::OperationalScar),
                 outcomes: filter_kind(&continuity, ContinuityKind::Outcome),
                 lessons,
+                current_practice: current_practice.clone(),
                 learning: learning.clone(),
                 signals: filter_kind(&continuity, ContinuityKind::Signal),
                 open_threads: continuity
@@ -178,6 +181,7 @@ impl UnifiedContinuityInterface for Engine {
                     "continuity_recall_timings_ms": recall.timings_ms,
                     "continuity_recall_compiler": recall.compiler,
                     "continuity_recall_top_why": recall.items.first().map(|item| item.why.clone()).unwrap_or_default(),
+                    "current_practice_count": current_practice.items.len(),
                     "learning_mode": learning.mode,
                     "learning_item_count": learning.items.len(),
                 }),

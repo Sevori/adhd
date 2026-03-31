@@ -279,6 +279,8 @@ pub struct ContinuityItemRecord {
     pub supersedes_id: Option<String>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub supports: Vec<SupportRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub practice_state: Option<PracticeLifecycleState>,
     pub extra: serde_json::Value,
 }
 
@@ -325,10 +327,26 @@ pub struct ContextRead {
     pub operational_scars: Vec<ContinuityItemRecord>,
     pub outcomes: Vec<ContinuityItemRecord>,
     pub lessons: Vec<ContinuityItemRecord>,
+    pub current_practice: PracticeView,
     pub learning: LearningView,
     pub signals: Vec<ContinuityItemRecord>,
     pub open_threads: Vec<ContinuityItemRecord>,
     pub rationale: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PracticeLifecycleState {
+    Current,
+    Aging,
+    Stale,
+    Retired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PracticeView {
+    pub summary: String,
+    pub items: Vec<ContinuityItemRecord>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

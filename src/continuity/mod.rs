@@ -16,10 +16,10 @@ pub use schema::{
     ContinuityPlasticityState, ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem,
     ContinuityRetentionState, CoordinationProjectedLane, CoordinationSignalInput, ExplainTarget,
     HandoffProof, HandoffProofRegister, HeartbeatInput, LaneProjectionRecord, LearningView,
-    LearningViewMode, MachineProfile, OpenContextInput, OutcomeInput, ReadContextInput,
-    RecallInput, ResolveOrSupersedeInput, ResumeInput, ResumeRecord, SignalInput, SnapshotInput,
-    SnapshotManifest, SnapshotRecord, SupportRef, TelemetryEventInput, UpsertAgentBadgeInput,
-    WriteEventInput,
+    LearningViewMode, MachineProfile, OpenContextInput, OutcomeInput, PracticeLifecycleState,
+    PracticeView, ReadContextInput, RecallInput, ResolveOrSupersedeInput, ResumeInput,
+    ResumeRecord, SignalInput, SnapshotInput, SnapshotManifest, SnapshotRecord, SupportRef,
+    TelemetryEventInput, UpsertAgentBadgeInput, WriteEventInput,
 };
 pub use types::{
     ContextStatus, ContinuityKind, ContinuityStatus, CoordinationLane, CoordinationSeverity,
@@ -29,8 +29,8 @@ pub use types::{
 // Re-export pub(crate) items used by other modules in this crate.
 pub(crate) use helpers::{
     coordination_signal, default_work_claim_lease_seconds, merge_work_claim_extra,
-    normalize_work_claim_resources, work_claim_coordination, work_claim_is_live, work_claim_key,
-    work_claims_conflict,
+    normalize_work_claim_resources, objective_requests_history_context, work_claim_coordination,
+    work_claim_is_live, work_claim_key, work_claims_conflict,
 };
 pub(crate) use schema::{CoordinationSignalRecord, WorkClaimConflict, WorkClaimCoordination};
 
@@ -766,6 +766,315 @@ mod tests {
         assert!(read.learning.summary.contains("Current operator habit"));
         assert_eq!(read.rationale["learning_mode"].as_str(), Some("lineage"));
         assert_eq!(read.rationale["learning_item_count"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn read_context_current_practice_prefers_latest_guidance_and_rejects_stale_pack_competitor() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "current-practice".into(),
+                session_id: "session-1".into(),
+                objective: "track the current review practice".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old review flow".into(),
+                body: "Review every PR with the old checklist before touching tests.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.8),
+                confidence: Some(0.82),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+        let current = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current review flow".into(),
+                body: "Start from the current practice first, then expand lineage on demand."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.9),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+        let guardrail = engine
+            .mark_constraint(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Constraint,
+                title: "Latest guardrail".into(),
+                body: "Default to current practice in normal recall mode.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.86),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.guardrail",
+                }),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        for (item_id, memory_id, ts) in [
+            (
+                stale.id.as_str(),
+                stale.memory_id.as_str(),
+                Utc::now() - Duration::days(35),
+            ),
+            (
+                current.id.as_str(),
+                current.memory_id.as_str(),
+                Utc::now() - Duration::hours(4),
+            ),
+            (
+                guardrail.id.as_str(),
+                guardrail.memory_id.as_str(),
+                Utc::now() - Duration::hours(2),
+            ),
+        ] {
+            conn.execute(
+                "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+                params![item_id, ts.to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+                params![memory_id, ts.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "Resume the current review practice.".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        let stale_decision = read
+            .decisions
+            .iter()
+            .find(|item| item.id == stale.id)
+            .unwrap();
+        let current_decision = read
+            .decisions
+            .iter()
+            .find(|item| item.id == current.id)
+            .unwrap();
+        assert_eq!(
+            stale_decision.practice_state,
+            Some(PracticeLifecycleState::Stale)
+        );
+        assert_eq!(
+            current_decision.practice_state,
+            Some(PracticeLifecycleState::Current)
+        );
+        assert!(
+            read.current_practice
+                .items
+                .iter()
+                .any(|item| item.id == current.id)
+        );
+        assert!(
+            read.current_practice
+                .items
+                .iter()
+                .any(|item| item.id == guardrail.id)
+        );
+        assert!(
+            !read
+                .current_practice
+                .items
+                .iter()
+                .any(|item| item.id == stale.id)
+        );
+        assert!(
+            read.current_practice
+                .summary
+                .contains("Current review flow")
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == current.memory_id)
+        );
+        assert!(
+            !read
+                .pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == stale.memory_id)
+        );
+
+        let manifest = engine.explain_context_pack(&read.pack.id).unwrap();
+        assert!(manifest.rejected.iter().any(|candidate| {
+            candidate.memory_id == stale.memory_id && candidate.reason == "practice_key_competitor"
+        }));
+    }
+
+    #[test]
+    fn read_context_history_mode_keeps_practice_lineage_available() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "practice-history".into(),
+                session_id: "session-1".into(),
+                objective: "track review-practice evolution".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old review flow".into(),
+                body: "Older operator habit that should remain available for lineage.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.8),
+                confidence: Some(0.82),
+                salience: Some(0.8),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+        let current = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current review flow".into(),
+                body: "Newer operator habit that should win in normal recall mode.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.9),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        for (item_id, memory_id, ts) in [
+            (
+                stale.id.as_str(),
+                stale.memory_id.as_str(),
+                Utc::now() - Duration::days(28),
+            ),
+            (
+                current.id.as_str(),
+                current.memory_id.as_str(),
+                Utc::now() - Duration::hours(3),
+            ),
+        ] {
+            conn.execute(
+                "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+                params![item_id, ts.to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+                params![memory_id, ts.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "Show the review practice timeline and why it changed over time.".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.learning.mode, LearningViewMode::Lineage);
+        assert!(read.learning.items.iter().any(|item| item.id == stale.id));
+        assert!(read.learning.items.iter().any(|item| item.id == current.id));
+        assert!(
+            read.current_practice
+                .items
+                .iter()
+                .all(|item| item.id != stale.id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == stale.memory_id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == current.memory_id)
+        );
     }
 
     #[test]
@@ -2536,6 +2845,7 @@ mod tests {
             supersedes_id: None,
             resolved_at: None,
             supports: Vec::new(),
+            practice_state: None,
             extra,
         }
     }
