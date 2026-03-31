@@ -515,6 +515,7 @@ fn derive_practice_state(
     let age_hours = (now - anchor).num_seconds().max(0) as f64 / 3600.0;
     let fresh_window_hours = (item.retention.half_life_hours * 0.18).clamp(12.0, 24.0 * 14.0);
     let stale_window_hours = (item.retention.half_life_hours * 0.55).clamp(48.0, 24.0 * 45.0);
+    let retirement_window_hours = guidance_retirement_window_hours(stale_window_hours);
 
     if item.status == ContinuityStatus::Resolved {
         if age_hours <= fresh_window_hours * 0.75 {
@@ -522,6 +523,8 @@ fn derive_practice_state(
         } else {
             Some(PracticeLifecycleState::Stale)
         }
+    } else if item.status.is_open() && age_hours > retirement_window_hours {
+        Some(PracticeLifecycleState::Retired)
     } else if age_hours <= fresh_window_hours {
         Some(PracticeLifecycleState::Current)
     } else if age_hours <= stale_window_hours {
@@ -532,11 +535,7 @@ fn derive_practice_state(
 }
 
 fn continuity_practice_anchor(item: &ContinuityItemRecord) -> Option<DateTime<Utc>> {
-    let plasticity = item
-        .extra
-        .get("plasticity")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ContinuityPlasticityState>(value).ok());
+    let plasticity = continuity_plasticity_state(&item.extra);
     let mut anchors = vec![item.updated_at];
     if let Some(plasticity) = plasticity {
         if let Some(value) = plasticity.last_strengthened_at {
@@ -550,6 +549,13 @@ fn continuity_practice_anchor(item: &ContinuityItemRecord) -> Option<DateTime<Ut
         }
     }
     anchors.into_iter().max()
+}
+
+fn continuity_plasticity_state(extra: &serde_json::Value) -> Option<ContinuityPlasticityState> {
+    extra
+        .get("plasticity")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ContinuityPlasticityState>(value).ok())
 }
 
 fn current_practice_rank(
@@ -599,6 +605,10 @@ fn is_guidance_like(kind: ContinuityKind) -> bool {
             | ContinuityKind::Lesson
             | ContinuityKind::Outcome
     )
+}
+
+fn guidance_retirement_window_hours(stale_window_hours: f64) -> f64 {
+    (stale_window_hours * 2.2).clamp(24.0 * 5.0, 24.0 * 120.0)
 }
 
 fn practice_state_sort_rank(state: Option<PracticeLifecycleState>) -> usize {
@@ -715,6 +725,14 @@ pub(crate) fn counts_as_open_thread(item: &ContinuityItemRecord, now: DateTime<U
     }
     if item.kind == ContinuityKind::WorkClaim {
         return work_claim_is_live(item, now);
+    }
+    if is_guidance_like(item.kind)
+        && matches!(
+            derive_practice_state(item, now),
+            Some(PracticeLifecycleState::Stale | PracticeLifecycleState::Retired)
+        )
+    {
+        return false;
     }
     true
 }
@@ -848,6 +866,11 @@ pub(crate) fn organism_state(
             }
         }
         if counts_as_open_thread(item, now) {
+            let practice_state = if is_guidance_like(item.kind) {
+                derive_practice_state(item, now).map(|state| practice_state_label(Some(state)))
+            } else {
+                None
+            };
             open_pressure.push(serde_json::json!({
                 "id": item.id,
                 "kind": item.kind.as_str(),
@@ -855,6 +878,7 @@ pub(crate) fn organism_state(
                 "title": item.title,
                 "retention_class": item.retention.class,
                 "effective_salience": item.retention.effective_salience,
+                "practice_state": practice_state,
             }));
         }
         if let Some(signal) = coordination_signal(item) {

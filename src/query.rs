@@ -513,6 +513,7 @@ fn continuity_practice_lifecycle_score(
     };
     let fresh_window_hours = base_half_life.clamp(12.0, 24.0 * 14.0) * 0.18;
     let stale_window_hours = base_half_life.clamp(24.0, 24.0 * 45.0) * 0.55;
+    let retirement_window_hours = (stale_window_hours * 2.2).clamp(24.0 * 5.0, 24.0 * 120.0);
     let state = match status {
         Some("superseded" | "rejected") => Some("practice_retired"),
         Some("resolved") => {
@@ -523,7 +524,9 @@ fn continuity_practice_lifecycle_score(
             }
         }
         _ => {
-            if age_hours <= fresh_window_hours {
+            if matches!(status, Some("open" | "active")) && age_hours > retirement_window_hours {
+                Some("practice_retired")
+            } else if age_hours <= fresh_window_hours {
                 Some("practice_current")
             } else if age_hours <= stale_window_hours {
                 Some("practice_aging")
@@ -532,15 +535,17 @@ fn continuity_practice_lifecycle_score(
             }
         }
     };
-    let score = match (state, history_requested) {
-        (Some("practice_current"), false) => 0.16,
-        (Some("practice_aging"), false) => 0.03,
-        (Some("practice_stale"), false) => -0.2,
-        (Some("practice_retired"), false) => -0.34,
-        (Some("practice_current"), true) => 0.05,
-        (Some("practice_aging"), true) => 0.0,
-        (Some("practice_stale"), true) => -0.02,
-        (Some("practice_retired"), true) => -0.06,
+    let score = match (state, status, history_requested) {
+        (Some("practice_current"), _, false) => 0.16,
+        (Some("practice_aging"), _, false) => 0.03,
+        (Some("practice_stale"), Some("open" | "active"), false) => -0.38,
+        (Some("practice_stale"), _, false) => -0.2,
+        (Some("practice_retired"), Some("open" | "active"), false) => -0.48,
+        (Some("practice_retired"), _, false) => -0.34,
+        (Some("practice_current"), _, true) => 0.05,
+        (Some("practice_aging"), _, true) => 0.0,
+        (Some("practice_stale"), _, true) => -0.02,
+        (Some("practice_retired"), _, true) => -0.06,
         _ => 0.0,
     };
     (score, state)
