@@ -347,6 +347,16 @@ pub enum PracticeLifecycleState {
 pub struct PracticeView {
     pub summary: String,
     pub items: Vec<ContinuityItemRecord>,
+    #[serde(default)]
+    pub evidence: Vec<PracticeEvidenceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PracticeEvidenceRecord {
+    pub practice_id: String,
+    pub support_signal: f64,
+    pub evidence_count: usize,
+    pub evidence: Vec<ContinuityItemRecord>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
