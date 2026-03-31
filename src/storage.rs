@@ -11337,6 +11337,136 @@ mod tests {
     }
 
     #[test]
+    fn build_context_pack_promotes_current_practice_evidence_chain() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-current-practice-pack".into(),
+                session_id: "session-current-practice-pack".into(),
+                objective: "track the current review practice".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let grounded = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Grounded review flow".into(),
+                body: "Start from the current practice and keep its evidence chain attached."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.9),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+        let lesson = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Grounded flow kept continuity intact".into(),
+                body: "The grounded flow preserved the learning chain in the last review pass."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.84),
+                confidence: Some(0.88),
+                salience: Some(0.82),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: grounded.id.clone(),
+                    reason: Some("belief_update_current".into()),
+                    weight: 1.1,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let outcome = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Outcome,
+                title: "Grounded flow reduced drift".into(),
+                body: "The review outcome confirmed that the grounded flow reduced drift.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.86),
+                confidence: Some(0.9),
+                salience: Some(0.84),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: grounded.id.clone(),
+                    reason: Some("outcome_confirmed".into()),
+                    weight: 1.2,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let pack = crate::query::build_context_pack(
+            &storage,
+            QueryInput {
+                agent_id: Some("observer".into()),
+                session_id: Some(context.session_id.clone()),
+                task_id: Some(context.task_id.clone()),
+                namespace: Some(context.namespace.clone()),
+                objective: Some("Resume the current review practice.".into()),
+                selector: None,
+                view_id: None,
+                query_text: "current review practice".into(),
+                budget_tokens: 256,
+                candidate_limit: 16,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == grounded.memory_id)
+        );
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == lesson.memory_id)
+        );
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == outcome.memory_id)
+        );
+        assert!(
+            pack.items
+                .iter()
+                .filter(|item| item.memory_id == lesson.memory_id
+                    || item.memory_id == outcome.memory_id)
+                .all(|item| item
+                    .why
+                    .iter()
+                    .any(|why| why == "current_practice_evidence"))
+        );
+    }
+
+    #[test]
     fn recall_continuity_demotes_stale_open_guidance_without_reinforcement() {
         let dir = tempdir().unwrap();
         let config = EngineConfig::with_root(dir.path());

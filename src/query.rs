@@ -5,6 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::continuity::{annotate_practice_states, build_current_practice_view};
 use crate::embedding::cosine_similarity;
 use crate::model::{
     CandidateRecord, ContextPack, ContextPackItem, ContextPackManifest, MemoryRecord, QueryInput,
@@ -15,7 +16,7 @@ use crate::storage::Storage;
 pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<ContextPack> {
     let total_start = Instant::now();
     let continuity_start = Instant::now();
-    let continuity = if let (Some(namespace), Some(task_id)) =
+    let (continuity, practice_evidence) = if let (Some(namespace), Some(task_id)) =
         (query.namespace.as_deref(), query.task_id.as_deref())
     {
         let objective = query.objective.as_deref().unwrap_or(&query.query_text);
@@ -32,12 +33,24 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                     .iter()
                     .map(|item| item.memory_id.clone())
                     .collect::<Vec<_>>();
-                storage.memories_by_ids(&memory_ids)?
+                let recalled_continuity_ids = recall
+                    .items
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<HashSet<_>>();
+                (
+                    storage.memories_by_ids(&memory_ids)?,
+                    current_practice_evidence_seeds(
+                        storage,
+                        &context.id,
+                        &recalled_continuity_ids,
+                    )?,
+                )
             }
-            Err(_) => Vec::new(),
+            Err(_) => (Vec::new(), Vec::new()),
         }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let continuity_ms = continuity_start.elapsed().as_millis();
 
@@ -89,6 +102,7 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
     merge_ranked(&mut merged, continuity, "continuity", |breakdown, score| {
         breakdown.continuity = score
     });
+    merge_current_practice_evidence(&mut merged, practice_evidence);
     merge_ranked(&mut merged, selector, "selector", |breakdown, score| {
         breakdown.selector = score
     });
@@ -149,6 +163,7 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
             let (practice_score, practice_why) =
                 continuity_practice_lifecycle_score(&candidate.memory, now, history_requested);
             candidate.final_score = candidate.breakdown.continuity * 1.2
+                + candidate.breakdown.practice_evidence * 0.95
                 + candidate.breakdown.continuity_kind
                 + candidate.breakdown.continuity_status
                 + candidate.breakdown.lexical * 0.95
@@ -165,6 +180,9 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
                 + practice_score;
             if let Some(kind) = continuity_kind_label(&candidate.memory) {
                 candidate.why.push(format!("continuity_kind:{kind}"));
+            }
+            if candidate.breakdown.practice_evidence > 0.0 {
+                candidate.why.push("current_practice_evidence".to_string());
             }
             if let Some(status) = continuity_status_label(&candidate.memory) {
                 candidate.why.push(format!("continuity_status:{status}"));
@@ -362,6 +380,14 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
     Ok(pack)
 }
 
+#[derive(Debug, Clone)]
+struct PracticeEvidenceSeed {
+    memory: MemoryRecord,
+    practice_id: String,
+    support_signal: f64,
+    support_rank: usize,
+}
+
 fn merge_ranked(
     merged: &mut HashMap<String, CandidateRecord>,
     records: Vec<MemoryRecord>,
@@ -383,6 +409,96 @@ fn merge_ranked(
         apply(&mut entry.breakdown, score);
         entry.why.push(format!("{why_prefix}#{rank}"));
     }
+}
+
+fn merge_current_practice_evidence(
+    merged: &mut HashMap<String, CandidateRecord>,
+    seeds: Vec<PracticeEvidenceSeed>,
+) {
+    if seeds.is_empty() {
+        return;
+    }
+    let len = seeds.len().max(1) as f64;
+    for (rank, seed) in seeds.into_iter().enumerate() {
+        let rank_score = 1.0 - (rank as f64 / len);
+        let score = (seed.support_signal.clamp(0.0, 1.0) * 0.6 + rank_score * 0.4).clamp(0.0, 1.0);
+        let entry = merged
+            .entry(seed.memory.id.clone())
+            .or_insert_with(|| CandidateRecord {
+                memory: seed.memory,
+                final_score: 0.0,
+                breakdown: ScoreBreakdown::default(),
+                why: Vec::new(),
+                provenance: serde_json::Value::Null,
+            });
+        entry.breakdown.practice_evidence = entry.breakdown.practice_evidence.max(score);
+        entry.why.push("current_practice_evidence".to_string());
+        entry.why.push(format!(
+            "current_practice_evidence:{}#{}",
+            seed.practice_id, seed.support_rank
+        ));
+    }
+}
+
+fn current_practice_evidence_seeds(
+    storage: &Storage,
+    context_id: &str,
+    recalled_continuity_ids: &HashSet<String>,
+) -> Result<Vec<PracticeEvidenceSeed>> {
+    if recalled_continuity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let now = Utc::now();
+    let mut continuity = storage.list_continuity_items(context_id, true)?;
+    annotate_practice_states(&mut continuity, now);
+    let current_practice = build_current_practice_view(&continuity, now);
+
+    let mut ordered = Vec::<(String, String, f64, usize)>::new();
+    let mut seen_memory_ids = HashSet::<String>::new();
+    for bundle in current_practice.evidence {
+        if !recalled_continuity_ids.contains(&bundle.practice_id) {
+            continue;
+        }
+        for (support_rank, evidence_item) in bundle.evidence.into_iter().enumerate() {
+            if seen_memory_ids.insert(evidence_item.memory_id.clone()) {
+                ordered.push((
+                    evidence_item.memory_id,
+                    bundle.practice_id.clone(),
+                    bundle.support_signal,
+                    support_rank,
+                ));
+            }
+        }
+    }
+    if ordered.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let memory_ids = ordered
+        .iter()
+        .map(|(memory_id, _, _, _)| memory_id.clone())
+        .collect::<Vec<_>>();
+    let memories = storage.memories_by_ids(&memory_ids)?;
+    let memory_by_id = memories
+        .into_iter()
+        .map(|memory| (memory.id.clone(), memory))
+        .collect::<HashMap<_, _>>();
+
+    Ok(ordered
+        .into_iter()
+        .filter_map(|(memory_id, practice_id, support_signal, support_rank)| {
+            memory_by_id
+                .get(&memory_id)
+                .cloned()
+                .map(|memory| PracticeEvidenceSeed {
+                    memory,
+                    practice_id,
+                    support_signal,
+                    support_rank,
+                })
+        })
+        .collect())
 }
 
 fn recency_score(now: chrono::DateTime<Utc>, ts: chrono::DateTime<Utc>) -> f64 {

@@ -372,6 +372,7 @@ pub struct QueryInput {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScoreBreakdown {
     pub continuity: f64,
+    pub practice_evidence: f64,
     pub continuity_kind: f64,
     pub continuity_status: f64,
     pub selector: f64,

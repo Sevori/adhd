@@ -28,9 +28,10 @@ pub use types::{
 
 // Re-export pub(crate) items used by other modules in this crate.
 pub(crate) use helpers::{
-    coordination_signal, default_work_claim_lease_seconds, merge_work_claim_extra,
-    normalize_work_claim_resources, objective_requests_history_context, work_claim_coordination,
-    work_claim_is_live, work_claim_key, work_claims_conflict,
+    annotate_practice_states, build_current_practice_view, coordination_signal,
+    default_work_claim_lease_seconds, merge_work_claim_extra, normalize_work_claim_resources,
+    objective_requests_history_context, work_claim_coordination, work_claim_is_live,
+    work_claim_key, work_claims_conflict,
 };
 pub(crate) use schema::{CoordinationSignalRecord, WorkClaimConflict, WorkClaimCoordination};
 
@@ -1164,6 +1165,35 @@ mod tests {
             read.current_practice
                 .summary
                 .contains("Review outcome confirmed the grounded flow")
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == grounded.memory_id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == lesson.memory_id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == outcome.memory_id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .filter(|item| item.memory_id == lesson.memory_id
+                    || item.memory_id == outcome.memory_id)
+                .all(|item| item
+                    .why
+                    .iter()
+                    .any(|why| why == "current_practice_evidence"))
         );
     }
 
