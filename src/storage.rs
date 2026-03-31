@@ -13092,7 +13092,11 @@ mod tests {
             .iter()
             .position(|item| item.id == stale.id)
             .unwrap();
-        let claim_item = recall.items.iter().find(|item| item.id == claim.id).unwrap();
+        let claim_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == claim.id)
+            .unwrap();
         assert!(claim_index < stale_index);
         assert!(claim_item.why.iter().any(|why| why == "next_step"));
         assert!(recall.compiler.next_step_seed_count >= 1);

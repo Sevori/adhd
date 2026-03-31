@@ -428,7 +428,8 @@ pub(crate) fn build_next_step_view(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
             .then_with(|| {
-                right.1
+                right
+                    .1
                     .retention
                     .effective_salience
                     .partial_cmp(&left.1.retention.effective_salience)
@@ -1185,16 +1186,12 @@ fn is_operational_next_step(item: &ContinuityItemRecord) -> bool {
         && (item.title == "model-next-step" || item.extra["next_step"].as_bool() == Some(true))
 }
 
-fn next_step_candidate_score(
-    item: &ContinuityItemRecord,
-    now: DateTime<Utc>,
-) -> Option<f64> {
+fn next_step_candidate_score(item: &ContinuityItemRecord, now: DateTime<Utc>) -> Option<f64> {
     if is_operational_next_step(item) {
         let age_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
         let age_penalty = (age_hours / 72.0).min(0.18);
         return Some(
-            0.92
-                + item.retention.effective_salience * 0.65
+            0.92 + item.retention.effective_salience * 0.65
                 + item.importance * 0.22
                 + item.confidence * 0.14
                 - age_penalty,
@@ -1213,8 +1210,7 @@ fn next_step_candidate_score(
         let age_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
         let age_penalty = (age_hours / 96.0).min(0.2);
         return Some(
-            0.74
-                + exclusivity_score
+            0.74 + exclusivity_score
                 + resource_score
                 + item.retention.effective_salience * 0.55
                 + item.importance * 0.18
