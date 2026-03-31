@@ -905,7 +905,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stale_decision.practice_state,
-            Some(PracticeLifecycleState::Stale)
+            Some(PracticeLifecycleState::Retired)
         );
         assert_eq!(
             current_decision.practice_state,
@@ -1075,6 +1075,115 @@ mod tests {
                 .iter()
                 .any(|item| item.memory_id == current.memory_id)
         );
+    }
+
+    #[test]
+    fn read_context_open_pressure_ignores_stale_open_guidance() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "open-pressure".into(),
+                session_id: "session-1".into(),
+                objective: "track live review guidance".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old review ritual".into(),
+                body: "Ask Claude to refresh the old MCP session before every move.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.82),
+                confidence: Some(0.84),
+                salience: Some(0.82),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = engine
+            .mark_constraint(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Constraint,
+                title: "Current review guidance".into(),
+                body: "Default to current practice in normal recall mode.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.87),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - Duration::days(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - Duration::days(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "What guidance is currently live?".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        let open_pressure = read.organism["open_pressure"].as_array().unwrap();
+        assert!(open_pressure.iter().any(|item| item["id"] == current.id));
+        assert!(!open_pressure.iter().any(|item| item["id"] == stale.id));
     }
 
     #[test]
@@ -2991,6 +3100,26 @@ mod tests {
             }),
         );
         assert!(!counts_as_open_thread(&expired_claim, now));
+
+        let mut stale_open_decision = make_test_item(
+            "5",
+            ContinuityKind::Decision,
+            ContinuityStatus::Open,
+            serde_json::json!({}),
+        );
+        stale_open_decision.updated_at = now - Duration::days(12);
+        stale_open_decision.retention.half_life_hours = 72.0;
+        assert!(!counts_as_open_thread(&stale_open_decision, now));
+
+        let mut fresh_open_decision = make_test_item(
+            "6",
+            ContinuityKind::Decision,
+            ContinuityStatus::Open,
+            serde_json::json!({}),
+        );
+        fresh_open_decision.updated_at = now - Duration::hours(3);
+        fresh_open_decision.retention.half_life_hours = 72.0;
+        assert!(counts_as_open_thread(&fresh_open_decision, now));
     }
 
     #[test]

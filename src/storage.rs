@@ -8045,12 +8045,15 @@ fn derive_recall_practice_state(
     };
     let fresh_window_hours = base_half_life.clamp(12.0, 24.0 * 14.0) * 0.18;
     let stale_window_hours = base_half_life.clamp(24.0, 24.0 * 45.0) * 0.55;
+    let retirement_window_hours = (stale_window_hours * 2.2).clamp(24.0 * 5.0, 24.0 * 120.0);
     if item.status == ContinuityStatus::Resolved {
         if age_hours <= fresh_window_hours * 0.75 {
             Some(PracticeLifecycleState::Aging)
         } else {
             Some(PracticeLifecycleState::Stale)
         }
+    } else if item.status.is_open() && age_hours > retirement_window_hours {
+        Some(PracticeLifecycleState::Retired)
     } else if age_hours <= fresh_window_hours {
         Some(PracticeLifecycleState::Current)
     } else if age_hours <= stale_window_hours {
@@ -8062,18 +8065,21 @@ fn derive_recall_practice_state(
 
 fn practice_state_adjustment(
     state: Option<PracticeLifecycleState>,
+    status: ContinuityStatus,
     history_requested: bool,
 ) -> f64 {
-    match (state, history_requested) {
-        (Some(PracticeLifecycleState::Current), false) => 0.16,
-        (Some(PracticeLifecycleState::Aging), false) => 0.03,
-        (Some(PracticeLifecycleState::Stale), false) => -0.2,
-        (Some(PracticeLifecycleState::Retired), false) => -0.34,
-        (Some(PracticeLifecycleState::Current), true) => 0.05,
-        (Some(PracticeLifecycleState::Aging), true) => 0.0,
-        (Some(PracticeLifecycleState::Stale), true) => -0.02,
-        (Some(PracticeLifecycleState::Retired), true) => -0.06,
-        (None, _) => 0.0,
+    match (state, status, history_requested) {
+        (Some(PracticeLifecycleState::Current), _, false) => 0.16,
+        (Some(PracticeLifecycleState::Aging), _, false) => 0.03,
+        (Some(PracticeLifecycleState::Stale), state, false) if state.is_open() => -0.38,
+        (Some(PracticeLifecycleState::Stale), _, false) => -0.2,
+        (Some(PracticeLifecycleState::Retired), state, false) if state.is_open() => -0.48,
+        (Some(PracticeLifecycleState::Retired), _, false) => -0.34,
+        (Some(PracticeLifecycleState::Current), _, true) => 0.05,
+        (Some(PracticeLifecycleState::Aging), _, true) => 0.0,
+        (Some(PracticeLifecycleState::Stale), _, true) => -0.02,
+        (Some(PracticeLifecycleState::Retired), _, true) => -0.06,
+        (None, _, _) => 0.0,
     }
 }
 
@@ -8107,9 +8113,17 @@ fn apply_practice_lifecycle_competition(
     for item in items.iter_mut() {
         let state = derive_recall_practice_state(&item.item, item.plasticity.as_ref(), now);
         item.practice_state = state;
-        item.item.score += practice_state_adjustment(state, history_requested);
+        item.item.score += practice_state_adjustment(state, item.item.status, history_requested);
         if let Some(why) = practice_state_why(state) {
             item.item.why.push(why.to_string());
+        }
+        if item.item.status.is_open()
+            && matches!(
+                state,
+                Some(PracticeLifecycleState::Stale | PracticeLifecycleState::Retired)
+            )
+        {
+            item.item.why.push("stale_open_guidance".to_string());
         }
     }
 
@@ -11298,6 +11312,117 @@ mod tests {
             candidate.memory_id == assistant_item.memory_id
                 && candidate.reason == "belief_key_competitor"
         }));
+    }
+
+    #[test]
+    fn recall_continuity_demotes_stale_open_guidance_without_reinforcement() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-stale-open-guidance".into(),
+                session_id: "session-stale-open-guidance".into(),
+                objective: "track live review guidance".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old review guidance".into(),
+                body: "The old review guidance said to refresh the old MCP session first.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.84),
+                confidence: Some(0.84),
+                salience: Some(0.84),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current review guidance".into(),
+                body: "The current review guidance says to start from current practice.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.9),
+                confidence: Some(0.9),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        let stale_ts = (Utc::now() - chrono::Duration::days(12)).to_rfc3339();
+        let current_ts = (Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![stale.id.as_str(), stale_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![current.id.as_str(), current_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::hours(3)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(&context.id, "what is the current review guidance", false, 8)
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(current.id.as_str())
+        );
+
+        let stale_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == stale.id)
+            .unwrap();
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "stale_open_guidance")
+        );
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "practice_retired" || why == "practice_stale")
+        );
     }
 
     #[test]

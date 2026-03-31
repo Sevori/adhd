@@ -148,6 +148,7 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - ICE MUST index `practice_key` as a dimension when present.
 - ICE MUST derive a lifecycle state for guidance-like continuity: `current`, `aging`, `stale`, or `retired`.
 - `superseded` and `rejected` guidance MUST be treated as `retired` in the derived lifecycle, even if the raw item still exists for lineage.
+- Guidance-like continuity that remains `open` or `active` but ages past a retirement horizon without recent reinforcement SHOULD stop counting as live operating pressure in normal recall and organism summaries. It remains available for provenance and explicit history reconstruction.
 - By default, recall and context-pack compilation SHOULD boost `current` guidance and penalize `stale` or `retired` guidance.
 - When the objective explicitly asks for history, timeline, lineage, evolution, or why a practice changed, ICE SHOULD relax stale-guidance suppression so the full operating line can be reconstructed.
 - `continuity_read_context` MUST expose a first-class `current_practice` view summarizing the active operating guidance for the task.
