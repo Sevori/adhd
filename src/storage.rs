@@ -3526,6 +3526,8 @@ impl Storage {
             crate::continuity::objective_requests_current_state_context(objective);
         let operational_state_requested =
             crate::continuity::objective_requests_operational_state_context(objective);
+        let active_thread_requested =
+            crate::continuity::objective_requests_active_thread_context(objective);
         let next_step_requested =
             crate::continuity::objective_requests_next_step_context(objective);
         let recent_update_requested =
@@ -3572,7 +3574,12 @@ impl Storage {
         let mut live_state_len = 0usize;
         let mut operational_state_len = 0usize;
         let mut recent_update_len = 0usize;
-        if current_state_requested || operational_state_requested || recent_update_requested {
+        let mut active_thread_len = 0usize;
+        if current_state_requested
+            || operational_state_requested
+            || recent_update_requested
+            || active_thread_requested
+        {
             let mut continuity = self.list_continuity_items(context_id, true)?;
             crate::continuity::annotate_practice_states(&mut continuity, now);
             let mut missing_ids = Vec::new();
@@ -3623,6 +3630,19 @@ impl Storage {
                     let seed = seeds.entry(item.id.clone()).or_default();
                     seed.recent_update_rank.get_or_insert(recent_update_len);
                     recent_update_len += 1;
+                    if seed.raw.is_none() {
+                        Some(item.id.clone())
+                    } else {
+                        None
+                    }
+                }));
+            }
+            if active_thread_requested {
+                let active_thread = crate::continuity::build_active_thread_view(&continuity, now);
+                missing_ids.extend(active_thread.iter().filter_map(|item| {
+                    let seed = seeds.entry(item.id.clone()).or_default();
+                    seed.active_thread_rank.get_or_insert(active_thread_len);
+                    active_thread_len += 1;
                     if seed.raw.is_none() {
                         Some(item.id.clone())
                     } else {
@@ -3744,6 +3764,10 @@ impl Storage {
             .values()
             .filter(|seed| seed.recent_update_rank.is_some())
             .count();
+        let active_thread_seed_count = seeds
+            .values()
+            .filter(|seed| seed.active_thread_rank.is_some())
+            .count();
         let mut recall_items = seeds
             .into_values()
             .filter_map(|mut seed| seed.raw.take().map(|raw| (raw, seed)))
@@ -3767,6 +3791,7 @@ impl Storage {
                 let operational_state_score =
                     rank_score(seed.operational_state_rank, operational_state_len);
                 let recent_update_score = rank_score(seed.recent_update_rank, recent_update_len);
+                let active_thread_score = rank_score(seed.active_thread_rank, active_thread_len);
                 let next_step_score = if seed.next_step_rank.is_some() {
                     1.0
                 } else {
@@ -3784,6 +3809,7 @@ impl Storage {
                     + live_state_score * 1.35
                     + operational_state_score * 0.95
                     + recent_update_score * 1.05
+                    + active_thread_score * 1.0
                     + next_step_score * 1.1
                     + item.retention.effective_salience * 0.9
                     + continuity_kind_boost(item.kind)
@@ -3821,6 +3847,9 @@ impl Storage {
                 }
                 if seed.recent_update_rank.is_some() {
                     why.push("recent_update".to_string());
+                }
+                if seed.active_thread_rank.is_some() {
+                    why.push("active_thread".to_string());
                 }
                 if seed.next_step_rank.is_some() {
                     why.push("next_step".to_string());
@@ -3910,6 +3939,7 @@ impl Storage {
                 priority_seed_count,
                 operational_seed_count,
                 recent_update_seed_count,
+                active_thread_seed_count,
                 dominant_band,
                 band_hit_counts,
             },
@@ -7851,6 +7881,7 @@ struct RecallSeed {
     live_state_rank: Option<usize>,
     operational_state_rank: Option<usize>,
     recent_update_rank: Option<usize>,
+    active_thread_rank: Option<usize>,
     next_step_rank: Option<usize>,
     compiled_rank: Option<usize>,
     compiled_band: Option<String>,
@@ -12134,6 +12165,161 @@ mod tests {
                 .iter()
                 .any(|why| why == "practice_stale" || why == "practice_retired")
         );
+    }
+
+    #[test]
+    fn recall_continuity_prefers_active_thread_seed_over_stale_lexical_anchor() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-active-thread-priority".into(),
+                session_id: "session-active-thread-priority".into(),
+                objective: "track active thread guidance".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old lexical verification anchor".into(),
+                body: "Verify this by following the old lexical verification anchor.".into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.96),
+                confidence: Some(0.96),
+                salience: Some(0.96),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current live thread decision".into(),
+                body: "The active thread should use the most recent validated decision for vague resumptions."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.92),
+                confidence: Some(0.93),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "main-thread"
+                }),
+            })
+            .unwrap();
+        let lesson = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Active thread lesson".into(),
+                body: "Vague resumptions should stay close to the newest validated local thread."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.86),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    reason: Some("supports_live_thread".into()),
+                    weight: 1.0,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "main-thread"
+                }),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - chrono::Duration::days(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                lesson.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(15)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                lesson.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(15)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(
+                &context.id,
+                "Verify this and figure out the next cut on main.",
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(current.id.as_str())
+        );
+        assert!(recall.compiler.active_thread_seed_count >= 2);
+
+        let current_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == current.id)
+            .unwrap();
+        assert!(current_item.why.iter().any(|why| why == "active_thread"));
     }
 
     #[test]
