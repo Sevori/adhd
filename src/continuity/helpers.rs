@@ -190,6 +190,7 @@ const CURRENT_PRACTICE_LIMIT: usize = 5;
 const CURRENT_PRACTICE_EVIDENCE_LIMIT: usize = 3;
 const CURRENT_PRACTICE_EVIDENCE_SUMMARY_LIMIT: usize = 2;
 const OPERATIONAL_STATE_LIMIT: usize = 8;
+const RECENT_UPDATE_LIMIT: usize = 6;
 
 pub(crate) fn build_learning_view(
     objective: &str,
@@ -434,6 +435,43 @@ pub(crate) fn build_next_step_view(items: &[ContinuityItemRecord]) -> Vec<Contin
     next_steps
 }
 
+pub(crate) fn build_recent_update_view(
+    items: &[ContinuityItemRecord],
+    now: DateTime<Utc>,
+) -> Vec<ContinuityItemRecord> {
+    let recent_cutoff = now - Duration::days(RECENT_LEARNING_WINDOW_DAYS);
+    let mut ranked = items
+        .iter()
+        .filter_map(|item| {
+            recent_update_candidate_score(item, recent_cutoff, now).map(|score| (score, item))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            .then_with(|| right.1.title.cmp(&left.1.title))
+    });
+
+    let mut selected = Vec::new();
+    let mut seen_clusters = BTreeSet::<String>::new();
+    for (_, item) in ranked {
+        if let Some(cluster_key) = continuity_practice_cluster_key(item)
+            && !seen_clusters.insert(cluster_key)
+        {
+            continue;
+        }
+        selected.push(item.clone());
+        if selected.len() >= RECENT_UPDATE_LIMIT {
+            break;
+        }
+    }
+
+    selected
+}
+
 fn learning_candidates(items: &[ContinuityItemRecord]) -> Vec<ContinuityItemRecord> {
     let mut candidates = items
         .iter()
@@ -597,6 +635,51 @@ pub(crate) fn objective_requests_next_step_context(objective: &str) -> bool {
         "próximo passo",
         "o que fazemos agora",
         "como seguimos agora",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+pub(crate) fn objective_requests_recent_update_context(objective: &str) -> bool {
+    if objective_requests_history_context(objective) {
+        return false;
+    }
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "what changed",
+        "what changed recently",
+        "recent update",
+        "recent updates",
+        "latest update",
+        "latest updates",
+        "latest decision",
+        "latest decisions",
+        "recent decision",
+        "recent decisions",
+        "latest lesson",
+        "latest lessons",
+        "recent lesson",
+        "recent lessons",
+        "what's new",
+        "what is new",
+        "new since",
+        "progress update",
+        "continue from here",
+        "pick up from here",
+        "where did we land",
+        "what did we just ship",
+        "what merged",
+        "what was merged",
+        "o que mudou",
+        "mudou recentemente",
+        "atualizacao recente",
+        "atualização recente",
+        "ultima decisao",
+        "última decisão",
+        "ultimo aprendizado",
+        "último aprendizado",
+        "continue daqui",
+        "segue daqui",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -1070,6 +1153,68 @@ fn operational_state_candidate_score(
             + item.importance * 0.18
             + item.confidence * 0.12
             - recency_penalty,
+    )
+}
+
+fn recent_update_candidate_score(
+    item: &ContinuityItemRecord,
+    recent_cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    if item.status == ContinuityStatus::Rejected {
+        return None;
+    }
+
+    let kind_score = match item.kind {
+        ContinuityKind::Decision => 0.34,
+        ContinuityKind::Lesson => 0.3,
+        ContinuityKind::Outcome => 0.28,
+        ContinuityKind::Constraint => 0.24,
+        ContinuityKind::Incident => 0.2,
+        ContinuityKind::OperationalScar => 0.18,
+        ContinuityKind::Fact if !item.supports.is_empty() => 0.14,
+        _ => return None,
+    };
+    let recency_bonus = if item.updated_at >= recent_cutoff {
+        0.24
+    } else {
+        0.0
+    };
+    let status_score = match item.status {
+        ContinuityStatus::Active => 0.14,
+        ContinuityStatus::Open => 0.08,
+        ContinuityStatus::Resolved => 0.04,
+        ContinuityStatus::Superseded => -0.04,
+        ContinuityStatus::Rejected => return None,
+    };
+    let practice_score = if is_guidance_like(item.kind) {
+        match item
+            .practice_state
+            .or_else(|| derive_practice_state(item, now))
+        {
+            Some(PracticeLifecycleState::Current) => 0.16,
+            Some(PracticeLifecycleState::Aging) => 0.08,
+            Some(PracticeLifecycleState::Stale) => -0.12,
+            Some(PracticeLifecycleState::Retired) => -0.2,
+            None => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let support_signal = (item.supports.len().min(3) as f64) * 0.06;
+    let age_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+    let age_penalty = (age_hours / 120.0).min(0.22);
+
+    Some(
+        kind_score
+            + recency_bonus
+            + status_score
+            + practice_score
+            + support_signal
+            + item.retention.effective_salience * 0.7
+            + item.importance * 0.14
+            + item.confidence * 0.1
+            - age_penalty,
     )
 }
 

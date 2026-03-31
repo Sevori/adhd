@@ -3528,6 +3528,8 @@ impl Storage {
             crate::continuity::objective_requests_operational_state_context(objective);
         let next_step_requested =
             crate::continuity::objective_requests_next_step_context(objective);
+        let recent_update_requested =
+            crate::continuity::objective_requests_recent_update_context(objective);
 
         let mut seeds = BTreeMap::<String, RecallSeed>::new();
         let compiled_started = Instant::now();
@@ -3569,7 +3571,8 @@ impl Storage {
 
         let mut live_state_len = 0usize;
         let mut operational_state_len = 0usize;
-        if current_state_requested || operational_state_requested {
+        let mut recent_update_len = 0usize;
+        if current_state_requested || operational_state_requested || recent_update_requested {
             let mut continuity = self.list_continuity_items(context_id, true)?;
             crate::continuity::annotate_practice_states(&mut continuity, now);
             let mut missing_ids = Vec::new();
@@ -3607,6 +3610,19 @@ impl Storage {
                 missing_ids.extend(next_steps.iter().filter_map(|item| {
                     let seed = seeds.entry(item.id.clone()).or_default();
                     seed.next_step_rank.get_or_insert(0);
+                    if seed.raw.is_none() {
+                        Some(item.id.clone())
+                    } else {
+                        None
+                    }
+                }));
+            }
+            if recent_update_requested {
+                let recent_updates = crate::continuity::build_recent_update_view(&continuity, now);
+                missing_ids.extend(recent_updates.iter().filter_map(|item| {
+                    let seed = seeds.entry(item.id.clone()).or_default();
+                    seed.recent_update_rank.get_or_insert(recent_update_len);
+                    recent_update_len += 1;
                     if seed.raw.is_none() {
                         Some(item.id.clone())
                     } else {
@@ -3724,6 +3740,10 @@ impl Storage {
             .values()
             .filter(|seed| seed.operational_state_rank.is_some())
             .count();
+        let recent_update_seed_count = seeds
+            .values()
+            .filter(|seed| seed.recent_update_rank.is_some())
+            .count();
         let mut recall_items = seeds
             .into_values()
             .filter_map(|mut seed| seed.raw.take().map(|raw| (raw, seed)))
@@ -3746,6 +3766,7 @@ impl Storage {
                 let live_state_score = rank_score(seed.live_state_rank, live_state_len);
                 let operational_state_score =
                     rank_score(seed.operational_state_rank, operational_state_len);
+                let recent_update_score = rank_score(seed.recent_update_rank, recent_update_len);
                 let next_step_score = if seed.next_step_rank.is_some() {
                     1.0
                 } else {
@@ -3762,6 +3783,7 @@ impl Storage {
                     + priority_score * 0.65
                     + live_state_score * 1.35
                     + operational_state_score * 0.95
+                    + recent_update_score * 1.05
                     + next_step_score * 1.1
                     + item.retention.effective_salience * 0.9
                     + continuity_kind_boost(item.kind)
@@ -3796,6 +3818,9 @@ impl Storage {
                 }
                 if seed.operational_state_rank.is_some() {
                     why.push("operational_state".to_string());
+                }
+                if seed.recent_update_rank.is_some() {
+                    why.push("recent_update".to_string());
                 }
                 if seed.next_step_rank.is_some() {
                     why.push("next_step".to_string());
@@ -3884,6 +3909,7 @@ impl Storage {
                 lexical_fallback_count,
                 priority_seed_count,
                 operational_seed_count,
+                recent_update_seed_count,
                 dominant_band,
                 band_hit_counts,
             },
@@ -7824,6 +7850,7 @@ struct RecallSeed {
     priority_rank: Option<usize>,
     live_state_rank: Option<usize>,
     operational_state_rank: Option<usize>,
+    recent_update_rank: Option<usize>,
     next_step_rank: Option<usize>,
     compiled_rank: Option<usize>,
     compiled_band: Option<String>,
@@ -11937,6 +11964,164 @@ mod tests {
                 .iter()
                 .any(|why| why == "operational_state")
         );
+
+        let stale_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == stale.id)
+            .unwrap();
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "practice_stale" || why == "practice_retired")
+        );
+    }
+
+    #[test]
+    fn recall_continuity_prefers_recent_update_seed_over_stale_lexical_anchor() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-recent-update-priority".into(),
+                session_id: "session-recent-update-priority".into(),
+                objective: "track recent merged guidance".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old lexical continuation anchor".into(),
+                body: "Continue from here using the old lexical continuation anchor.".into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.96),
+                confidence: Some(0.96),
+                salience: Some(0.96),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Merged task-local guidance".into(),
+                body: "Continue from the merged task-local guidance, not the stale lexical anchor."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.91),
+                salience: Some(0.89),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let lesson = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Recent merge lesson".into(),
+                body: "The recent merge proved that active local guidance should outrank stale lexical recall."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.86),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    reason: Some("supports_recent_guidance".into()),
+                    weight: 1.0,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - chrono::Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(50)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(50)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                lesson.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                lesson.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(&context.id, "continue from here on main", false, 8)
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(current.id.as_str())
+        );
+        assert!(recall.compiler.recent_update_seed_count >= 2);
+
+        let lesson_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == lesson.id)
+            .unwrap();
+        assert!(lesson_item.why.iter().any(|why| why == "recent_update"));
 
         let stale_item = recall
             .items
