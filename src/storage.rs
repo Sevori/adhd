@@ -3521,6 +3521,9 @@ impl Storage {
         let priority_window = limit.max(8) * 8;
         let lexical_window = limit.max(8) * 6;
         let now = Utc::now();
+        let history_requested = crate::continuity::objective_requests_history_context(objective);
+        let current_state_requested =
+            crate::continuity::objective_requests_current_state_context(objective);
 
         let mut seeds = BTreeMap::<String, RecallSeed>::new();
         let compiled_started = Instant::now();
@@ -3558,6 +3561,31 @@ impl Storage {
             seed.raw = Some(raw);
             seed.priority_rank = Some(priority_len);
             priority_len += 1;
+        }
+
+        let mut live_state_len = 0usize;
+        if current_state_requested {
+            let mut continuity = self.list_continuity_items(context_id, true)?;
+            crate::continuity::annotate_practice_states(&mut continuity, now);
+            let current_practice = crate::continuity::build_current_practice_view(&continuity, now);
+            let missing_ids = current_practice
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let seed = seeds.entry(item.id.clone()).or_default();
+                    seed.live_state_rank.get_or_insert(live_state_len);
+                    live_state_len += 1;
+                    if seed.raw.is_none() {
+                        Some(item.id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            for raw in self.raw_continuity_rows_by_ids(&missing_ids)? {
+                let seed = seeds.entry(raw.id.clone()).or_default();
+                seed.raw = Some(raw);
+            }
         }
 
         let lexical_started = Instant::now();
@@ -3677,6 +3705,7 @@ impl Storage {
                     .map(|value| value.state.clone());
                 let lexical_score = rank_score(seed.lexical_rank, lexical_len);
                 let priority_score = rank_score(seed.priority_rank, priority_len);
+                let live_state_score = rank_score(seed.live_state_rank, live_state_len);
                 let compiled_score = rank_score(seed.compiled_rank, compiled_len);
                 let lexical_weight = if seed.compiled_band.is_some() {
                     0.75
@@ -3686,6 +3715,7 @@ impl Storage {
                 let score = lexical_score * lexical_weight
                     + compiled_score * 1.2
                     + priority_score * 0.65
+                    + live_state_score * 1.35
                     + item.retention.effective_salience * 0.9
                     + continuity_kind_boost(item.kind)
                     + continuity_status_boost(item.status)
@@ -3713,6 +3743,9 @@ impl Storage {
                 }
                 if seed.priority_rank.is_some() {
                     why.push("retention_priority".to_string());
+                }
+                if seed.live_state_rank.is_some() {
+                    why.push("live_state".to_string());
                 }
                 if anchor_support_scores.contains_key(&item.id) {
                     why.push("causal_anchor".to_string());
@@ -3745,11 +3778,7 @@ impl Storage {
             })
             .collect::<Result<Vec<_>>>()?;
         apply_belief_key_competition(&mut recall_items);
-        apply_practice_lifecycle_competition(
-            &mut recall_items,
-            crate::continuity::objective_requests_history_context(objective),
-            now,
-        );
+        apply_practice_lifecycle_competition(&mut recall_items, history_requested, now);
         recall_items.sort_by(|a, b| {
             b.item
                 .score
@@ -7739,6 +7768,7 @@ struct RecallSeed {
     raw: Option<RawContinuityRow>,
     lexical_rank: Option<usize>,
     priority_rank: Option<usize>,
+    live_state_rank: Option<usize>,
     compiled_rank: Option<usize>,
     compiled_band: Option<String>,
 }
@@ -11574,6 +11604,128 @@ mod tests {
                 .why
                 .iter()
                 .any(|why| why == "practice_retired" || why == "practice_stale")
+        );
+    }
+
+    #[test]
+    fn recall_continuity_prefers_live_state_winner_over_stale_lexical_anchor() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-live-state-priority".into(),
+                session_id: "session-live-state-priority".into(),
+                objective: "track organism live state".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old brutal feedback state".into(),
+                body: "The brutal feedback current live state on main says the old review anchor is still in force.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.96),
+                confidence: Some(0.96),
+                salience: Some(0.96),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "organism.main.live_state",
+                }),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Merged organism state".into(),
+                body: "Operate from the merged active guidance on main, not from the stale anchor."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.88),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "organism.main.live_state",
+                }),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        let stale_ts = (Utc::now() - chrono::Duration::days(16)).to_rfc3339();
+        let current_ts = (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![stale.id.as_str(), stale_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(16)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![current.id.as_str(), current_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(
+                &context.id,
+                "verify the current live state on main",
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(current.id.as_str())
+        );
+
+        let current_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == current.id)
+            .unwrap();
+        assert!(current_item.why.iter().any(|why| why == "live_state"));
+
+        let stale_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == stale.id)
+            .unwrap();
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "practice_stale" || why == "practice_retired")
         );
     }
 

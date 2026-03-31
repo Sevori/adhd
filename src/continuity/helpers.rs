@@ -439,6 +439,36 @@ pub(crate) fn objective_requests_history_context(objective: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
+pub(crate) fn objective_requests_current_state_context(objective: &str) -> bool {
+    if objective_requests_history_context(objective) {
+        return false;
+    }
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "current state",
+        "current live state",
+        "live state",
+        "latest state",
+        "active state",
+        "current practice",
+        "latest practice",
+        "latest guidance",
+        "active guidance",
+        "right now",
+        "as of now",
+        "where are we now",
+        "what is current",
+        "what's current",
+        "estado atual",
+        "estado corrente",
+        "pratica atual",
+        "prática atual",
+        "guia atual",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn summarize_recent_learning(
     items: &[ContinuityItemRecord],
     used_recent_window: bool,
