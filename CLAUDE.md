@@ -26,11 +26,14 @@ make serve         # Start HTTP server on :4040
 Rust codebase. Edition 2024. Single crate, library + binary.
 
 Key modules:
-- `src/continuity.rs` — shared continuity kernel (the brain)
+- `src/continuity/mod.rs` — shared continuity kernel (the brain)
+- `src/continuity/helpers.rs` — continuity ranking, views, and lifecycle helpers
 - `src/mcp.rs` — MCP stdio server
-- `src/benchmark.rs` — continuity benchmark suite
+- `src/benchmark/mod.rs` — continuity benchmark suite
 - `src/storage.rs` — SQLite storage layer
 - `src/engine.rs` — core engine
+- `src/query.rs` — bounded context-pack compilation
+- `src/dispatch.rs` — organism-level worker routing and pressure tracking
 - `src/http.rs` — HTTP/axum server
 
 ## The Spec Is the Source of Truth

@@ -47,7 +47,7 @@ fn codex_install_global_writes_managed_config_without_creating_repo_root() -> Re
         ],
     )?;
     assert_eq!(first["changed"].as_bool(), Some(true));
-    assert_eq!(first["server_name"].as_str(), Some("adhd_machine"));
+    assert_eq!(first["server_name"].as_str(), Some("ice_machine"));
     assert!(config_path.exists());
     assert!(machine_root.join("data").exists());
     assert!(
@@ -56,7 +56,7 @@ fn codex_install_global_writes_managed_config_without_creating_repo_root() -> Re
     );
 
     let config = fs::read_to_string(&config_path)?;
-    assert!(config.contains("[mcp_servers.adhd_machine]"));
+    assert!(config.contains("[mcp_servers.ice_machine]"));
     assert!(config.contains("mcp"));
     assert!(config.contains(machine_root.to_str().context("machine root utf-8")?));
 

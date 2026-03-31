@@ -778,7 +778,7 @@ impl Storage {
         let machine_id = Uuid::now_v7().to_string();
         let profile = MachineProfile {
             machine_id: machine_id.clone(),
-            label: format!("adhd@{host_name}"),
+            label: format!("ice@{host_name}"),
             namespace: format!("machine:{machine_id}"),
             default_task_id: DEFAULT_MACHINE_TASK_ID.to_string(),
             host_name,
@@ -10943,6 +10943,7 @@ mod tests {
         let machine_b = storage.machine_profile().unwrap();
 
         assert_eq!(machine_a.machine_id, machine_b.machine_id);
+        assert!(machine_a.label.starts_with("ice@"));
         assert_eq!(
             storage
                 .resolve_namespace_alias(Some(MACHINE_NAMESPACE_ALIAS))
