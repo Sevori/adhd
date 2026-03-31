@@ -28,9 +28,11 @@ pub use types::{
 
 // Re-export pub(crate) items used by other modules in this crate.
 pub(crate) use helpers::{
-    annotate_practice_states, build_current_practice_view, coordination_signal,
-    default_work_claim_lease_seconds, merge_work_claim_extra, normalize_work_claim_resources,
+    annotate_practice_states, build_current_practice_view, build_next_step_view,
+    build_operational_state_view, coordination_signal, default_work_claim_lease_seconds,
+    merge_work_claim_extra, normalize_work_claim_resources,
     objective_requests_current_state_context, objective_requests_history_context,
+    objective_requests_next_step_context, objective_requests_operational_state_context,
     work_claim_coordination, work_claim_is_live, work_claim_key, work_claims_conflict,
 };
 pub(crate) use schema::{CoordinationSignalRecord, WorkClaimConflict, WorkClaimCoordination};
@@ -1426,6 +1428,229 @@ mod tests {
         let open_pressure = read.organism["open_pressure"].as_array().unwrap();
         assert!(open_pressure.iter().any(|item| item["id"] == current.id));
         assert!(!open_pressure.iter().any(|item| item["id"] == stale.id));
+    }
+
+    #[test]
+    fn objective_requests_operational_state_context_detects_implicit_operational_prompts() {
+        assert!(objective_requests_operational_state_context(
+            "What should we do next on main?"
+        ));
+        assert!(objective_requests_operational_state_context(
+            "Qual o próximo passo para seguir?"
+        ));
+        assert!(!objective_requests_operational_state_context(
+            "What editor does the user prefer?"
+        ));
+        assert!(!objective_requests_operational_state_context(
+            "Show the lineage and how the guidance changed over time."
+        ));
+    }
+
+    #[test]
+    fn read_context_implicit_operational_prompt_surfaces_current_plan_to_second_agent() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let planner = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["write_item".into(), "read_context".into()],
+                namespace: "demo".into(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let worker = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "worker".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["read_context".into(), "claim_work".into()],
+                namespace: "demo".into(),
+                role: Some("worker".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: DEFAULT_MACHINE_TASK_ID.into(),
+                session_id: "session-orchestration".into(),
+                objective: "coordinate the merged main plan".into(),
+                selector: None,
+                agent_id: Some("planner".into()),
+                attachment_id: Some(planner.id.clone()),
+            })
+            .unwrap();
+        engine
+            .claim_work(ClaimWorkInput {
+                context_id: context.id.clone(),
+                agent_id: "worker".into(),
+                title: "Own merged main lane".into(),
+                body: "Pick up the active next step on main.".into(),
+                scope: Scope::Shared,
+                resources: vec!["repo/demo/main".into()],
+                exclusive: true,
+                attachment_id: Some(worker.id),
+                lease_seconds: Some(120),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old protocol friction plan".into(),
+                body: "Keep following the old lexical anchor on main.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.94),
+                confidence: Some(0.94),
+                salience: Some(0.94),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "organism.main.plan",
+                }),
+            })
+            .unwrap();
+        let current = engine
+            .mark_constraint(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Constraint,
+                title: "Merged main guidance".into(),
+                body: "Operate from the merged main guidance and keep its evidence chain attached."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.9),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "organism.main.plan",
+                }),
+            })
+            .unwrap();
+        let next_step = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::WorkingState,
+                title: "model-next-step".into(),
+                body: "Push the merged main guidance first.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.84),
+                confidence: Some(0.87),
+                salience: Some(0.86),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "next_step": true,
+                }),
+            }])
+            .unwrap()
+            .remove(0);
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - Duration::days(14)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                next_step.id.as_str(),
+                (Utc::now() - Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                next_step.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(20)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "what should we do next on main?".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("worker".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: false,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.recall.items[0].id, next_step.id);
+        assert!(
+            read.current_practice
+                .items
+                .iter()
+                .any(|item| item.id == current.id)
+        );
+        assert!(
+            read.current_practice
+                .items
+                .iter()
+                .all(|item| item.id != stale.id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == next_step.memory_id)
+        );
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == current.memory_id)
+        );
+        assert!(read.recall.compiler.operational_seed_count >= 2);
     }
 
     #[test]

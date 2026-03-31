@@ -189,6 +189,7 @@ const LEARNING_SUMMARY_LIMIT: usize = 3;
 const CURRENT_PRACTICE_LIMIT: usize = 5;
 const CURRENT_PRACTICE_EVIDENCE_LIMIT: usize = 3;
 const CURRENT_PRACTICE_EVIDENCE_SUMMARY_LIMIT: usize = 2;
+const OPERATIONAL_STATE_LIMIT: usize = 8;
 
 pub(crate) fn build_learning_view(
     objective: &str,
@@ -376,6 +377,63 @@ pub(crate) fn build_current_practice_view(
     }
 }
 
+pub(crate) fn build_operational_state_view(
+    items: &[ContinuityItemRecord],
+    now: DateTime<Utc>,
+) -> Vec<ContinuityItemRecord> {
+    let mut ranked = items
+        .iter()
+        .filter_map(|item| operational_state_candidate_score(item, now).map(|score| (score, item)))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            .then_with(|| right.1.title.cmp(&left.1.title))
+    });
+
+    let mut selected = Vec::new();
+    let mut seen_clusters = BTreeSet::<String>::new();
+    for (_, item) in ranked {
+        if let Some(cluster_key) = continuity_practice_cluster_key(item)
+            && !seen_clusters.insert(cluster_key)
+        {
+            continue;
+        }
+        selected.push(item.clone());
+        if selected.len() >= OPERATIONAL_STATE_LIMIT {
+            break;
+        }
+    }
+
+    selected
+}
+
+pub(crate) fn build_next_step_view(items: &[ContinuityItemRecord]) -> Vec<ContinuityItemRecord> {
+    let mut next_steps = items
+        .iter()
+        .filter(|item| is_operational_next_step(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    next_steps.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| {
+                right
+                    .retention
+                    .effective_salience
+                    .partial_cmp(&left.retention.effective_salience)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.title.cmp(&left.title))
+    });
+    next_steps.truncate(3);
+    next_steps
+}
+
 fn learning_candidates(items: &[ContinuityItemRecord]) -> Vec<ContinuityItemRecord> {
     let mut candidates = items
         .iter()
@@ -464,6 +522,81 @@ pub(crate) fn objective_requests_current_state_context(objective: &str) -> bool 
         "pratica atual",
         "prática atual",
         "guia atual",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+pub(crate) fn objective_requests_operational_state_context(objective: &str) -> bool {
+    if objective_requests_history_context(objective) {
+        return false;
+    }
+    if objective_requests_current_state_context(objective) {
+        return true;
+    }
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "what should we do",
+        "what do we do next",
+        "what should i do",
+        "what should the agent do",
+        "what's the plan",
+        "what is the plan",
+        "what's our plan",
+        "what is our plan",
+        "next step",
+        "next steps",
+        "next move",
+        "status update",
+        "where do we stand",
+        "where are we",
+        "what's blocking",
+        "what is blocking",
+        "what are the blockers",
+        "what is the blocker",
+        "what should we focus on",
+        "what is the focus",
+        "what should we prioritize",
+        "what are the priorities",
+        "how should we proceed",
+        "what matters now",
+        "o que fazemos agora",
+        "qual o proximo passo",
+        "qual o próximo passo",
+        "como seguimos",
+        "onde estamos",
+        "o que mudou",
+        "qual a prioridade",
+        "quais sao os bloqueios",
+        "quais são os bloqueios",
+        "qual e o plano",
+        "qual é o plano",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+pub(crate) fn objective_requests_next_step_context(objective: &str) -> bool {
+    if objective_requests_history_context(objective) {
+        return false;
+    }
+    let normalized = objective.to_ascii_lowercase();
+    [
+        "what should we do next",
+        "what do we do next",
+        "what should i do next",
+        "what should the agent do next",
+        "next step",
+        "next steps",
+        "next move",
+        "what now",
+        "where next",
+        "qual o proximo passo",
+        "qual o próximo passo",
+        "proximo passo",
+        "próximo passo",
+        "o que fazemos agora",
+        "como seguimos agora",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -865,6 +998,78 @@ fn is_guidance_like(kind: ContinuityKind) -> bool {
             | ContinuityKind::Constraint
             | ContinuityKind::Lesson
             | ContinuityKind::Outcome
+    )
+}
+
+fn is_operational_next_step(item: &ContinuityItemRecord) -> bool {
+    item.kind == ContinuityKind::WorkingState
+        && (item.title == "model-next-step" || item.extra["next_step"].as_bool() == Some(true))
+}
+
+fn operational_state_candidate_score(
+    item: &ContinuityItemRecord,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    if !counts_as_open_thread(item, now) {
+        return None;
+    }
+
+    let practice_state = if is_guidance_like(item.kind) {
+        item.practice_state
+            .or_else(|| derive_practice_state(item, now))
+    } else {
+        None
+    };
+    let kind_score = match item.kind {
+        ContinuityKind::WorkingState if is_operational_next_step(item) => 0.42,
+        ContinuityKind::Constraint => 0.34,
+        ContinuityKind::Decision => 0.3,
+        ContinuityKind::Outcome => 0.22,
+        ContinuityKind::Lesson => 0.18,
+        ContinuityKind::Incident => 0.24,
+        ContinuityKind::Signal => 0.22,
+        ContinuityKind::WorkClaim => 0.14,
+        ContinuityKind::WorkingState => 0.12,
+        _ => return None,
+    };
+    let practice_score = match practice_state {
+        Some(PracticeLifecycleState::Current) => 0.18,
+        Some(PracticeLifecycleState::Aging) => 0.08,
+        Some(PracticeLifecycleState::Stale) => -0.12,
+        Some(PracticeLifecycleState::Retired) => -0.22,
+        None => 0.0,
+    };
+    let status_score = match item.status {
+        ContinuityStatus::Active => 0.1,
+        ContinuityStatus::Open => 0.05,
+        _ => 0.0,
+    };
+    let coordination_score = coordination_signal(item)
+        .map(|signal| match signal.severity {
+            value if value == CoordinationSeverity::Block.as_str() => 0.18,
+            value if value == CoordinationSeverity::Warn.as_str() => 0.12,
+            value if value == CoordinationSeverity::Info.as_str() => 0.04,
+            _ => 0.0,
+        })
+        .unwrap_or_default();
+    let next_step_score = if is_operational_next_step(item) {
+        0.26
+    } else {
+        0.0
+    };
+    let recency_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+    let recency_penalty = (recency_hours / 96.0).min(0.24);
+
+    Some(
+        kind_score
+            + practice_score
+            + status_score
+            + coordination_score
+            + next_step_score
+            + item.retention.effective_salience * 0.85
+            + item.importance * 0.18
+            + item.confidence * 0.12
+            - recency_penalty,
     )
 }
 
