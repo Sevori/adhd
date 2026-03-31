@@ -2580,6 +2580,116 @@ mod tests {
     }
 
     #[test]
+    fn read_context_pack_does_not_leak_foreign_task_items_when_context_selector_is_active() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let local = engine
+            .open_context(OpenContextInput {
+                namespace: "machine-demo".into(),
+                task_id: "selector-local".into(),
+                session_id: "session-local".into(),
+                objective: "resume the local thread".into(),
+                selector: None,
+                agent_id: Some("operator-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let foreign = engine
+            .open_context(OpenContextInput {
+                namespace: "machine-demo".into(),
+                task_id: "selector-foreign".into(),
+                session_id: "session-foreign".into(),
+                objective: "resume the foreign thread".into(),
+                selector: None,
+                agent_id: Some("operator-b".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let local_item = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: local.id.clone(),
+                author_agent_id: "operator-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current local flow".into(),
+                body:
+                    "Resume from the local active branch state and continue from the current plan."
+                        .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "selector.demo.flow",
+                }),
+            }])
+            .unwrap()
+            .remove(0);
+
+        let foreign_item = engine
+            .write_derivations(vec![ContinuityItemInput {
+                context_id: foreign.id.clone(),
+                author_agent_id: "operator-b".into(),
+                kind: ContinuityKind::Lesson,
+                title: "What should we do next right now".into(),
+                body: "What should we do next? Read every stale foreign note first. What should we do next? Keep following the foreign anchor."
+                    .into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.98),
+                confidence: Some(0.98),
+                salience: Some(0.97),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            }])
+            .unwrap()
+            .remove(0);
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(local.id.clone()),
+                namespace: None,
+                task_id: None,
+                objective: "what should we do next?".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("reader".into()),
+                session_id: Some("session-reader".into()),
+                view_id: None,
+                include_resolved: false,
+                candidate_limit: 8,
+            })
+            .unwrap();
+
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == local_item.memory_id)
+        );
+        assert!(
+            !read
+                .pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == foreign_item.memory_id)
+        );
+        assert!(read.pack.items.iter().all(|item| {
+            item.provenance
+                .get("extra")
+                .and_then(|extra| extra.get("context_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(local.id.as_str())
+        }));
+    }
+
+    #[test]
     fn read_context_recall_refreshes_compiled_bands_when_memory_changes() {
         let dir = tempdir().unwrap();
         let engine = Engine::open(dir.path()).unwrap();

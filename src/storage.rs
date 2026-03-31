@@ -2066,6 +2066,24 @@ impl Storage {
             .collect())
     }
 
+    pub fn selector_allows_memory(
+        &self,
+        selector: &Selector,
+        memory: &MemoryRecord,
+    ) -> Result<bool> {
+        if !selector.layers.is_empty() && !selector.layers.contains(&memory.layer) {
+            return Ok(false);
+        }
+        if selector.start_ts.is_some_and(|start| memory.ts < start) {
+            return Ok(false);
+        }
+        if selector.end_ts.is_some_and(|end| memory.ts > end) {
+            return Ok(false);
+        }
+        let dims = self.dimensions_for_item("memory", &memory.id)?;
+        Ok(Self::selector_matches_dimensions(selector, &dims))
+    }
+
     pub fn materialize_view(&self, input: ViewInput) -> Result<ViewRecord> {
         let total_start = Instant::now();
         let created_at = Utc::now();
@@ -4906,6 +4924,33 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    fn selector_matches_dimensions(selector: &Selector, dims: &[DimensionValue]) -> bool {
+        let matches_filter = |filter: &DimensionFilter| {
+            dims.iter().any(|dimension| {
+                dimension.key == filter.key
+                    && (filter.values.is_empty() || filter.values.contains(&dimension.value))
+            })
+        };
+
+        if selector.namespace.as_deref().is_some_and(|namespace| {
+            !dims
+                .iter()
+                .any(|dimension| dimension.key == "namespace" && dimension.value == namespace)
+        }) {
+            return false;
+        }
+        if selector.all.iter().any(|filter| !matches_filter(filter)) {
+            return false;
+        }
+        if !selector.any.is_empty() && !selector.any.iter().any(matches_filter) {
+            return false;
+        }
+        if selector.exclude.iter().any(matches_filter) {
+            return false;
+        }
+        true
     }
 
     fn view_memory_ids(&self, view_id: &str) -> Result<Vec<String>> {
@@ -11740,6 +11785,125 @@ mod tests {
                     .iter()
                     .any(|why| why == "current_practice_evidence"))
         );
+    }
+
+    #[test]
+    fn build_context_pack_selector_hard_bounds_all_sources() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let local = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-selector-local".into(),
+                session_id: "session-selector-local".into(),
+                objective: "resume the local thread".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let foreign = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-selector-foreign".into(),
+                session_id: "session-selector-foreign".into(),
+                objective: "resume the foreign thread".into(),
+                selector: None,
+                agent_id: Some("agent-b".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let local_item = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: local.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current shared review flow".into(),
+                body: "Resume from the live branch state first and continue from the active local plan."
+                    .into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "selector.demo.flow",
+                }),
+            })
+            .unwrap();
+        let foreign_item = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: foreign.id.clone(),
+                author_agent_id: "agent-b".into(),
+                kind: ContinuityKind::Lesson,
+                title: "What should we do next right now".into(),
+                body: "What should we do next? Read every stale foreign note first. What should we do next? Keep following the foreign anchor."
+                    .into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.98),
+                confidence: Some(0.98),
+                salience: Some(0.97),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let pack = crate::query::build_context_pack(
+            &storage,
+            QueryInput {
+                agent_id: Some("agent-a".into()),
+                session_id: Some(local.session_id.clone()),
+                task_id: Some(local.task_id.clone()),
+                namespace: Some(local.namespace.clone()),
+                objective: Some("what should we do next?".into()),
+                selector: Some(Selector {
+                    namespace: Some(local.namespace.clone()),
+                    all: vec![
+                        DimensionFilter {
+                            key: "task".into(),
+                            values: vec![local.task_id.clone()],
+                        },
+                        DimensionFilter {
+                            key: "context".into(),
+                            values: vec![local.id.clone()],
+                        },
+                    ],
+                    ..Selector::default()
+                }),
+                view_id: None,
+                query_text: "what should we do next?".into(),
+                budget_tokens: 192,
+                candidate_limit: 8,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == local_item.memory_id)
+        );
+        assert!(
+            !pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == foreign_item.memory_id)
+        );
+        assert!(pack.items.iter().all(|item| {
+            item.provenance
+                .get("extra")
+                .and_then(|extra| extra.get("context_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(local.id.as_str())
+        }));
     }
 
     #[test]

@@ -170,6 +170,8 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - `continuity_recall` MUST expose how many candidates were explicitly demoted as `stale semantic debris`, so ICE can measure whether it is winning by retrieving better state or simply drowning in old lexical noise.
 - Evidence-chain promotion MUST be bounded and provenance-backed. It may only use stored continuity evidence already attached to the winning practice, not hidden benchmark labels or prompt-only annotations.
 - Historical guidance MUST remain available for provenance and learning-line reconstruction. ICE may not fake recency by deleting lineage.
+- When `build_context_pack` receives a `selector`, that selector MUST act as a hard bound over the entire pack. Any item that does not satisfy the selector MUST be excluded, even if it scored highly through lexical search, vector similarity, lineage expansion, or recalled continuity.
+- Selector-bounded reads MUST preserve isolation between contexts and tasks. A selector-scoped handoff may not leak foreign task memory into the final pack just because another task shares stronger lexical overlap with the prompt.
 
 ### Learning View
 
