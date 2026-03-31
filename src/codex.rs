@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::config::EngineConfig;
 
-pub const DEFAULT_CODEX_GLOBAL_SERVER_NAME: &str = "adhd_machine";
+pub const DEFAULT_CODEX_GLOBAL_SERVER_NAME: &str = "ice_machine";
 pub const DEFAULT_CODEX_MACHINE_ROOT_DIR: &str = "organisms/ice";
 
 const MANAGED_BLOCK_PREFIX: &str = "# BEGIN ICE MANAGED MCP SERVER ";
@@ -301,19 +301,28 @@ mod tests {
             ],
         )
         .expect("render managed block");
-        let first = upsert_managed_mcp_block("model = \"gpt-5.4\"\n", "adhd_machine", &block)
-            .expect("append managed block");
+        let first = upsert_managed_mcp_block(
+            "model = \"gpt-5.4\"\n",
+            DEFAULT_CODEX_GLOBAL_SERVER_NAME,
+            &block,
+        )
+        .expect("append managed block");
         assert!(first.changed);
-        let second = upsert_managed_mcp_block(&first.content, "adhd_machine", &block)
-            .expect("replace managed block idempotently");
+        let second =
+            upsert_managed_mcp_block(&first.content, DEFAULT_CODEX_GLOBAL_SERVER_NAME, &block)
+                .expect("replace managed block idempotently");
         assert!(!second.changed);
         assert_eq!(first.content, second.content);
         assert!(
             second
                 .content
-                .contains(&managed_begin_marker("adhd_machine"))
+                .contains(&managed_begin_marker(DEFAULT_CODEX_GLOBAL_SERVER_NAME))
         );
-        assert!(second.content.contains(&managed_end_marker("adhd_machine")));
+        assert!(
+            second
+                .content
+                .contains(&managed_end_marker(DEFAULT_CODEX_GLOBAL_SERVER_NAME))
+        );
     }
 
     #[test]
@@ -334,8 +343,8 @@ mod tests {
         )
         .expect("render managed block");
         let err = upsert_managed_mcp_block(
-            "[mcp_servers.adhd_machine]\ncommand = \"cargo\"\nargs = [\"run\"]\n",
-            "adhd_machine",
+            "[mcp_servers.ice_machine]\ncommand = \"cargo\"\nargs = [\"run\"]\n",
+            DEFAULT_CODEX_GLOBAL_SERVER_NAME,
             &block,
         )
         .expect_err("reject unmanaged duplicate");
