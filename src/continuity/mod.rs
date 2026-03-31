@@ -30,8 +30,8 @@ pub use types::{
 pub(crate) use helpers::{
     annotate_practice_states, build_current_practice_view, coordination_signal,
     default_work_claim_lease_seconds, merge_work_claim_extra, normalize_work_claim_resources,
-    objective_requests_history_context, work_claim_coordination, work_claim_is_live,
-    work_claim_key, work_claims_conflict,
+    objective_requests_current_state_context, objective_requests_history_context,
+    work_claim_coordination, work_claim_is_live, work_claim_key, work_claims_conflict,
 };
 pub(crate) use schema::{CoordinationSignalRecord, WorkClaimConflict, WorkClaimCoordination};
 
