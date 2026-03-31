@@ -402,6 +402,8 @@ pub struct ContinuityRecallCompiler {
     #[serde(default)]
     pub operational_seed_count: usize,
     #[serde(default)]
+    pub next_step_seed_count: usize,
+    #[serde(default)]
     pub recent_update_seed_count: usize,
     #[serde(default)]
     pub active_thread_seed_count: usize,

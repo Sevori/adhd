@@ -3591,6 +3591,7 @@ impl Storage {
 
         let mut live_state_len = 0usize;
         let mut operational_state_len = 0usize;
+        let mut next_step_len = 0usize;
         let mut recent_update_len = 0usize;
         let mut active_thread_len = 0usize;
         if current_state_requested
@@ -3631,10 +3632,11 @@ impl Storage {
                 }));
             }
             if next_step_requested {
-                let next_steps = crate::continuity::build_next_step_view(&continuity);
+                let next_steps = crate::continuity::build_next_step_view(&continuity, now);
                 missing_ids.extend(next_steps.iter().filter_map(|item| {
                     let seed = seeds.entry(item.id.clone()).or_default();
-                    seed.next_step_rank.get_or_insert(0);
+                    seed.next_step_rank.get_or_insert(next_step_len);
+                    next_step_len += 1;
                     if seed.raw.is_none() {
                         Some(item.id.clone())
                     } else {
@@ -3778,6 +3780,10 @@ impl Storage {
             .values()
             .filter(|seed| seed.operational_state_rank.is_some())
             .count();
+        let next_step_seed_count = seeds
+            .values()
+            .filter(|seed| seed.next_step_rank.is_some())
+            .count();
         let recent_update_seed_count = seeds
             .values()
             .filter(|seed| seed.recent_update_rank.is_some())
@@ -3810,11 +3816,32 @@ impl Storage {
                     rank_score(seed.operational_state_rank, operational_state_len);
                 let recent_update_score = rank_score(seed.recent_update_rank, recent_update_len);
                 let active_thread_score = rank_score(seed.active_thread_rank, active_thread_len);
-                let next_step_score = if seed.next_step_rank.is_some() {
-                    1.0
-                } else {
-                    0.0
-                };
+                let next_step_score = rank_score(seed.next_step_rank, next_step_len);
+                let work_claim_lane_score =
+                    if item.kind == ContinuityKind::WorkClaim && work_claim_is_live(&item, now) {
+                        let coordination = work_claim_coordination(&item);
+                        let exclusivity_score = coordination
+                            .as_ref()
+                            .map(|coordination| if coordination.exclusive { 0.12 } else { 0.0 })
+                            .unwrap_or_default();
+                        let resource_score = coordination
+                            .as_ref()
+                            .map(|coordination| (coordination.resources.len().min(3) as f64) * 0.04)
+                            .unwrap_or_default();
+                        if next_step_requested {
+                            if seed.next_step_rank == Some(0) {
+                                0.72 + exclusivity_score + resource_score
+                            } else {
+                                0.0
+                            }
+                        } else if operational_state_requested {
+                            0.28 + exclusivity_score * 0.5 + resource_score * 0.5
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
                 let compiled_score = rank_score(seed.compiled_rank, compiled_len);
                 let lexical_weight = if seed.compiled_band.is_some() {
                     0.75
@@ -3829,6 +3856,7 @@ impl Storage {
                     + recent_update_score * 1.05
                     + active_thread_score * 1.0
                     + next_step_score * 1.1
+                    + work_claim_lane_score
                     + item.retention.effective_salience * 0.9
                     + continuity_kind_boost(item.kind)
                     + continuity_status_boost(item.status)
@@ -3871,6 +3899,9 @@ impl Storage {
                 }
                 if seed.next_step_rank.is_some() {
                     why.push("next_step".to_string());
+                }
+                if work_claim_lane_score > 0.0 {
+                    why.push("work_claim_lane".to_string());
                 }
                 if anchor_support_scores.contains_key(&item.id) {
                     why.push("causal_anchor".to_string());
@@ -3960,6 +3991,7 @@ impl Storage {
                 stale_debris_demoted_count,
                 priority_seed_count,
                 operational_seed_count,
+                next_step_seed_count,
                 recent_update_seed_count,
                 active_thread_seed_count,
                 dominant_band,
@@ -12272,6 +12304,7 @@ mod tests {
             Some(next_step.id.as_str())
         );
         assert_eq!(recall.compiler.operational_seed_count, 2);
+        assert_eq!(recall.compiler.next_step_seed_count, 1);
 
         let next_step_item = recall
             .items
@@ -12754,6 +12787,7 @@ mod tests {
             Some(current.id.as_str())
         );
         assert_eq!(recall.compiler.operational_seed_count, 0);
+        assert_eq!(recall.compiler.next_step_seed_count, 0);
         assert_eq!(recall.compiler.recent_update_seed_count, 0);
         assert_eq!(recall.compiler.active_thread_seed_count, 0);
         assert!(recall.compiler.stale_debris_demoted_count >= 1);
@@ -12938,6 +12972,134 @@ mod tests {
         assert!(manifest.rejected.iter().any(|candidate| {
             candidate.memory_id == stale.memory_id && candidate.reason == "stale_semantic_debris"
         }));
+    }
+
+    #[test]
+    fn recall_continuity_next_step_prompt_surfaces_live_work_claim_when_no_model_next_step_exists()
+    {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-work-claim-next-step".into(),
+                session_id: "session-work-claim-next-step".into(),
+                objective: "coordinate the active lane".into(),
+                selector: None,
+                agent_id: Some("planner".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let claim = storage
+            .claim_work(ClaimWorkInput {
+                context_id: context.id.clone(),
+                agent_id: "worker".into(),
+                title: "Own the merged lint lane".into(),
+                body: "Fix lint on main before opening another slice.".into(),
+                scope: Scope::Project,
+                resources: vec!["repo/test/main".into()],
+                exclusive: true,
+                attachment_id: None,
+                lease_seconds: Some(900),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old next slice anchor".into(),
+                body: "What should we do next on main? Follow the old next slice anchor.".into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.97),
+                confidence: Some(0.95),
+                salience: Some(0.97),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Constraint,
+                title: "Current merged main guidance".into(),
+                body: "Start from the current merged main branch state first.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "test.main.lane",
+                }),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - chrono::Duration::hours(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::hours(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(40)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(40)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(&context.id, "what should we do next on main?", false, 8)
+            .unwrap();
+        let claim_index = recall
+            .items
+            .iter()
+            .position(|item| item.id == claim.id)
+            .unwrap();
+        let stale_index = recall
+            .items
+            .iter()
+            .position(|item| item.id == stale.id)
+            .unwrap();
+        let claim_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == claim.id)
+            .unwrap();
+        assert!(claim_index < stale_index);
+        assert!(claim_item.why.iter().any(|why| why == "next_step"));
+        assert!(recall.compiler.next_step_seed_count >= 1);
     }
 
     #[test]
