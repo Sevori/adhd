@@ -148,10 +148,24 @@ pub fn build_context_pack(storage: &Storage, query: QueryInput) -> Result<Contex
         breakdown.lineage = score
     });
 
+    let merged_values = merged
+        .into_values()
+        .map(|candidate| {
+            let allowed = query
+                .selector
+                .as_ref()
+                .map(|selector| storage.selector_allows_memory(selector, &candidate.memory))
+                .transpose()?
+                .unwrap_or(true);
+            Ok(allowed.then_some(candidate))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let now = Utc::now();
     let history_requested = objective_requests_history_context(&query.query_text);
-    let mut candidates = merged
-        .into_values()
+    let mut candidates = merged_values
+        .into_iter()
+        .flatten()
         .map(|mut candidate| {
             candidate.breakdown.continuity_kind = continuity_kind_score(&candidate.memory);
             candidate.breakdown.continuity_status = continuity_status_score(&candidate.memory);
