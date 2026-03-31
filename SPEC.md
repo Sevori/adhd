@@ -159,9 +159,11 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - When the objective implicitly asks for operational state, such as plan, status, blockers, next step, priorities, or what to do now, continuity recall SHOULD seed from live operational state even if the wording does not contain `current`, `live`, or `latest`.
 - This implicit operational-state path SHOULD combine live `current_practice` with bounded open-pressure state such as next steps, active blockers, live coordination pressure, and non-stale open guidance.
 - When the objective asks for recent progress, changes, latest decisions, latest lessons, or to continue from the latest state, continuity recall SHOULD seed from recent high-signal learning pivots and recently validated active guidance before trusting lexical matches alone.
+- When the objective is a vague resumption or verification prompt, continuity recall SHOULD seed from the active local thread before trusting lexical matches alone, so the newest validated task-local decision beats stale shared lexical debris.
 - This live-state recall path MUST prefer recently active operating guidance over stale lexical competitors when both speak about the same cluster, while keeping the stale branch available for explicit history reconstruction.
 - Explicit current-state seeding and implicit operational-state seeding MUST remain distinct telemetry paths so ICE can measure when a recall win came from operational priors instead of lexical fallback.
 - Recent-update seeding MUST remain a distinct telemetry path so ICE can measure when a recall win came from recent active pivots rather than operational-state priors or lexical fallback.
+- Active-thread seeding for vague resumptions MUST remain a distinct telemetry path so ICE can measure when a recall win came from the local working thread instead of lexical fallback or a more explicit operational prior.
 - Evidence-chain promotion MUST be bounded and provenance-backed. It may only use stored continuity evidence already attached to the winning practice, not hidden benchmark labels or prompt-only annotations.
 - Historical guidance MUST remain available for provenance and learning-line reconstruction. ICE may not fake recency by deleting lineage.
 

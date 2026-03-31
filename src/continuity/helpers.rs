@@ -191,6 +191,7 @@ const CURRENT_PRACTICE_EVIDENCE_LIMIT: usize = 3;
 const CURRENT_PRACTICE_EVIDENCE_SUMMARY_LIMIT: usize = 2;
 const OPERATIONAL_STATE_LIMIT: usize = 8;
 const RECENT_UPDATE_LIMIT: usize = 6;
+const ACTIVE_THREAD_LIMIT: usize = 6;
 
 pub(crate) fn build_learning_view(
     objective: &str,
@@ -472,6 +473,43 @@ pub(crate) fn build_recent_update_view(
     selected
 }
 
+pub(crate) fn build_active_thread_view(
+    items: &[ContinuityItemRecord],
+    now: DateTime<Utc>,
+) -> Vec<ContinuityItemRecord> {
+    let active_cutoff = now - Duration::days(RECENT_LEARNING_WINDOW_DAYS);
+    let mut ranked = items
+        .iter()
+        .filter_map(|item| {
+            active_thread_candidate_score(item, active_cutoff, now).map(|score| (score, item))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            .then_with(|| right.1.title.cmp(&left.1.title))
+    });
+
+    let mut selected = Vec::new();
+    let mut seen_clusters = BTreeSet::<String>::new();
+    for (_, item) in ranked {
+        if let Some(cluster_key) = continuity_practice_cluster_key(item)
+            && !seen_clusters.insert(cluster_key)
+        {
+            continue;
+        }
+        selected.push(item.clone());
+        if selected.len() >= ACTIVE_THREAD_LIMIT {
+            break;
+        }
+    }
+
+    selected
+}
+
 fn learning_candidates(items: &[ContinuityItemRecord]) -> Vec<ContinuityItemRecord> {
     let mut candidates = items
         .iter()
@@ -509,7 +547,7 @@ fn is_learning_candidate(item: &ContinuityItemRecord) -> bool {
 }
 
 pub(crate) fn objective_requests_history_context(objective: &str) -> bool {
-    let normalized = objective.to_ascii_lowercase();
+    let normalized = normalize_objective_text(objective);
     [
         "history",
         "timeline",
@@ -539,7 +577,7 @@ pub(crate) fn objective_requests_current_state_context(objective: &str) -> bool 
     if objective_requests_history_context(objective) {
         return false;
     }
-    let normalized = objective.to_ascii_lowercase();
+    let normalized = normalize_objective_text(objective);
     [
         "current state",
         "current live state",
@@ -572,7 +610,7 @@ pub(crate) fn objective_requests_operational_state_context(objective: &str) -> b
     if objective_requests_current_state_context(objective) {
         return true;
     }
-    let normalized = objective.to_ascii_lowercase();
+    let normalized = normalize_objective_text(objective);
     [
         "what should we do",
         "what do we do next",
@@ -618,7 +656,7 @@ pub(crate) fn objective_requests_next_step_context(objective: &str) -> bool {
     if objective_requests_history_context(objective) {
         return false;
     }
-    let normalized = objective.to_ascii_lowercase();
+    let normalized = normalize_objective_text(objective);
     [
         "what should we do next",
         "what do we do next",
@@ -644,7 +682,7 @@ pub(crate) fn objective_requests_recent_update_context(objective: &str) -> bool 
     if objective_requests_history_context(objective) {
         return false;
     }
-    let normalized = objective.to_ascii_lowercase();
+    let normalized = normalize_objective_text(objective);
     [
         "what changed",
         "what changed recently",
@@ -670,6 +708,10 @@ pub(crate) fn objective_requests_recent_update_context(objective: &str) -> bool 
         "what did we just ship",
         "what merged",
         "what was merged",
+        "what just merged",
+        "merged recently",
+        "recent merge",
+        "latest merge",
         "o que mudou",
         "mudou recentemente",
         "atualizacao recente",
@@ -683,6 +725,53 @@ pub(crate) fn objective_requests_recent_update_context(objective: &str) -> bool 
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+pub(crate) fn objective_requests_active_thread_context(objective: &str) -> bool {
+    if objective_requests_history_context(objective) {
+        return false;
+    }
+    if objective_requests_current_state_context(objective)
+        || objective_requests_operational_state_context(objective)
+        || objective_requests_next_step_context(objective)
+        || objective_requests_recent_update_context(objective)
+    {
+        return false;
+    }
+    let normalized = normalize_objective_text(objective);
+    let tokens = objective_content_tokens(&normalized);
+    let phrases = [
+        "continue",
+        "resume",
+        "pick up",
+        "follow up",
+        "verify this",
+        "verify the merged slice",
+        "sanity check",
+        "where were we",
+        "where did we stop",
+        "what next here",
+        "what is next here",
+        "what should land next",
+        "next cut",
+        "next slice",
+        "what is the next cut",
+        "toca a proxima",
+        "toca a próxima",
+        "segue ai",
+        "segue aí",
+    ];
+    if phrases.iter().any(|needle| normalized.contains(needle)) {
+        return true;
+    }
+    let generic_control_tokens = [
+        "continue", "resume", "verify", "check", "follow", "proceed", "advance", "merge", "merged",
+        "ship", "land", "push", "next", "slice", "cut",
+    ];
+    let has_control_token = tokens
+        .iter()
+        .any(|token| generic_control_tokens.contains(&token.as_str()));
+    has_control_token && tokens.len() <= 7
 }
 
 fn summarize_recent_learning(
@@ -1216,6 +1305,107 @@ fn recent_update_candidate_score(
             + item.confidence * 0.1
             - age_penalty,
     )
+}
+
+fn active_thread_candidate_score(
+    item: &ContinuityItemRecord,
+    active_cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    if item.status == ContinuityStatus::Rejected {
+        return None;
+    }
+
+    let kind_score = match item.kind {
+        ContinuityKind::WorkingState if is_operational_next_step(item) => 0.34,
+        ContinuityKind::WorkingState => 0.24,
+        ContinuityKind::Decision => 0.32,
+        ContinuityKind::Lesson => 0.28,
+        ContinuityKind::Outcome => 0.24,
+        ContinuityKind::Constraint => 0.18,
+        ContinuityKind::Incident => 0.14,
+        ContinuityKind::OperationalScar => 0.12,
+        ContinuityKind::Fact if !item.supports.is_empty() => 0.1,
+        _ => return None,
+    };
+    let status_score = match item.status {
+        ContinuityStatus::Active => 0.18,
+        ContinuityStatus::Open => 0.1,
+        ContinuityStatus::Resolved => 0.02,
+        ContinuityStatus::Superseded => -0.08,
+        ContinuityStatus::Rejected => return None,
+    };
+    let practice_score = if is_guidance_like(item.kind) {
+        match item
+            .practice_state
+            .or_else(|| derive_practice_state(item, now))
+        {
+            Some(PracticeLifecycleState::Current) => 0.2,
+            Some(PracticeLifecycleState::Aging) => 0.1,
+            Some(PracticeLifecycleState::Stale) => return None,
+            Some(PracticeLifecycleState::Retired) => return None,
+            None => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let support_signal = (item.supports.len().min(3) as f64) * 0.06;
+    let freshness_bonus = if item.updated_at >= active_cutoff {
+        0.24
+    } else {
+        0.08
+    };
+    let age_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+    if age_hours > (RECENT_LEARNING_WINDOW_DAYS as f64 * 24.0 * 3.0)
+        && item.kind != ContinuityKind::Constraint
+    {
+        return None;
+    }
+    let age_penalty = (age_hours / 168.0).min(0.28);
+
+    Some(
+        kind_score
+            + status_score
+            + practice_score
+            + support_signal
+            + freshness_bonus
+            + item.retention.effective_salience * 0.72
+            + item.importance * 0.15
+            + item.confidence * 0.1
+            - age_penalty,
+    )
+}
+
+fn normalize_objective_text(objective: &str) -> String {
+    let mut normalized = String::with_capacity(objective.len());
+    let mut last_was_space = true;
+    for ch in objective.chars().flat_map(|ch| ch.to_lowercase()) {
+        let mapped = if ch.is_alphanumeric() { ch } else { ' ' };
+        if mapped == ' ' {
+            if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            normalized.push(mapped);
+            last_was_space = false;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn objective_content_tokens(normalized: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "as", "at", "by", "do", "for", "from", "here", "i", "is", "it", "just",
+        "me", "now", "of", "on", "our", "the", "this", "to", "up", "we", "what", "where", "with",
+        "ai", "o", "os", "a", "as", "da", "de", "do", "dos", "das", "e", "em", "na", "no", "nos",
+        "nas", "um", "uma", "para", "por", "que", "isso", "isto", "aqui", "agora", "segue", "toca",
+    ];
+    normalized
+        .split_whitespace()
+        .filter(|token| !STOPWORDS.contains(token))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn guidance_retirement_window_hours(stale_window_hours: f64) -> f64 {

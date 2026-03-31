@@ -28,9 +28,10 @@ pub use types::{
 
 // Re-export pub(crate) items used by other modules in this crate.
 pub(crate) use helpers::{
-    annotate_practice_states, build_current_practice_view, build_next_step_view,
-    build_operational_state_view, build_recent_update_view, coordination_signal,
-    default_work_claim_lease_seconds, merge_work_claim_extra, normalize_work_claim_resources,
+    annotate_practice_states, build_active_thread_view, build_current_practice_view,
+    build_next_step_view, build_operational_state_view, build_recent_update_view,
+    coordination_signal, default_work_claim_lease_seconds, merge_work_claim_extra,
+    normalize_work_claim_resources, objective_requests_active_thread_context,
     objective_requests_current_state_context, objective_requests_history_context,
     objective_requests_next_step_context, objective_requests_operational_state_context,
     objective_requests_recent_update_context, work_claim_coordination, work_claim_is_live,
@@ -1456,6 +1457,9 @@ mod tests {
             "What changed recently in the recall behavior?"
         ));
         assert!(objective_requests_recent_update_context(
+            "Verify the merged recent-update slice."
+        ));
+        assert!(objective_requests_recent_update_context(
             "Qual a última decisão que mudou isso?"
         ));
         assert!(!objective_requests_recent_update_context(
@@ -1463,6 +1467,22 @@ mod tests {
         ));
         assert!(!objective_requests_recent_update_context(
             "Show the full lineage over time."
+        ));
+    }
+
+    #[test]
+    fn objective_requests_active_thread_context_detects_vague_resumption_prompts() {
+        assert!(objective_requests_active_thread_context(
+            "Verify this and figure out the next cut on main."
+        ));
+        assert!(objective_requests_active_thread_context(
+            "Resume and push the next slice."
+        ));
+        assert!(!objective_requests_active_thread_context(
+            "What guidance is currently live?"
+        ));
+        assert!(!objective_requests_active_thread_context(
+            "What changed recently in continuity recall?"
         ));
     }
 
@@ -1870,6 +1890,207 @@ mod tests {
                     .any(|why| why == "practice_stale" || why == "practice_retired")
         }));
         assert!(read.recall.compiler.recent_update_seed_count >= 2);
+    }
+
+    #[test]
+    fn read_context_vague_resumption_prompt_prefers_active_thread_to_second_agent() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let planner = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["write_item".into(), "read_context".into()],
+                namespace: "demo".into(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let _worker = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "worker".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["read_context".into()],
+                namespace: "demo".into(),
+                role: Some("worker".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: DEFAULT_MACHINE_TASK_ID.into(),
+                session_id: "session-1".into(),
+                objective: "exercise vague resumption".into(),
+                selector: None,
+                agent_id: Some("planner".into()),
+                attachment_id: Some(planner.id.clone()),
+            })
+            .unwrap();
+
+        engine
+            .upsert_agent_badge(UpsertAgentBadgeInput {
+                agent_id: Some("planner".into()),
+                attachment_id: Some(planner.id.clone()),
+                namespace: Some("demo".into()),
+                context_id: Some(context.id.clone()),
+                display_name: Some("Planner".into()),
+                status: Some("working".into()),
+                focus: Some("mainline guidance".into()),
+                headline: Some("Keeps the current slice moving".into()),
+                branch: Some("main".into()),
+                repo_root: Some("/tmp/demo".into()),
+                resource: Some("repo:/tmp/demo".into()),
+                metadata: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old lexical verification anchor".into(),
+                body: "Verify this by following the old lexical anchor from the previous era."
+                    .into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.94),
+                confidence: Some(0.9),
+                salience: Some(0.94),
+                context_id: context.id.clone(),
+                dimensions: vec![],
+                supports: vec![],
+                extra: serde_json::json!({
+                    "repo_root": "/tmp/demo",
+                    "branch": "main",
+                    "practice_key": "demo/mainline"
+                }),
+                layer: None,
+            })
+            .unwrap();
+        let current = engine
+            .mark_decision(ContinuityItemInput {
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Current retrieval slice should prioritize the live thread".into(),
+                body: "The active thread should prefer the newest validated local decision for vague resumptions on main.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.92),
+                confidence: Some(0.91),
+                salience: Some(0.9),
+                context_id: context.id.clone(),
+                dimensions: vec![],
+                supports: vec![],
+                extra: serde_json::json!({
+                    "repo_root": "/tmp/demo",
+                    "branch": "main",
+                    "practice_key": "demo/mainline"
+                }),
+                layer: None,
+            })
+            .unwrap();
+        let mut recent_lesson = engine
+            .write_derivations(vec![ContinuityItemInput {
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Recent verification should stay close to the live thread".into(),
+                body: "The newest validated local decision should beat stale lexical anchors on vague prompts.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.86),
+                context_id: context.id.clone(),
+                dimensions: vec![],
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    weight: 1.0,
+                    reason: Some("validated by the live thread".into()),
+                }],
+                extra: serde_json::json!({
+                    "repo_root": "/tmp/demo",
+                    "branch": "main",
+                    "practice_key": "demo/mainline"
+                }),
+                layer: None,
+            }])
+            .unwrap();
+        let recent_lesson = recent_lesson.remove(0);
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - Duration::days(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - Duration::days(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - Duration::minutes(40)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(40)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                recent_lesson.id.as_str(),
+                (Utc::now() - Duration::minutes(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                recent_lesson.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(12)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "Verify this and figure out the next cut on main.".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("worker".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: false,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.recall.items[0].id, current.id);
+        assert!(read.recall.items.iter().any(|item| {
+            item.id == current.id && item.why.iter().any(|why| why == "active_thread")
+        }));
+        assert!(read.recall.compiler.active_thread_seed_count >= 1);
     }
 
     #[test]
