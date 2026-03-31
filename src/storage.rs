@@ -3876,6 +3876,7 @@ impl Storage {
                         score,
                         why,
                     },
+                    scope: item.scope,
                     belief_key,
                     practice_key,
                     source_role,
@@ -3886,6 +3887,8 @@ impl Storage {
             .collect::<Result<Vec<_>>>()?;
         apply_belief_key_competition(&mut recall_items);
         apply_practice_lifecycle_competition(&mut recall_items, history_requested, now);
+        let stale_debris_demoted_count =
+            apply_stale_semantic_debris_penalty(&mut recall_items, history_requested, now);
         recall_items.sort_by(|a, b| {
             b.item
                 .score
@@ -3936,6 +3939,7 @@ impl Storage {
             compiler: ContinuityRecallCompiler {
                 compiled_hit_count,
                 lexical_fallback_count,
+                stale_debris_demoted_count,
                 priority_seed_count,
                 operational_seed_count,
                 recent_update_seed_count,
@@ -7906,6 +7910,7 @@ struct StoredContinuityPlasticity {
 #[derive(Debug, Clone)]
 struct ScoredContinuityRecallItem {
     item: ContinuityRecallItem,
+    scope: Scope,
     belief_key: Option<String>,
     practice_key: Option<String>,
     source_role: Option<String>,
@@ -8251,6 +8256,113 @@ fn practice_state_why(state: Option<PracticeLifecycleState>) -> Option<&'static 
     }
 }
 
+fn continuity_item_is_seeded_from_live_state(why: &[String]) -> bool {
+    why.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "live_state"
+                | "operational_state"
+                | "recent_update"
+                | "active_thread"
+                | "next_step"
+                | "causal_anchor"
+                | "supports_anchor"
+                | "current_practice_evidence"
+                | "belief_key_winner"
+                | "practice_key_winner"
+        )
+    })
+}
+
+fn continuity_item_has_reinforcement(
+    plasticity: Option<&ContinuityPlasticityState>,
+    support_count: usize,
+) -> bool {
+    if support_count > 0 {
+        return true;
+    }
+    plasticity
+        .map(|plasticity| {
+            plasticity.confirmation_count > 0
+                || plasticity.successful_use_count > 0
+                || plasticity.spaced_reactivation_count > 0
+                || plasticity.last_strengthened_at.is_some()
+                || plasticity.last_confirmed_at.is_some()
+        })
+        .unwrap_or(false)
+}
+
+fn stale_semantic_debris_penalty(
+    item: &ScoredContinuityRecallItem,
+    history_requested: bool,
+    now: DateTime<Utc>,
+) -> Option<(f64, Vec<&'static str>)> {
+    if history_requested
+        || !item.item.status.is_open()
+        || !is_guidance_like_kind(item.item.kind)
+        || continuity_item_is_seeded_from_live_state(&item.item.why)
+    {
+        return None;
+    }
+
+    let state = item
+        .practice_state
+        .or_else(|| derive_recall_practice_state(&item.item, item.plasticity.as_ref(), now));
+    if !matches!(
+        state,
+        Some(PracticeLifecycleState::Stale | PracticeLifecycleState::Retired)
+    ) {
+        return None;
+    }
+
+    let lexical_only = item.item.why.iter().any(|why| why == "lexical");
+    let has_anchor = item.practice_key.is_some() || item.belief_key.is_some();
+    let has_reinforcement =
+        continuity_item_has_reinforcement(item.plasticity.as_ref(), item.item.support_count);
+    let anchor = continuity_practice_anchor(item.item.updated_at, item.plasticity.as_ref());
+    let age_hours = (now - anchor).num_seconds().max(0) as f64 / 3600.0;
+    let ancient = age_hours >= 24.0 * 10.0;
+    if !lexical_only && has_anchor && has_reinforcement && !ancient {
+        return None;
+    }
+
+    let mut penalty: f64 = match state {
+        Some(PracticeLifecycleState::Retired) => 0.16,
+        Some(PracticeLifecycleState::Stale) => 0.1,
+        _ => 0.0,
+    };
+    let mut why = vec!["stale_semantic_debris"];
+
+    if lexical_only {
+        penalty += 0.16;
+        why.push("debris_lexical_only");
+    }
+    if !has_anchor {
+        penalty += 0.1;
+        why.push("debris_unanchored");
+    }
+    if !has_reinforcement {
+        penalty += 0.08;
+        why.push("debris_unreinforced");
+    }
+    if item.item.support_count == 0 {
+        penalty += 0.06;
+        why.push("debris_unsupported");
+    }
+    if ancient {
+        penalty += 0.08;
+        why.push("debris_ancient");
+    }
+    if item.scope == Scope::Shared {
+        penalty += 0.08;
+        why.push("debris_shared_scope");
+    } else if item.scope == Scope::Project {
+        penalty += 0.03;
+    }
+
+    Some((penalty.clamp(0.0, 0.58), why))
+}
+
 fn continuity_practice_competition_rank(item: &ScoredContinuityRecallItem) -> f64 {
     let mut score = item.item.score;
     if let Some(plasticity) = item.plasticity.as_ref() {
@@ -8330,6 +8442,26 @@ fn apply_practice_lifecycle_competition(
             loser.why.push("practice_key_competitor".to_string());
         }
     }
+}
+
+fn apply_stale_semantic_debris_penalty(
+    items: &mut [ScoredContinuityRecallItem],
+    history_requested: bool,
+    now: DateTime<Utc>,
+) -> usize {
+    let mut demoted = 0usize;
+    for item in items.iter_mut() {
+        let Some((penalty, reasons)) = stale_semantic_debris_penalty(item, history_requested, now)
+        else {
+            continue;
+        };
+        item.item.score -= penalty;
+        demoted += 1;
+        for reason in reasons {
+            item.item.why.push(reason.to_string());
+        }
+    }
+    demoted
 }
 
 fn apply_belief_key_competition(items: &mut [ScoredContinuityRecallItem]) {
@@ -12320,6 +12452,328 @@ mod tests {
             .find(|item| item.id == current.id)
             .unwrap();
         assert!(current_item.why.iter().any(|why| why == "active_thread"));
+    }
+
+    #[test]
+    fn recall_continuity_demotes_ancient_shared_debris_on_generic_prompt() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-generic-debris-demotion".into(),
+                session_id: "session-generic-debris-demotion".into(),
+                objective: "track organism rule".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old brutal feedback anchor".into(),
+                body: "On main, keep following the old brutal feedback organism rule forever."
+                    .into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.97),
+                confidence: Some(0.95),
+                salience: Some(0.97),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Merged evidence-backed rule".into(),
+                body: "On main, follow the merged evidence-backed organism rule instead.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let lesson = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Merged rule stayed correct".into(),
+                body: "The merged rule stayed correct after the last organism pass.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.86),
+                confidence: Some(0.9),
+                salience: Some(0.84),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    reason: Some("outcome_confirmed".into()),
+                    weight: 1.1,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - chrono::Duration::days(21)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(21)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                lesson.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                lesson.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let recall = storage
+            .recall_continuity(&context.id, "organism main rule", false, 8)
+            .unwrap();
+        assert_eq!(
+            recall.items.first().map(|item| item.id.as_str()),
+            Some(current.id.as_str())
+        );
+        assert_eq!(recall.compiler.operational_seed_count, 0);
+        assert_eq!(recall.compiler.recent_update_seed_count, 0);
+        assert_eq!(recall.compiler.active_thread_seed_count, 0);
+        assert!(recall.compiler.stale_debris_demoted_count >= 1);
+
+        let stale_item = recall
+            .items
+            .iter()
+            .find(|item| item.id == stale.id)
+            .unwrap();
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "stale_semantic_debris")
+        );
+        assert!(
+            stale_item
+                .why
+                .iter()
+                .any(|why| why == "debris_shared_scope")
+        );
+    }
+
+    #[test]
+    fn build_context_pack_rejects_ancient_shared_debris_reintroduced_by_lexical_search() {
+        let dir = tempdir().unwrap();
+        let config = EngineConfig::with_root(dir.path());
+        let storage = Storage::open(config).unwrap();
+        let context = storage
+            .open_context(OpenContextInput {
+                namespace: "test".into(),
+                task_id: "task-pack-debris-demotion".into(),
+                session_id: "session-pack-debris-demotion".into(),
+                objective: "track organism rule".into(),
+                selector: None,
+                agent_id: Some("agent-a".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+        let stale = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old brutal feedback anchor".into(),
+                body: "On main, keep following the old brutal feedback organism rule forever."
+                    .into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.97),
+                confidence: Some(0.95),
+                salience: Some(0.97),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let current = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Decision,
+                title: "Merged evidence-backed rule".into(),
+                body: "On main, follow the merged evidence-backed organism rule instead.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let lesson = storage
+            .persist_continuity_item(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "agent-a".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Merged rule stayed correct".into(),
+                body: "The merged rule stayed correct after the last organism pass.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.86),
+                confidence: Some(0.9),
+                salience: Some(0.84),
+                layer: None,
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    reason: Some("outcome_confirmed".into()),
+                    weight: 1.1,
+                }],
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - chrono::Duration::days(21)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::days(21)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                lesson.id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                lesson.memory_id.as_str(),
+                (Utc::now() - chrono::Duration::minutes(45)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let pack = crate::query::build_context_pack(
+            &storage,
+            QueryInput {
+                agent_id: Some("agent-a".into()),
+                session_id: Some(context.session_id.clone()),
+                task_id: Some(context.task_id.clone()),
+                namespace: Some(context.namespace.clone()),
+                objective: Some("organism main rule".into()),
+                selector: None,
+                view_id: None,
+                query_text: "organism main rule".into(),
+                budget_tokens: 192,
+                candidate_limit: 8,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            pack.items
+                .iter()
+                .any(|item| item.memory_id == current.memory_id)
+        );
+        assert!(
+            !pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == stale.memory_id)
+        );
+
+        let manifest = storage.explain_context_pack(&pack.id).unwrap();
+        assert!(manifest.rejected.iter().any(|candidate| {
+            candidate.memory_id == stale.memory_id && candidate.reason == "stale_semantic_debris"
+        }));
     }
 
     #[test]

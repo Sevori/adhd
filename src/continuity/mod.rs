@@ -958,7 +958,11 @@ mod tests {
 
         let manifest = engine.explain_context_pack(&read.pack.id).unwrap();
         assert!(manifest.rejected.iter().any(|candidate| {
-            candidate.memory_id == stale.memory_id && candidate.reason == "practice_key_competitor"
+            candidate.memory_id == stale.memory_id
+                && matches!(
+                    candidate.reason.as_str(),
+                    "practice_key_competitor" | "stale_semantic_debris"
+                )
         }));
     }
 
@@ -2091,6 +2095,190 @@ mod tests {
             item.id == current.id && item.why.iter().any(|why| why == "active_thread")
         }));
         assert!(read.recall.compiler.active_thread_seed_count >= 1);
+    }
+
+    #[test]
+    fn read_context_generic_prompt_demotes_ancient_shared_debris_for_second_agent() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let planner = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["write_item".into(), "read_context".into()],
+                namespace: "demo".into(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let _worker = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "worker".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["read_context".into()],
+                namespace: "demo".into(),
+                role: Some("worker".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: DEFAULT_MACHINE_TASK_ID.into(),
+                session_id: "session-1".into(),
+                objective: "exercise generic debris demotion".into(),
+                selector: None,
+                agent_id: Some("planner".into()),
+                attachment_id: Some(planner.id.clone()),
+            })
+            .unwrap();
+
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old brutal feedback anchor".into(),
+                body: "On main, keep following the old brutal feedback organism rule forever."
+                    .into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Open),
+                importance: Some(0.97),
+                confidence: Some(0.95),
+                salience: Some(0.97),
+                context_id: context.id.clone(),
+                dimensions: vec![],
+                supports: vec![],
+                extra: serde_json::json!({
+                    "repo_root": "/tmp/demo",
+                    "branch": "main",
+                }),
+                layer: None,
+            })
+            .unwrap();
+        let current = engine
+            .mark_decision(ContinuityItemInput {
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Merged evidence-backed rule".into(),
+                body: "On main, follow the merged evidence-backed organism rule instead.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.9),
+                confidence: Some(0.92),
+                salience: Some(0.9),
+                context_id: context.id.clone(),
+                dimensions: vec![],
+                supports: vec![],
+                extra: serde_json::json!({
+                    "repo_root": "/tmp/demo",
+                    "branch": "main",
+                }),
+                layer: None,
+            })
+            .unwrap();
+        let mut lesson = engine
+            .write_derivations(vec![ContinuityItemInput {
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Lesson,
+                title: "Merged rule stayed correct".into(),
+                body: "The merged rule stayed correct after the last organism pass.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Resolved),
+                importance: Some(0.86),
+                confidence: Some(0.9),
+                salience: Some(0.84),
+                context_id: context.id.clone(),
+                dimensions: vec![],
+                supports: vec![SupportRef {
+                    support_type: "continuity".into(),
+                    support_id: current.id.clone(),
+                    weight: 1.1,
+                    reason: Some("outcome_confirmed".into()),
+                }],
+                extra: serde_json::json!({
+                    "repo_root": "/tmp/demo",
+                    "branch": "main",
+                }),
+                layer: None,
+            }])
+            .unwrap();
+        let lesson = lesson.remove(0);
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - Duration::days(21)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - Duration::days(21)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                current.id.as_str(),
+                (Utc::now() - Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                current.memory_id.as_str(),
+                (Utc::now() - Duration::hours(2)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                lesson.id.as_str(),
+                (Utc::now() - Duration::minutes(30)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                lesson.memory_id.as_str(),
+                (Utc::now() - Duration::minutes(30)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "organism main rule".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("worker".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: false,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(read.recall.items[0].id, current.id);
+        assert_eq!(read.recall.compiler.operational_seed_count, 0);
+        assert_eq!(read.recall.compiler.recent_update_seed_count, 0);
+        assert_eq!(read.recall.compiler.active_thread_seed_count, 0);
+        assert!(read.recall.compiler.stale_debris_demoted_count >= 1);
+        assert!(read.recall.items.iter().any(|item| {
+            item.id == stale.id && item.why.iter().any(|why| why == "stale_semantic_debris")
+        }));
     }
 
     #[test]

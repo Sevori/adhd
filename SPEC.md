@@ -150,6 +150,9 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - `superseded` and `rejected` guidance MUST be treated as `retired` in the derived lifecycle, even if the raw item still exists for lineage.
 - Guidance-like continuity that remains `open` or `active` but ages past a retirement horizon without recent reinforcement SHOULD stop counting as live operating pressure in normal recall and organism summaries. It remains available for provenance and explicit history reconstruction.
 - By default, recall and context-pack compilation SHOULD boost `current` guidance and penalize `stale` or `retired` guidance.
+- ICE MUST derive a `stale semantic debris` class for ancient open or active guidance that is no longer behaving like live operating state. At minimum this class SHOULD capture guidance that is already `stale` or `retired`, lacks recent reinforcement, lacks corroborating evidence, and survives mainly because of lexical overlap.
+- `stale semantic debris` MUST be demoted in normal recall and context-pack compilation even when lexical overlap is strong. Generic reads may not let old lexical anchors outrank fresher validated guidance just because they share more words with the prompt.
+- `stale semantic debris` demotion SHOULD be stronger for shared-scope debris than for task-local debris, because shared lexical junk pollutes more future agents.
 - When the objective explicitly asks for history, timeline, lineage, evolution, or why a practice changed, ICE SHOULD relax stale-guidance suppression so the full operating line can be reconstructed.
 - `continuity_read_context` MUST expose a first-class `current_practice` view summarizing the active operating guidance for the task.
 - The default `current_practice` view SHOULD prefer the latest active guidance and collapse weaker competitors for the same `practice_key` or `belief_key`.
@@ -164,6 +167,7 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - Explicit current-state seeding and implicit operational-state seeding MUST remain distinct telemetry paths so ICE can measure when a recall win came from operational priors instead of lexical fallback.
 - Recent-update seeding MUST remain a distinct telemetry path so ICE can measure when a recall win came from recent active pivots rather than operational-state priors or lexical fallback.
 - Active-thread seeding for vague resumptions MUST remain a distinct telemetry path so ICE can measure when a recall win came from the local working thread instead of lexical fallback or a more explicit operational prior.
+- `continuity_recall` MUST expose how many candidates were explicitly demoted as `stale semantic debris`, so ICE can measure whether it is winning by retrieving better state or simply drowning in old lexical noise.
 - Evidence-chain promotion MUST be bounded and provenance-backed. It may only use stored continuity evidence already attached to the winning practice, not hidden benchmark labels or prompt-only annotations.
 - Historical guidance MUST remain available for provenance and learning-line reconstruction. ICE may not fake recency by deleting lineage.
 
