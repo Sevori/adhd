@@ -187,6 +187,8 @@ const RECENT_LEARNING_WINDOW_DAYS: i64 = 7;
 const RECENT_LEARNING_LIMIT: usize = 6;
 const LEARNING_SUMMARY_LIMIT: usize = 3;
 const CURRENT_PRACTICE_LIMIT: usize = 5;
+const CURRENT_PRACTICE_EVIDENCE_LIMIT: usize = 3;
+const CURRENT_PRACTICE_EVIDENCE_SUMMARY_LIMIT: usize = 2;
 
 pub(crate) fn build_learning_view(
     objective: &str,
@@ -232,6 +234,11 @@ pub(crate) fn build_learning_view(
 }
 
 pub(crate) fn annotate_practice_states(items: &mut [ContinuityItemRecord], now: DateTime<Utc>) {
+    let items_by_id = items
+        .iter()
+        .map(|item| (item.id.clone(), item.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let support_index = current_practice_support_index(items, &items_by_id);
     let mut strongest_clusters = BTreeMap::<String, (usize, f64, DateTime<Utc>)>::new();
     let mut baseline_states = vec![None; items.len()];
     let mut practice_ranks = vec![0.0; items.len()];
@@ -242,7 +249,9 @@ pub(crate) fn annotate_practice_states(items: &mut [ContinuityItemRecord], now: 
         let Some(state) = state else {
             continue;
         };
-        practice_ranks[index] = current_practice_rank(item, state, now);
+        let support_signal =
+            current_practice_support_signal(item, &items_by_id, &support_index, now);
+        practice_ranks[index] = current_practice_rank(item, state, now, support_signal);
         if let Some(cluster_key) = continuity_practice_cluster_key(item) {
             strongest_clusters
                 .entry(cluster_key)
@@ -281,14 +290,41 @@ pub(crate) fn build_current_practice_view(
     items: &[ContinuityItemRecord],
     now: DateTime<Utc>,
 ) -> PracticeView {
+    let items_by_id = items
+        .iter()
+        .map(|item| (item.id.clone(), item.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let support_index = current_practice_support_index(items, &items_by_id);
     let mut practice_items = items
         .iter()
         .filter(|item| is_current_practice_candidate(item))
         .cloned()
         .collect::<Vec<_>>();
+    let support_signal_by_id = practice_items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                current_practice_support_signal(item, &items_by_id, &support_index, now),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     practice_items.sort_by(|left, right| {
         practice_state_sort_rank(right.practice_state)
             .cmp(&practice_state_sort_rank(left.practice_state))
+            .then_with(|| {
+                support_signal_by_id
+                    .get(&right.id)
+                    .copied()
+                    .unwrap_or_default()
+                    .partial_cmp(
+                        &support_signal_by_id
+                            .get(&left.id)
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| right.updated_at.cmp(&left.updated_at))
             .then_with(|| {
                 right
@@ -313,10 +349,30 @@ pub(crate) fn build_current_practice_view(
         }
     }
 
-    let summary = summarize_current_practice(&selected, now);
+    let evidence = selected
+        .iter()
+        .filter_map(|item| {
+            let evidence = current_practice_evidence_items(item, &items_by_id, &support_index, now);
+            if evidence.is_empty() {
+                return None;
+            }
+            Some(PracticeEvidenceRecord {
+                practice_id: item.id.clone(),
+                support_signal: support_signal_by_id
+                    .get(&item.id)
+                    .copied()
+                    .unwrap_or_default(),
+                evidence_count: evidence.len(),
+                evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let summary = summarize_current_practice(&selected, &evidence, now);
     PracticeView {
         summary,
         items: selected,
+        evidence,
     }
 }
 
@@ -449,20 +505,45 @@ fn summarize_learning_line(items: &[ContinuityItemRecord], now: DateTime<Utc>) -
     )
 }
 
-fn summarize_current_practice(items: &[ContinuityItemRecord], now: DateTime<Utc>) -> String {
+fn summarize_current_practice(
+    items: &[ContinuityItemRecord],
+    evidence: &[PracticeEvidenceRecord],
+    now: DateTime<Utc>,
+) -> String {
     if items.is_empty() {
         return "No current practice is established yet.".to_string();
     }
+    let evidence_by_practice = evidence
+        .iter()
+        .map(|bundle| (bundle.practice_id.as_str(), bundle))
+        .collect::<BTreeMap<_, _>>();
     let focus = items
         .iter()
         .take(LEARNING_SUMMARY_LIMIT)
         .map(|item| {
+            let evidence_suffix = evidence_by_practice
+                .get(item.id.as_str())
+                .map(|bundle| {
+                    let evidence_titles = bundle
+                        .evidence
+                        .iter()
+                        .take(CURRENT_PRACTICE_EVIDENCE_SUMMARY_LIMIT)
+                        .map(|evidence_item| evidence_item.title.clone())
+                        .collect::<Vec<_>>();
+                    format!(
+                        "; backed by {} signal(s): {}",
+                        bundle.evidence_count,
+                        evidence_titles.join(", ")
+                    )
+                })
+                .unwrap_or_else(|| "; no live support signals".to_string());
             format!(
-                "{} [{}; {}; {}]",
+                "{} [{}; {}; {}{}]",
                 item.title,
                 item.kind.as_str(),
                 practice_state_label(item.practice_state),
-                relative_time_label(item.updated_at, now)
+                relative_time_label(item.updated_at, now),
+                evidence_suffix
             )
         })
         .collect::<Vec<_>>()
@@ -562,6 +643,7 @@ fn current_practice_rank(
     item: &ContinuityItemRecord,
     state: PracticeLifecycleState,
     now: DateTime<Utc>,
+    support_signal: f64,
 ) -> f64 {
     let recency_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
     let state_score = match state {
@@ -574,7 +656,156 @@ fn current_practice_rank(
         + item.retention.effective_salience
         + item.importance * 0.24
         + item.confidence * 0.16
+        + support_signal
         - (recency_hours / 72.0).min(0.22)
+}
+
+fn current_practice_support_index(
+    items: &[ContinuityItemRecord],
+    items_by_id: &BTreeMap<String, ContinuityItemRecord>,
+) -> BTreeMap<String, Vec<(SupportRef, ContinuityItemRecord)>> {
+    let mut out = BTreeMap::<String, Vec<(SupportRef, ContinuityItemRecord)>>::new();
+    for item in items {
+        for support in &item.supports {
+            if support.support_type != "continuity" {
+                continue;
+            }
+            let Some(target) = items_by_id.get(&support.support_id) else {
+                continue;
+            };
+            out.entry(target.id.clone())
+                .or_default()
+                .push((support.clone(), item.clone()));
+        }
+    }
+    out
+}
+
+fn current_practice_support_signal(
+    item: &ContinuityItemRecord,
+    items_by_id: &BTreeMap<String, ContinuityItemRecord>,
+    support_index: &BTreeMap<String, Vec<(SupportRef, ContinuityItemRecord)>>,
+    now: DateTime<Utc>,
+) -> f64 {
+    current_practice_evidence_candidates(item, items_by_id, support_index, now)
+        .iter()
+        .enumerate()
+        .map(|(index, (_, _, score))| {
+            let damp = match index {
+                0 => 1.0,
+                1 => 0.72,
+                _ => 0.48,
+            };
+            score * damp
+        })
+        .sum::<f64>()
+        .clamp(0.0, 0.34)
+}
+
+fn current_practice_evidence_items(
+    item: &ContinuityItemRecord,
+    items_by_id: &BTreeMap<String, ContinuityItemRecord>,
+    support_index: &BTreeMap<String, Vec<(SupportRef, ContinuityItemRecord)>>,
+    now: DateTime<Utc>,
+) -> Vec<ContinuityItemRecord> {
+    current_practice_evidence_candidates(item, items_by_id, support_index, now)
+        .into_iter()
+        .map(|(_, evidence, _)| evidence)
+        .collect()
+}
+
+fn current_practice_evidence_candidates(
+    item: &ContinuityItemRecord,
+    items_by_id: &BTreeMap<String, ContinuityItemRecord>,
+    support_index: &BTreeMap<String, Vec<(SupportRef, ContinuityItemRecord)>>,
+    now: DateTime<Utc>,
+) -> Vec<(SupportRef, ContinuityItemRecord, f64)> {
+    let mut ranked = Vec::<(SupportRef, ContinuityItemRecord, f64)>::new();
+    let mut seen = BTreeSet::<String>::new();
+
+    for (support_ref, evidence_item) in support_index.get(&item.id).into_iter().flatten().cloned() {
+        if seen.insert(evidence_item.id.clone()) {
+            let score = current_practice_evidence_rank(&support_ref, &evidence_item, now);
+            ranked.push((support_ref, evidence_item, score));
+        }
+    }
+
+    for support_ref in item
+        .supports
+        .iter()
+        .filter(|support| support.support_type == "continuity")
+        .cloned()
+    {
+        let Some(evidence_item) = items_by_id.get(&support_ref.support_id).cloned() else {
+            continue;
+        };
+        if seen.insert(evidence_item.id.clone()) {
+            let score = current_practice_evidence_rank(&support_ref, &evidence_item, now);
+            ranked.push((support_ref, evidence_item, score));
+        }
+    }
+
+    ranked.retain(|(_, evidence_item, score)| {
+        *score > 0.0 && evidence_item.status != ContinuityStatus::Rejected
+    });
+    ranked.sort_by(|left, right| {
+        right
+            .2
+            .partial_cmp(&left.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
+            .then_with(|| right.1.title.cmp(&left.1.title))
+    });
+    ranked.truncate(CURRENT_PRACTICE_EVIDENCE_LIMIT);
+    ranked
+}
+
+fn current_practice_evidence_rank(
+    support_ref: &SupportRef,
+    evidence_item: &ContinuityItemRecord,
+    now: DateTime<Utc>,
+) -> f64 {
+    let kind_score = match evidence_item.kind {
+        ContinuityKind::Outcome => 0.13,
+        ContinuityKind::Lesson => 0.11,
+        ContinuityKind::OperationalScar => 0.1,
+        ContinuityKind::Incident => 0.08,
+        ContinuityKind::Decision | ContinuityKind::Constraint => 0.06,
+        ContinuityKind::Fact | ContinuityKind::Derivation => 0.04,
+        _ => 0.02,
+    };
+    let reason_score = match support_ref.reason.as_deref().map(str::trim) {
+        Some("outcome_confirmed") => 0.12,
+        Some("belief_update_current") => 0.1,
+        Some("outcome_used") => 0.08,
+        Some("same runtime path") => 0.06,
+        Some(reason) if !reason.is_empty() => 0.04,
+        _ => 0.0,
+    };
+    let status_score = match evidence_item.status {
+        ContinuityStatus::Resolved => 0.04,
+        ContinuityStatus::Open | ContinuityStatus::Active => 0.02,
+        ContinuityStatus::Superseded => -0.04,
+        ContinuityStatus::Rejected => -0.12,
+    };
+    let age_hours = (now - evidence_item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+    let recency_score = if age_hours <= 24.0 {
+        0.08
+    } else if age_hours <= 24.0 * 3.0 {
+        0.05
+    } else if age_hours <= 24.0 * 7.0 {
+        0.03
+    } else {
+        0.0
+    };
+
+    (support_ref.weight.clamp(0.0, 1.5) * 0.08
+        + kind_score
+        + reason_score
+        + status_score
+        + recency_score
+        + evidence_item.retention.effective_salience * 0.04)
+        .clamp(-0.12, 0.22)
 }
 
 fn continuity_practice_cluster_key(item: &ContinuityItemRecord) -> Option<String> {

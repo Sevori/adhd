@@ -16,10 +16,10 @@ pub use schema::{
     ContinuityPlasticityState, ContinuityRecall, ContinuityRecallCompiler, ContinuityRecallItem,
     ContinuityRetentionState, CoordinationProjectedLane, CoordinationSignalInput, ExplainTarget,
     HandoffProof, HandoffProofRegister, HeartbeatInput, LaneProjectionRecord, LearningView,
-    LearningViewMode, MachineProfile, OpenContextInput, OutcomeInput, PracticeLifecycleState,
-    PracticeView, ReadContextInput, RecallInput, ResolveOrSupersedeInput, ResumeInput,
-    ResumeRecord, SignalInput, SnapshotInput, SnapshotManifest, SnapshotRecord, SupportRef,
-    TelemetryEventInput, UpsertAgentBadgeInput, WriteEventInput,
+    LearningViewMode, MachineProfile, OpenContextInput, OutcomeInput, PracticeEvidenceRecord,
+    PracticeLifecycleState, PracticeView, ReadContextInput, RecallInput, ResolveOrSupersedeInput,
+    ResumeInput, ResumeRecord, SignalInput, SnapshotInput, SnapshotManifest, SnapshotRecord,
+    SupportRef, TelemetryEventInput, UpsertAgentBadgeInput, WriteEventInput,
 };
 pub use types::{
     ContextStatus, ContinuityKind, ContinuityStatus, CoordinationLane, CoordinationSeverity,
@@ -953,6 +953,216 @@ mod tests {
         assert!(manifest.rejected.iter().any(|candidate| {
             candidate.memory_id == stale.memory_id && candidate.reason == "practice_key_competitor"
         }));
+    }
+
+    #[test]
+    fn read_context_current_practice_prefers_corroborated_guidance_over_unproven_competitor() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: "current-practice-evidence".into(),
+                session_id: "session-1".into(),
+                objective: "track the current review practice".into(),
+                selector: None,
+                agent_id: Some("observer".into()),
+                attachment_id: None,
+            })
+            .unwrap();
+
+        let grounded = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Grounded review flow".into(),
+                body: "Start from current practice and keep the learning chain attached.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+        let unproven = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "observer".into(),
+                kind: ContinuityKind::Decision,
+                title: "Fresh but unproven review flow".into(),
+                body: "Replace the review flow with a brand new shortcut immediately.".into(),
+                scope: Scope::Project,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.88),
+                confidence: Some(0.9),
+                salience: Some(0.88),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({
+                    "practice_key": "operator.review.flow",
+                }),
+            })
+            .unwrap();
+        let derivations = engine
+            .write_derivations(vec![
+                ContinuityItemInput {
+                    context_id: context.id.clone(),
+                    author_agent_id: "observer".into(),
+                    kind: ContinuityKind::Lesson,
+                    title: "Review lineage stayed stable".into(),
+                    body: "The grounded flow kept continuity intact during the last review pass."
+                        .into(),
+                    scope: Scope::Project,
+                    status: Some(ContinuityStatus::Resolved),
+                    importance: Some(0.82),
+                    confidence: Some(0.88),
+                    salience: Some(0.82),
+                    layer: None,
+                    supports: vec![SupportRef {
+                        support_type: "continuity".into(),
+                        support_id: grounded.id.clone(),
+                        reason: Some("belief_update_current".into()),
+                        weight: 1.1,
+                    }],
+                    dimensions: Vec::new(),
+                    extra: serde_json::json!({}),
+                },
+                ContinuityItemInput {
+                    context_id: context.id.clone(),
+                    author_agent_id: "observer".into(),
+                    kind: ContinuityKind::Outcome,
+                    title: "Review outcome confirmed the grounded flow".into(),
+                    body: "The last review outcome confirmed that the grounded flow reduced drift."
+                        .into(),
+                    scope: Scope::Project,
+                    status: Some(ContinuityStatus::Resolved),
+                    importance: Some(0.84),
+                    confidence: Some(0.9),
+                    salience: Some(0.84),
+                    layer: None,
+                    supports: vec![SupportRef {
+                        support_type: "continuity".into(),
+                        support_id: grounded.id.clone(),
+                        reason: Some("outcome_confirmed".into()),
+                        weight: 1.2,
+                    }],
+                    dimensions: Vec::new(),
+                    extra: serde_json::json!({}),
+                },
+            ])
+            .unwrap();
+        let lesson = derivations[0].clone();
+        let outcome = derivations[1].clone();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        for (item_id, memory_id, ts) in [
+            (
+                grounded.id.as_str(),
+                grounded.memory_id.as_str(),
+                Utc::now() - Duration::hours(6),
+            ),
+            (
+                unproven.id.as_str(),
+                unproven.memory_id.as_str(),
+                Utc::now() - Duration::hours(1),
+            ),
+            (
+                lesson.id.as_str(),
+                lesson.memory_id.as_str(),
+                Utc::now() - Duration::hours(2),
+            ),
+            (
+                outcome.id.as_str(),
+                outcome.memory_id.as_str(),
+                Utc::now() - Duration::minutes(30),
+            ),
+        ] {
+            conn.execute(
+                "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+                params![item_id, ts.to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+                params![memory_id, ts.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "Resume the current review practice.".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("observer".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: true,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        assert_eq!(
+            read.current_practice
+                .items
+                .first()
+                .map(|item| item.id.as_str()),
+            Some(grounded.id.as_str())
+        );
+        assert!(
+            !read
+                .current_practice
+                .items
+                .iter()
+                .any(|item| item.id == unproven.id)
+        );
+        let grounded_evidence = read
+            .current_practice
+            .evidence
+            .iter()
+            .find(|bundle| bundle.practice_id == grounded.id)
+            .unwrap();
+        assert_eq!(grounded_evidence.evidence_count, 2);
+        assert!(grounded_evidence.support_signal > 0.15);
+        assert!(
+            grounded_evidence
+                .evidence
+                .iter()
+                .any(|item| item.id == lesson.id)
+        );
+        assert!(
+            grounded_evidence
+                .evidence
+                .iter()
+                .any(|item| item.id == outcome.id)
+        );
+        assert!(
+            read.current_practice
+                .summary
+                .contains("Grounded review flow")
+        );
+        assert!(
+            read.current_practice
+                .summary
+                .contains("Review lineage stayed stable")
+        );
+        assert!(
+            read.current_practice
+                .summary
+                .contains("Review outcome confirmed the grounded flow")
+        );
     }
 
     #[test]

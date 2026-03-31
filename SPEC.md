@@ -153,6 +153,7 @@ ICE MUST derive a first-class current-practice view from continuity instead of f
 - When the objective explicitly asks for history, timeline, lineage, evolution, or why a practice changed, ICE SHOULD relax stale-guidance suppression so the full operating line can be reconstructed.
 - `continuity_read_context` MUST expose a first-class `current_practice` view summarizing the active operating guidance for the task.
 - The default `current_practice` view SHOULD prefer the latest active guidance and collapse weaker competitors for the same `practice_key` or `belief_key`.
+- The default `current_practice` view MUST surface the evidence that currently backs each live practice, favoring corroborated guidance over uncorroborated same-cluster competitors when the support signal is materially stronger.
 - Historical guidance MUST remain available for provenance and learning-line reconstruction. ICE may not fake recency by deleting lineage.
 
 ### Learning View
