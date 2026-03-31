@@ -51,6 +51,17 @@ pub enum LongMemEvalReaderMethod {
     ConSeparate,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LongMemEvalReaderConfig<'a> {
+    provider: LongMemEvalReaderProvider,
+    endpoint: &'a str,
+    model: &'a str,
+    api_key_env: Option<&'a str>,
+    num_predict: usize,
+    max_retries: usize,
+    retry_backoff_secs: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LongMemEvalEvaluateConfig {
     pub repo_path: PathBuf,
@@ -268,17 +279,20 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
         })?;
         let rendered_items = render_context_items(&engine, &pack, &case.question)?;
         let context_text = render_context_pack_text(&rendered_items);
+        let reader = LongMemEvalReaderConfig {
+            provider: config.reader_provider,
+            endpoint: &config.reader_endpoint,
+            model: &config.reader_model,
+            api_key_env: config.reader_api_key_env.as_deref(),
+            num_predict: config.reader_num_predict,
+            max_retries: config.reader_max_retries,
+            retry_backoff_secs: config.reader_retry_backoff_secs,
+        };
         let reading_notes = match config.reader_method {
             LongMemEvalReaderMethod::Direct => None,
             LongMemEvalReaderMethod::ConSeparate => Some(extract_reading_notes(
                 &client,
-                config.reader_provider,
-                &config.reader_endpoint,
-                &config.reader_model,
-                config.reader_api_key_env.as_deref(),
-                config.reader_num_predict,
-                config.reader_max_retries,
-                config.reader_retry_backoff_secs,
+                reader,
                 &case,
                 &rendered_items,
             )?),
@@ -288,18 +302,12 @@ pub fn run_longmemeval(config: LongMemEvalRunConfig) -> Result<LongMemEvalRunRep
             LongMemEvalReaderMethod::ConSeparate => config.reader_num_predict.max(192),
         };
         let prompt = render_answer_prompt(&case, &context_text, reading_notes.as_deref());
-        let hypothesis = generate_answer(
-            &client,
-            config.reader_provider,
-            &config.reader_endpoint,
-            &config.reader_model,
-            config.reader_api_key_env.as_deref(),
-            answer_num_predict,
-            config.reader_max_retries,
-            config.reader_retry_backoff_secs,
-            &prompt,
-        )
-        .with_context(|| format!("running reader for {}", case.question_id))?;
+        let answer_reader = LongMemEvalReaderConfig {
+            num_predict: answer_num_predict,
+            ..reader
+        };
+        let hypothesis = generate_answer(&client, answer_reader, &prompt)
+            .with_context(|| format!("running reader for {}", case.question_id))?;
 
         writeln!(
             output,
@@ -610,7 +618,7 @@ fn render_context_pack_text(items: &[RenderedContextItem]) -> String {
     }
 
     items
-        .into_iter()
+        .iter()
         .map(|item| item.rendered.clone())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -840,13 +848,7 @@ fn score_line_against_question(line: &str, keywords: &[String]) -> usize {
 
 fn extract_reading_notes(
     client: &Client,
-    provider: LongMemEvalReaderProvider,
-    endpoint: &str,
-    model: &str,
-    api_key_env: Option<&str>,
-    num_predict: usize,
-    max_retries: usize,
-    retry_backoff_secs: u64,
+    reader: LongMemEvalReaderConfig<'_>,
     case: &LongMemEvalCase,
     items: &[RenderedContextItem],
 ) -> Result<String> {
@@ -854,18 +856,15 @@ fn extract_reading_notes(
         return Ok("No reading notes were extracted.".to_string());
     }
     let mut notes = Vec::with_capacity(items.len());
-    let note_budget = num_predict.clamp(96, 256);
+    let note_budget = reader.num_predict.clamp(96, 256);
     for item in items {
         let prompt = render_reading_note_prompt(case, item);
         let raw = generate_reader_text(
             client,
-            provider,
-            endpoint,
-            model,
-            api_key_env,
-            note_budget,
-            max_retries,
-            retry_backoff_secs,
+            LongMemEvalReaderConfig {
+                num_predict: note_budget,
+                ..reader
+            },
             &prompt,
         )?;
         let text = normalize_reading_note(&raw);
@@ -988,55 +987,37 @@ fn is_quantitative_question(question: &str) -> bool {
 
 fn generate_answer(
     client: &Client,
-    provider: LongMemEvalReaderProvider,
-    endpoint: &str,
-    model: &str,
-    api_key_env: Option<&str>,
-    num_predict: usize,
-    max_retries: usize,
-    retry_backoff_secs: u64,
+    reader: LongMemEvalReaderConfig<'_>,
     prompt: &str,
 ) -> Result<String> {
-    let raw = generate_reader_text(
-        client,
-        provider,
-        endpoint,
-        model,
-        api_key_env,
-        num_predict,
-        max_retries,
-        retry_backoff_secs,
-        prompt,
-    )?;
+    let raw = generate_reader_text(client, reader, prompt)?;
     Ok(normalize_hypothesis(&raw))
 }
 
 fn generate_reader_text(
     client: &Client,
-    provider: LongMemEvalReaderProvider,
-    endpoint: &str,
-    model: &str,
-    api_key_env: Option<&str>,
-    num_predict: usize,
-    max_retries: usize,
-    retry_backoff_secs: u64,
+    reader: LongMemEvalReaderConfig<'_>,
     prompt: &str,
 ) -> Result<String> {
-    let attempts = max_retries.max(1);
-    let backoff = retry_backoff_secs.max(1);
+    let attempts = reader.max_retries.max(1);
+    let backoff = reader.retry_backoff_secs.max(1);
     let mut last_error = None;
 
     for attempt in 1..=attempts {
-        let result = match provider {
-            LongMemEvalReaderProvider::Ollama => {
-                generate_ollama_text(client, endpoint, model, num_predict, prompt)
-            }
+        let result = match reader.provider {
+            LongMemEvalReaderProvider::Ollama => generate_ollama_text(
+                client,
+                reader.endpoint,
+                reader.model,
+                reader.num_predict,
+                prompt,
+            ),
             LongMemEvalReaderProvider::OpenAiCompatible => generate_openai_compatible_text(
                 client,
-                endpoint,
-                model,
-                api_key_env,
-                num_predict,
+                reader.endpoint,
+                reader.model,
+                reader.api_key_env,
+                reader.num_predict,
                 prompt,
             ),
         };

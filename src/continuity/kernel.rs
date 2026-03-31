@@ -74,7 +74,7 @@ impl UnifiedContinuityInterface for Engine {
                 &context.id,
                 &input.objective,
                 input.include_resolved,
-                input.candidate_limit.min(8).max(4),
+                input.candidate_limit.clamp(4, 8),
             )?;
             let pack = build_context_pack(
                 storage,
@@ -287,14 +287,16 @@ impl UnifiedContinuityInterface for Engine {
             dimensions,
             extra: merge_coordination_signal_extra(
                 input.extra,
-                input.lane,
-                severity,
-                input.target_agent_id,
-                input.target_projected_lane,
-                input.claim_id,
-                input.resource,
-                input.projection_ids,
-                input.projected_lanes,
+                CoordinationSignalExtraInput {
+                    lane: input.lane,
+                    severity,
+                    target_agent_id: input.target_agent_id,
+                    target_projected_lane: input.target_projected_lane,
+                    claim_id: input.claim_id,
+                    resource: input.resource,
+                    projection_ids: input.projection_ids,
+                    projected_lanes: input.projected_lanes,
+                },
             ),
         })
     }

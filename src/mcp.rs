@@ -538,7 +538,7 @@ fn continuity_bootstrap(engine: &Engine, arguments: Value) -> Result<Value> {
         task_id: None,
         objective,
         include_resolved: false,
-        candidate_limit: input.candidate_limit.min(8).max(4),
+        candidate_limit: input.candidate_limit.clamp(4, 8),
     })?;
     Ok(json!({
         "machine": machine,

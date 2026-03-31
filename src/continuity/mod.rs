@@ -36,7 +36,9 @@ pub(crate) use schema::{CoordinationSignalRecord, WorkClaimConflict, WorkClaimCo
 
 // Used by test code in other modules (storage.rs, dogfood.rs).
 #[allow(unused_imports)]
-pub(crate) use helpers::{coordination_signal_from_extra, merge_coordination_signal_extra};
+pub(crate) use helpers::{
+    CoordinationSignalExtraInput, coordination_signal_from_extra, merge_coordination_signal_extra,
+};
 
 #[cfg(test)]
 mod tests {
@@ -3044,14 +3046,16 @@ mod tests {
     fn merge_coordination_signal_extra_into_null() {
         let result = merge_coordination_signal_extra(
             serde_json::Value::Null,
-            CoordinationLane::Anxiety,
-            CoordinationSeverity::Warn,
-            Some("target-agent".into()),
-            None,
-            Some("claim-1".into()),
-            Some("src/file.rs".into()),
-            vec!["proj-1".into()],
-            Vec::new(),
+            CoordinationSignalExtraInput {
+                lane: CoordinationLane::Anxiety,
+                severity: CoordinationSeverity::Warn,
+                target_agent_id: Some("target-agent".into()),
+                target_projected_lane: None,
+                claim_id: Some("claim-1".into()),
+                resource: Some("src/file.rs".into()),
+                projection_ids: vec!["proj-1".into()],
+                projected_lanes: Vec::new(),
+            },
         );
         assert_eq!(
             result["coordination_signal"]["lane"].as_str(),
@@ -3076,14 +3080,16 @@ mod tests {
         let existing = serde_json::json!({"metadata": "keep"});
         let result = merge_coordination_signal_extra(
             existing,
-            CoordinationLane::Review,
-            CoordinationSeverity::Info,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
+            CoordinationSignalExtraInput {
+                lane: CoordinationLane::Review,
+                severity: CoordinationSeverity::Info,
+                target_agent_id: None,
+                target_projected_lane: None,
+                claim_id: None,
+                resource: None,
+                projection_ids: Vec::new(),
+                projected_lanes: Vec::new(),
+            },
         );
         assert_eq!(result["metadata"].as_str(), Some("keep"));
         assert_eq!(
@@ -3096,14 +3102,16 @@ mod tests {
     fn merge_coordination_signal_extra_wraps_non_object() {
         let result = merge_coordination_signal_extra(
             serde_json::json!(42),
-            CoordinationLane::Backoff,
-            CoordinationSeverity::Block,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
+            CoordinationSignalExtraInput {
+                lane: CoordinationLane::Backoff,
+                severity: CoordinationSeverity::Block,
+                target_agent_id: None,
+                target_projected_lane: None,
+                claim_id: None,
+                resource: None,
+                projection_ids: Vec::new(),
+                projected_lanes: Vec::new(),
+            },
         );
         assert_eq!(result["payload"].as_u64(), Some(42));
         assert_eq!(

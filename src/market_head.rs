@@ -1295,12 +1295,14 @@ fn build_market_head_challenge_case(
 fn summarize_market_head_challenge(
     cases: &[MarketHeadChallengeCaseEvaluation],
 ) -> MarketHeadChallengeSummary {
-    let mut summary = MarketHeadChallengeSummary::default();
-    summary.class_count = cases.len();
-    summary.failed_cases = cases
-        .iter()
-        .filter(|case| case.status == BaselineStatus::Failed)
-        .count();
+    let mut summary = MarketHeadChallengeSummary {
+        class_count: cases.len(),
+        failed_cases: cases
+            .iter()
+            .filter(|case| case.status == BaselineStatus::Failed)
+            .count(),
+        ..MarketHeadChallengeSummary::default()
+    };
     if cases.is_empty() {
         return summary;
     }
@@ -1359,12 +1361,14 @@ fn summarize_market_head_challenge(
 }
 
 fn summarize_market_head_judge(cases: &[MarketHeadJudgeCaseEvaluation]) -> MarketHeadJudgeSummary {
-    let mut summary = MarketHeadJudgeSummary::default();
-    summary.class_count = cases.len();
-    summary.failed_cases = cases
-        .iter()
-        .filter(|case| case.status == BaselineStatus::Failed)
-        .count();
+    let mut summary = MarketHeadJudgeSummary {
+        class_count: cases.len(),
+        failed_cases: cases
+            .iter()
+            .filter(|case| case.status == BaselineStatus::Failed)
+            .count(),
+        ..MarketHeadJudgeSummary::default()
+    };
     if cases.is_empty() {
         return summary;
     }

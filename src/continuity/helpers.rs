@@ -1001,26 +1001,31 @@ pub(crate) fn default_coordination_severity(lane: CoordinationLane) -> Coordinat
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CoordinationSignalExtraInput {
+    pub lane: CoordinationLane,
+    pub severity: CoordinationSeverity,
+    pub target_agent_id: Option<String>,
+    pub target_projected_lane: Option<CoordinationProjectedLane>,
+    pub claim_id: Option<String>,
+    pub resource: Option<String>,
+    pub projection_ids: Vec<String>,
+    pub projected_lanes: Vec<CoordinationProjectedLane>,
+}
+
 pub(crate) fn merge_coordination_signal_extra(
     extra: serde_json::Value,
-    lane: CoordinationLane,
-    severity: CoordinationSeverity,
-    target_agent_id: Option<String>,
-    target_projected_lane: Option<CoordinationProjectedLane>,
-    claim_id: Option<String>,
-    resource: Option<String>,
-    projection_ids: Vec<String>,
-    projected_lanes: Vec<CoordinationProjectedLane>,
+    input: CoordinationSignalExtraInput,
 ) -> serde_json::Value {
     let coordination_value = serde_json::json!({
-        "lane": lane.as_str(),
-        "severity": severity.as_str(),
-        "target_agent_id": target_agent_id,
-        "target_projected_lane": target_projected_lane,
-        "claim_id": claim_id,
-        "resource": resource,
-        "projection_ids": projection_ids,
-        "projected_lanes": projected_lanes,
+        "lane": input.lane.as_str(),
+        "severity": input.severity.as_str(),
+        "target_agent_id": input.target_agent_id,
+        "target_projected_lane": input.target_projected_lane,
+        "claim_id": input.claim_id,
+        "resource": input.resource,
+        "projection_ids": input.projection_ids,
+        "projected_lanes": input.projected_lanes,
     });
     match extra {
         serde_json::Value::Object(mut map) => {
@@ -1257,20 +1262,20 @@ pub(crate) fn merge_dispatch_assignment_pressure(
                 )
             });
         absorb_dispatch_assignment_pressure(projection, assignment, true);
-        if let Some(attached_lane) = assignment.attached_projected_lane.as_ref() {
-            if attached_lane.projection_id != assignment.projected_lane.projection_id {
-                let projection = merged
-                    .entry(attached_lane.projection_id.clone())
-                    .or_insert_with(|| {
-                        dispatch_assignment_lane_projection(
-                            assignment,
-                            attached_lane,
-                            namespace_fallback,
-                            false,
-                        )
-                    });
-                absorb_dispatch_assignment_pressure(projection, assignment, false);
-            }
+        if let Some(attached_lane) = assignment.attached_projected_lane.as_ref()
+            && attached_lane.projection_id != assignment.projected_lane.projection_id
+        {
+            let projection = merged
+                .entry(attached_lane.projection_id.clone())
+                .or_insert_with(|| {
+                    dispatch_assignment_lane_projection(
+                        assignment,
+                        attached_lane,
+                        namespace_fallback,
+                        false,
+                    )
+                });
+            absorb_dispatch_assignment_pressure(projection, assignment, false);
         }
     }
     let mut values = merged.into_values().collect::<Vec<_>>();

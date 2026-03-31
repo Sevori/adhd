@@ -740,7 +740,7 @@ struct GooseArgs {
 
 #[derive(Debug, Subcommand)]
 enum DogfoodCommand {
-    SyncRepo(RepoSyncArgs),
+    SyncRepo(Box<RepoSyncArgs>),
     Heartbeat(HeartbeatArgs),
     Organism(OrganismArgs),
 }
@@ -1451,7 +1451,7 @@ fn main() -> Result<()> {
                 let result = block_on(run_repo_sync(
                     engine.clone(),
                     resolve_repo_root(args.repo_root.clone())?,
-                    args,
+                    *args,
                 ))?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
@@ -1960,10 +1960,10 @@ fn derive_dispatch_attached_lane_from_badges(
         if badge.agent_id != worker.worker_id {
             continue;
         }
-        if let Some(task_id) = worker.task_id.as_deref() {
-            if badge.task_id.as_deref() != Some(task_id) {
-                continue;
-            }
+        if let Some(task_id) = worker.task_id.as_deref()
+            && badge.task_id.as_deref() != Some(task_id)
+        {
+            continue;
         }
         let Some(lane) = derive_dispatch_attached_lane_from_badge(badge) else {
             continue;
@@ -2140,10 +2140,10 @@ fn repo_sync_focus(state: &RepoSyncState) -> String {
     let current_slice_is_complete = current_slice_lines
         .iter()
         .any(|line| line.trim().to_ascii_lowercase().contains("proved locally"));
-    if !current_slice_is_complete {
-        if let Some(current) = extract_markdown_section_lead(&current_slice_lines) {
-            return current;
-        }
+    if !current_slice_is_complete
+        && let Some(current) = extract_markdown_section_lead(&current_slice_lines)
+    {
+        return current;
     }
     let next_slice_lines = markdown_section_lines(current_cycle, "## Next Slice");
     extract_markdown_section_lead(&next_slice_lines)

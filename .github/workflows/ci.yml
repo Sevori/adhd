@@ -31,13 +31,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Run lint
+        run: cargo clippy -- -D warnings
 
       - name: Run tests
         run: cargo test --locked
