@@ -413,27 +413,34 @@ pub(crate) fn build_operational_state_view(
     selected
 }
 
-pub(crate) fn build_next_step_view(items: &[ContinuityItemRecord]) -> Vec<ContinuityItemRecord> {
+pub(crate) fn build_next_step_view(
+    items: &[ContinuityItemRecord],
+    now: DateTime<Utc>,
+) -> Vec<ContinuityItemRecord> {
     let mut next_steps = items
         .iter()
-        .filter(|item| is_operational_next_step(item))
-        .cloned()
+        .filter_map(|item| next_step_candidate_score(item, now).map(|score| (score, item)))
         .collect::<Vec<_>>();
     next_steps.sort_by(|left, right| {
         right
-            .updated_at
-            .cmp(&left.updated_at)
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
             .then_with(|| {
-                right
+                right.1
                     .retention
                     .effective_salience
-                    .partial_cmp(&left.retention.effective_salience)
+                    .partial_cmp(&left.1.retention.effective_salience)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then_with(|| right.title.cmp(&left.title))
+            .then_with(|| right.1.title.cmp(&left.1.title))
     });
-    next_steps.truncate(3);
     next_steps
+        .into_iter()
+        .map(|(_, item)| item.clone())
+        .take(3)
+        .collect()
 }
 
 pub(crate) fn build_recent_update_view(
@@ -1176,6 +1183,46 @@ fn is_guidance_like(kind: ContinuityKind) -> bool {
 fn is_operational_next_step(item: &ContinuityItemRecord) -> bool {
     item.kind == ContinuityKind::WorkingState
         && (item.title == "model-next-step" || item.extra["next_step"].as_bool() == Some(true))
+}
+
+fn next_step_candidate_score(
+    item: &ContinuityItemRecord,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    if is_operational_next_step(item) {
+        let age_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+        let age_penalty = (age_hours / 72.0).min(0.18);
+        return Some(
+            0.92
+                + item.retention.effective_salience * 0.65
+                + item.importance * 0.22
+                + item.confidence * 0.14
+                - age_penalty,
+        );
+    }
+    if item.kind == ContinuityKind::WorkClaim && work_claim_is_live(item, now) {
+        let coordination = work_claim_coordination(item);
+        let exclusivity_score = coordination
+            .as_ref()
+            .map(|coordination| if coordination.exclusive { 0.1 } else { 0.0 })
+            .unwrap_or_default();
+        let resource_score = coordination
+            .as_ref()
+            .map(|coordination| (coordination.resources.len().min(3) as f64) * 0.03)
+            .unwrap_or_default();
+        let age_hours = (now - item.updated_at).num_seconds().max(0) as f64 / 3600.0;
+        let age_penalty = (age_hours / 96.0).min(0.2);
+        return Some(
+            0.74
+                + exclusivity_score
+                + resource_score
+                + item.retention.effective_salience * 0.55
+                + item.importance * 0.18
+                + item.confidence * 0.12
+                - age_penalty,
+        );
+    }
+    None
 }
 
 fn operational_state_candidate_score(

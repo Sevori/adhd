@@ -1695,6 +1695,7 @@ mod tests {
                 .any(|item| item.memory_id == current.memory_id)
         );
         assert!(read.recall.compiler.operational_seed_count >= 2);
+        assert!(read.recall.compiler.next_step_seed_count >= 1);
     }
 
     #[test]
@@ -2273,12 +2274,145 @@ mod tests {
 
         assert_eq!(read.recall.items[0].id, current.id);
         assert_eq!(read.recall.compiler.operational_seed_count, 0);
+        assert_eq!(read.recall.compiler.next_step_seed_count, 0);
         assert_eq!(read.recall.compiler.recent_update_seed_count, 0);
         assert_eq!(read.recall.compiler.active_thread_seed_count, 0);
         assert!(read.recall.compiler.stale_debris_demoted_count >= 1);
         assert!(read.recall.items.iter().any(|item| {
             item.id == stale.id && item.why.iter().any(|why| why == "stale_semantic_debris")
         }));
+    }
+
+    #[test]
+    fn read_context_next_step_prompt_surfaces_live_work_claim_when_no_model_next_step_exists() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path()).unwrap();
+        let planner = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "planner".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["write_item".into(), "read_context".into()],
+                namespace: "demo".into(),
+                role: Some("planner".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let worker = engine
+            .attach_agent(AttachAgentInput {
+                agent_id: "worker".into(),
+                agent_type: "codex".into(),
+                capabilities: vec!["read_context".into(), "claim_work".into()],
+                namespace: "demo".into(),
+                role: Some("worker".into()),
+                metadata: serde_json::json!({"repo_root": "/tmp/demo", "branch": "main"}),
+            })
+            .unwrap();
+        let context = engine
+            .open_context(OpenContextInput {
+                namespace: "demo".into(),
+                task_id: DEFAULT_MACHINE_TASK_ID.into(),
+                session_id: "session-next-step-work-claim".into(),
+                objective: "coordinate the active next step".into(),
+                selector: None,
+                agent_id: Some("planner".into()),
+                attachment_id: Some(planner.id.clone()),
+            })
+            .unwrap();
+        let claim = engine
+            .claim_work(ClaimWorkInput {
+                context_id: context.id.clone(),
+                agent_id: "worker".into(),
+                title: "Own the merged lint lane".into(),
+                body: "Fix lint on main before opening another slice.".into(),
+                scope: Scope::Project,
+                resources: vec!["repo/demo/main".into()],
+                exclusive: true,
+                attachment_id: Some(worker.id),
+                lease_seconds: Some(900),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+        let stale = engine
+            .mark_decision(ContinuityItemInput {
+                context_id: context.id.clone(),
+                author_agent_id: "planner".into(),
+                kind: ContinuityKind::Decision,
+                title: "Old next slice anchor".into(),
+                body: "What should we do next on main? Follow the old next slice anchor.".into(),
+                scope: Scope::Shared,
+                status: Some(ContinuityStatus::Active),
+                importance: Some(0.97),
+                confidence: Some(0.95),
+                salience: Some(0.97),
+                layer: None,
+                supports: Vec::new(),
+                dimensions: Vec::new(),
+                extra: serde_json::json!({}),
+            })
+            .unwrap();
+
+        let sqlite = dir.path().join("data/ice.sqlite");
+        let conn = Connection::open(sqlite).unwrap();
+        conn.execute(
+            "UPDATE continuity_items SET ts = ?2, updated_at = ?2 WHERE id = ?1",
+            params![
+                stale.id.as_str(),
+                (Utc::now() - Duration::hours(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_items SET ts = ?2 WHERE id = ?1",
+            params![
+                stale.memory_id.as_str(),
+                (Utc::now() - Duration::hours(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let read = engine
+            .read_context(ReadContextInput {
+                context_id: Some(context.id),
+                namespace: None,
+                task_id: None,
+                objective: "what should we do next on main?".into(),
+                token_budget: 256,
+                selector: None,
+                agent_id: Some("worker".into()),
+                session_id: None,
+                view_id: None,
+                include_resolved: false,
+                candidate_limit: 16,
+            })
+            .unwrap();
+
+        let claim_index = read
+            .recall
+            .items
+            .iter()
+            .position(|item| item.id == claim.id)
+            .unwrap();
+        let stale_index = read
+            .recall
+            .items
+            .iter()
+            .position(|item| item.id == stale.id)
+            .unwrap();
+        let claim_item = read
+            .recall
+            .items
+            .iter()
+            .find(|item| item.id == claim.id)
+            .unwrap();
+        assert!(claim_index < stale_index);
+        assert!(claim_item.why.iter().any(|why| why == "next_step"));
+        assert!(
+            read.pack
+                .items
+                .iter()
+                .any(|item| item.memory_id == claim.memory_id)
+        );
+        assert!(read.recall.compiler.next_step_seed_count >= 1);
     }
 
     #[test]
